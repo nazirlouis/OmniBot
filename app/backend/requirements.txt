@@ -1,0 +1,8 @@
+requests
+python-dotenv
+Pillow
+fastapi
+uvicorn[standard]
+google-genai
+bleak
+python-multipart
