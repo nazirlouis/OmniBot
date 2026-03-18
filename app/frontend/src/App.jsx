@@ -4,6 +4,7 @@ import './index.css';
 import Sidebar from './components/Sidebar';
 import IntelligenceFeed from './components/IntelligenceFeed';
 import SetupOrchestrator from './components/SetupOrchestrator';
+import BotSettings from './components/BotSettings';
 import { initialSetupState, scanForDevices, scanForWifi, sendProvision } from './components/setupService';
 
 function App() {
@@ -53,7 +54,6 @@ function App() {
           if (message.type === 'esp32_connected') {
             setEsp32Status('online');
             setLastPing(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
-            updateSetup('appMode', 'dashboard'); // Auto-switch to dashboard when it pings
           } else if (message.type === 'processing_started') {
             setEsp32Status('working');
             addLog('esp32', 'Sensory capture complete. Transmitting to Gemini...');
@@ -152,17 +152,23 @@ function App() {
       />
       
       <main className="main-content">
-        {setupState.appMode === 'dashboard' ? (
+        {setupState.appMode === 'dashboard' && (
           <IntelligenceFeed 
             logs={logs}
             wsStatus={wsStatus}
           />
-        ) : (
+        )}
+        
+        {setupState.appMode === 'setup' && (
           <SetupOrchestrator 
             state={setupState}
             setters={setupSetters}
             actions={setupActions}
           />
+        )}
+        
+        {setupState.appMode === 'settings' && (
+          <BotSettings setAppMode={setupSetters.setAppMode} />
         )}
       </main>
     </div>

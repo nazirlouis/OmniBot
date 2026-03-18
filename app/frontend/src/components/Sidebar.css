@@ -98,6 +98,35 @@
   color: var(--accent);
 }
 
+.bot-settings-btn {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  z-index: 2;
+  opacity: 0;
+}
+
+.bot-card:hover .bot-settings-btn {
+  opacity: 1;
+}
+
+.bot-settings-btn:hover {
+  background: rgba(0, 136, 255, 0.1);
+  color: var(--accent);
+  border-color: rgba(0, 136, 255, 0.3);
+}
+
 .bot-card.working .bot-icon {
   animation: spin 3s linear infinite;
 }

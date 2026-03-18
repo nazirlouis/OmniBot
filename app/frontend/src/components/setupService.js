@@ -36,3 +36,17 @@ export const sendProvision = async (ssid, password, device_address) => {
   });
   return await res.json();
 };
+
+export const getBotSettings = async (device_id) => {
+  const res = await fetch(`http://localhost:8000/api/settings/${encodeURIComponent(device_id)}`);
+  return await res.json();
+};
+
+export const updateBotSettings = async (device_id, settings) => {
+  const res = await fetch(`http://localhost:8000/api/settings/${encodeURIComponent(device_id)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings)
+  });
+  return await res.json();
+};
