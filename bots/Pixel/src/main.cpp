@@ -15,6 +15,7 @@
 #include <RTClib.h>
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 // ==========================================
 //        USER CONFIGURATION
@@ -112,9 +113,48 @@ String lastRenderedTime = "";
 
 unsigned long lastRecordingEyesUpdate = 0;
 unsigned long lastIdleEyesUpdate = 0;
+unsigned long lastUploadingEyesUpdate = 0;
 
 bool needsRestart = false;
 volatile bool triggerUpload = false;
+volatile bool geminiFirstTokenReceived = false;
+
+// Weather overlay (from backend show_weather tool)
+#define WEATHER_KIND_SUNNY 0
+#define WEATHER_KIND_CLOUDY 1
+#define WEATHER_KIND_PARTIALLY_CLOUDY 2
+#define WEATHER_KIND_RAINING 3
+#define WEATHER_KIND_SNOWING 4
+
+bool weatherOverlayActive = false;
+uint32_t weatherOverlayUntilMs = 0;
+uint8_t weatherKind = WEATHER_KIND_CLOUDY;
+int weatherTempDisplay = 0;
+bool weatherNeedsRedraw = true;
+// After show_weather during upload, do not resume thinking when the overlay ends.
+bool suppressUploadThinkingAfterWeather = false;
+
+// Weather overlay motion (delta-friendly: avoid full-screen clears on each tick).
+struct WeatherAnimState {
+    uint32_t lastTickMs = 0;
+    bool sunnyHasPrevSeg = false;
+    int16_t su_ix[8], su_iy[8], su_ox[8], su_oy[8];
+    int16_t cloudDx = 0;
+    int16_t cloudDy = 0;
+    float cloudPhase = 0.0f;
+    float sunnyPhase = 0.0f;
+    struct RainDrop {
+        int16_t x0;
+        int16_t y0;
+    } rain[9];
+    struct SnowFlake {
+        int16_t cx;
+        int16_t cy;
+        int16_t rx;
+    } snow[10];
+    float snowPhase = 0.0f;
+};
+static WeatherAnimState wAnim;
 const uint8_t WIFI_CONNECT_ATTEMPTS = 3;
 const uint16_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 const uint8_t WIFI_FAILS_BEFORE_BLE_FALLBACK = 3;
@@ -151,6 +191,28 @@ struct IdleAnimState {
 
 IdleAnimState idleAnim;
 
+struct UploadAnimState {
+    int16_t prevEyeXOffset = 0;
+    int16_t prevEyeYOffset = 0;
+    int16_t prevEyeRyL = 26;
+    int16_t prevEyeRyR = 24;
+    int16_t prevBrowOffset = 0;
+    uint8_t prevQSize = 0;
+    bool hasPrevFrame = false;
+};
+
+UploadAnimState uploadAnim;
+
+struct RecordingAnimState {
+    int16_t prevEyeXOffset = 0;
+    int16_t prevEyeYOffset = 0;
+    int16_t prevEyeRyL = 52;
+    int16_t prevEyeRyR = 52;
+    bool hasPrevFrame = false;
+};
+
+RecordingAnimState recordingAnim;
+
 // ==========================================
 //          UI HELPER
 // ==========================================
@@ -184,6 +246,303 @@ static void fillOval(int16_t xc, int16_t yc, int16_t rx, int16_t ry, uint16_t co
 
         gfx->drawFastHLine(xc - (int16_t)x, yc + dy, (int16_t)(2 * x + 1), color);
     }
+}
+
+// Scale s roughly 1.0 = previous look; >1 enlarges clouds (round display).
+static void drawWeatherCloud(int16_t x, int16_t y, uint16_t cloudGray, uint16_t cloudHi, float s) {
+    int16_t a = (int16_t)(28 * s), b = (int16_t)(18 * s);
+    int16_t ox = (int16_t)(22 * s), oy = (int16_t)(6 * s);
+    fillOval(x, y, a, b, cloudGray);
+    fillOval(x - ox, y + oy, (int16_t)(24 * s), (int16_t)(16 * s), cloudGray);
+    fillOval(x + (int16_t)(20 * s), y + oy, (int16_t)(26 * s), (int16_t)(18 * s), cloudGray);
+    // Soft highlight on main puff
+    fillOval(x - (int16_t)(8 * s), y - (int16_t)(5 * s), (int16_t)(10 * s), (int16_t)(7 * s), cloudHi);
+}
+
+// ---- Weather layout (shared: full paint + delta animation ticks) ----
+static const uint16_t kWxBg = 0x10A2;
+static const uint16_t kWxRing = 0x2124;
+static const uint16_t kWxCloud = 0xB5B6;
+static const uint16_t kWxCloudHi = 0xDEFB;
+static const uint16_t kWxTemp = 0xEF9D;
+static const uint16_t kWxAccent = 0x5D9B;
+static const int16_t kWxCx = 120;
+static const int16_t kWxIconY = 92;
+static const float kWxIconScale = 1.65f;
+static const int16_t kWxTempCyTop = 142;
+static const uint16_t kWxAnimIntervalMs = 72;
+
+static void drawTemperatureLineF(int16_t cyTop, uint8_t textSize, uint16_t textColor) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%dF", weatherTempDisplay);
+
+    gfx->setTextSize(textSize);
+    gfx->setTextColor(textColor);
+
+    const int16_t charW = (int16_t)(6 * textSize);
+    const int16_t lineH = (int16_t)(8 * textSize);
+    const int16_t totalW = (int16_t)strlen(buf) * charW;
+    int16_t startX = (240 - totalW) / 2;
+    if (startX < 4) startX = 4;
+
+    const int16_t baselineY = cyTop + lineH - (int16_t)(textSize > 3 ? 3 : 2);
+
+    gfx->setCursor(startX, baselineY);
+    gfx->print(buf);
+}
+
+// Cloud / sun art only — icon band stays below temperature.
+static void wxClearIconBand() {
+    gfx->fillRect(12, 22, 216, 112, kWxBg);
+    gfx->drawCircle(120, 120, 118, kWxRing);
+}
+
+static void wxRedrawTemperatureOnly() {
+    gfx->fillRect(8, kWxTempCyTop, 224, 48, kWxBg);
+    drawTemperatureLineF(kWxTempCyTop, 5, kWxTemp);
+}
+
+static void wxInitAnimAfterFullPaint() {
+    wAnim.lastTickMs = millis();
+    wAnim.cloudDx = 0;
+    wAnim.cloudDy = 0;
+    wAnim.cloudPhase = (float)((millis() & 2047u)) * 0.002f;
+    wAnim.sunnyPhase = 0.0f;
+    wAnim.snowPhase = 0.0f;
+
+    if (weatherKind == WEATHER_KIND_SUNNY) {
+        const int16_t cx = kWxCx;
+        const int16_t iconY = kWxIconY;
+        const float sc = kWxIconScale;
+        for (int i = 0; i < 8; i++) {
+            float a = (float)i * 3.1415926f / 4.0f;
+            wAnim.su_ix[i] = cx + (int16_t)(cosf(a) * (38.0f * sc));
+            wAnim.su_iy[i] = iconY + (int16_t)(sinf(a) * (38.0f * sc));
+            wAnim.su_ox[i] = cx + (int16_t)(cosf(a) * (52.0f * sc));
+            wAnim.su_oy[i] = iconY + (int16_t)(sinf(a) * (52.0f * sc));
+        }
+        wAnim.sunnyHasPrevSeg = true;
+    } else {
+        wAnim.sunnyHasPrevSeg = false;
+    }
+
+    if (weatherKind == WEATHER_KIND_RAINING) {
+        int n = 0;
+        for (int i = -1; i <= 1; i++) {
+            int16_t rx = kWxCx + (int16_t)(i * 22 * kWxIconScale);
+            for (int j = 0; j < 3; j++) {
+                wAnim.rain[n].x0 = rx + (int16_t)(j * 5 * kWxIconScale);
+                wAnim.rain[n].y0 = kWxIconY + (int16_t)(28 * kWxIconScale) + (int16_t)((n * 5) % 18);
+                n++;
+            }
+        }
+    }
+    if (weatherKind == WEATHER_KIND_SNOWING) {
+        int n = 0;
+        for (int i = -2; i <= 2; i++) {
+            int16_t rr = (int16_t)(4 * kWxIconScale);
+            wAnim.snow[n].rx = rr;
+            wAnim.snow[n].cx = kWxCx + (int16_t)(i * 18 * kWxIconScale);
+            wAnim.snow[n].cy = kWxIconY + (int16_t)(34 * kWxIconScale);
+            n++;
+            wAnim.snow[n].rx = rr;
+            wAnim.snow[n].cx = kWxCx + (int16_t)((i * 18 + 6) * kWxIconScale);
+            wAnim.snow[n].cy = kWxIconY + (int16_t)(52 * kWxIconScale);
+            n++;
+        }
+    }
+}
+
+static void updateWxSunnyAnim() {
+    const int16_t cx = kWxCx;
+    const int16_t iconY = kWxIconY;
+    const float sc = kWxIconScale;
+    wAnim.sunnyPhase += 0.10f;
+
+    for (int i = 0; i < 8; i++) {
+        float a = (float)i * 3.1415926f / 4.0f;
+        int16_t ix = cx + (int16_t)(cosf(a) * (38.0f * sc));
+        int16_t iy = iconY + (int16_t)(sinf(a) * (38.0f * sc));
+        float omul = 52.0f + sinf(wAnim.sunnyPhase + (float)i * 0.55f) * 6.5f;
+        int16_t ox = cx + (int16_t)(cosf(a) * (omul * sc));
+        int16_t oy = iconY + (int16_t)(sinf(a) * (omul * sc));
+
+        if (wAnim.sunnyHasPrevSeg) {
+            gfx->drawLine(wAnim.su_ix[i], wAnim.su_iy[i], wAnim.su_ox[i], wAnim.su_oy[i], kWxBg);
+        }
+        gfx->drawLine(ix, iy, ox, oy, 0xFF80);
+        wAnim.su_ix[i] = ix;
+        wAnim.su_iy[i] = iy;
+        wAnim.su_ox[i] = ox;
+        wAnim.su_oy[i] = oy;
+    }
+    wAnim.sunnyHasPrevSeg = true;
+}
+
+static void updateWxCloudyAnim() {
+    wAnim.cloudPhase += 0.085f;
+    int16_t ndx = (int16_t)(sinf(wAnim.cloudPhase) * 2.0f);
+    int16_t ndy = (int16_t)(cosf(wAnim.cloudPhase * 0.82f) * 1.5f);
+    if (ndx == wAnim.cloudDx && ndy == wAnim.cloudDy) {
+        return;
+    }
+
+    wxClearIconBand();
+    drawWeatherCloud(kWxCx + ndx, kWxIconY + ndy, kWxCloud, kWxCloudHi, kWxIconScale);
+    wAnim.cloudDx = ndx;
+    wAnim.cloudDy = ndy;
+}
+
+static void updateWxPartlyAnim() {
+    wAnim.cloudPhase += 0.085f;
+    int16_t ndx = (int16_t)(sinf(wAnim.cloudPhase) * 2.0f);
+    int16_t ndy = (int16_t)(cosf(wAnim.cloudPhase * 0.82f) * 1.5f);
+    if (ndx == wAnim.cloudDx && ndy == wAnim.cloudDy) {
+        return;
+    }
+
+    wxClearIconBand();
+    fillOval(kWxCx - (int16_t)(18 * kWxIconScale), kWxIconY - (int16_t)(14 * kWxIconScale),
+             (int16_t)(20 * kWxIconScale), (int16_t)(20 * kWxIconScale), 0xFEA0);
+    fillOval(kWxCx - (int16_t)(18 * kWxIconScale), kWxIconY - (int16_t)(14 * kWxIconScale),
+             (int16_t)(12 * kWxIconScale), (int16_t)(12 * kWxIconScale), YELLOW);
+    drawWeatherCloud(
+        kWxCx + ndx + (int16_t)(8 * kWxIconScale),
+        kWxIconY + ndy + (int16_t)(8 * kWxIconScale),
+        kWxCloud, kWxCloudHi, kWxIconScale * 0.95f
+    );
+    wAnim.cloudDx = ndx;
+    wAnim.cloudDy = ndy;
+}
+
+static void updateWxRainAnim() {
+    const float sc = kWxIconScale;
+    const int16_t dropLen = (int16_t)(26 * sc);
+    const int16_t dx = (int16_t)(4 * sc);
+    const int16_t yTopMin = kWxIconY + (int16_t)(26 * sc);
+    const int16_t yTopMax = kWxIconY + (int16_t)(56 * sc);
+
+    for (int i = 0; i < 9; i++) {
+        int16_t x0 = wAnim.rain[i].x0;
+        int16_t y0 = wAnim.rain[i].y0;
+        gfx->drawLine(x0, y0, (int16_t)(x0 - dx), (int16_t)(y0 + dropLen), kWxBg);
+        y0 += 5;
+        if (y0 > yTopMax) {
+            y0 = (int16_t)(yTopMin + (i * 4) % 14);
+        }
+        wAnim.rain[i].y0 = y0;
+        gfx->drawLine(x0, y0, (int16_t)(x0 - dx), (int16_t)(y0 + dropLen), kWxAccent);
+    }
+}
+
+static void updateWxSnowAnim() {
+    wAnim.snowPhase += 0.12f;
+    for (int i = 0; i < 10; i++) {
+        int16_t ox = wAnim.snow[i].cx;
+        int16_t oy = wAnim.snow[i].cy;
+        int16_t rr = wAnim.snow[i].rx;
+        fillOval(ox, oy, rr, rr, kWxBg);
+        float wob = sinf(wAnim.snowPhase + (float)i * 0.45f);
+        int16_t nx = ox + (int16_t)(wob * 2.5f);
+        int16_t ny = oy + (int16_t)(sinf(wAnim.snowPhase * 0.65f + (float)i * 0.35f) * 2.5f);
+        wAnim.snow[i].cx = nx;
+        wAnim.snow[i].cy = ny;
+        fillOval(nx, ny, rr, rr, 0xEFBF);
+    }
+}
+
+static void updateWeatherOverlayAnimation(uint32_t now) {
+    if (now - wAnim.lastTickMs < kWxAnimIntervalMs) {
+        return;
+    }
+    wAnim.lastTickMs = now;
+
+    switch (weatherKind) {
+        case WEATHER_KIND_SUNNY:
+            updateWxSunnyAnim();
+            break;
+        case WEATHER_KIND_CLOUDY:
+            updateWxCloudyAnim();
+            break;
+        case WEATHER_KIND_PARTIALLY_CLOUDY:
+            updateWxPartlyAnim();
+            break;
+        case WEATHER_KIND_RAINING:
+            updateWxRainAnim();
+            wxRedrawTemperatureOnly();
+            break;
+        case WEATHER_KIND_SNOWING:
+            updateWxSnowAnim();
+            wxRedrawTemperatureOnly();
+            break;
+        default:
+            updateWxCloudyAnim();
+            break;
+    }
+}
+
+static void drawWeatherOverlay() {
+    gfx->fillScreen(kWxBg);
+    gfx->drawCircle(120, 120, 118, kWxRing);
+
+    switch (weatherKind) {
+        case WEATHER_KIND_SUNNY: {
+            int16_t r = (int16_t)(28 * kWxIconScale);
+            fillOval(kWxCx, kWxIconY, r, r, 0xFEA0);
+            fillOval(kWxCx, kWxIconY, (int16_t)(r * 0.55f), (int16_t)(r * 0.55f), YELLOW);
+            for (int i = 0; i < 8; i++) {
+                float a = (float)i * 3.1415926f / 4.0f;
+                int16_t x1 = kWxCx + (int16_t)(cosf(a) * (38.0f * kWxIconScale));
+                int16_t y1 = kWxIconY + (int16_t)(sinf(a) * (38.0f * kWxIconScale));
+                int16_t x2 = kWxCx + (int16_t)(cosf(a) * (52.0f * kWxIconScale));
+                int16_t y2 = kWxIconY + (int16_t)(sinf(a) * (52.0f * kWxIconScale));
+                gfx->drawLine(x1, y1, x2, y2, 0xFF80);
+            }
+            break;
+        }
+        case WEATHER_KIND_CLOUDY:
+            drawWeatherCloud(kWxCx, kWxIconY, kWxCloud, kWxCloudHi, kWxIconScale);
+            break;
+        case WEATHER_KIND_PARTIALLY_CLOUDY:
+            fillOval(kWxCx - (int16_t)(18 * kWxIconScale), kWxIconY - (int16_t)(14 * kWxIconScale),
+                     (int16_t)(20 * kWxIconScale), (int16_t)(20 * kWxIconScale), 0xFEA0);
+            fillOval(kWxCx - (int16_t)(18 * kWxIconScale), kWxIconY - (int16_t)(14 * kWxIconScale),
+                     (int16_t)(12 * kWxIconScale), (int16_t)(12 * kWxIconScale), YELLOW);
+            drawWeatherCloud(
+                kWxCx + (int16_t)(8 * kWxIconScale),
+                kWxIconY + (int16_t)(8 * kWxIconScale),
+                kWxCloud, kWxCloudHi, kWxIconScale * 0.95f
+            );
+            break;
+        case WEATHER_KIND_RAINING:
+            drawWeatherCloud(kWxCx, kWxIconY - (int16_t)(6 * kWxIconScale), kWxCloud, kWxCloudHi, kWxIconScale);
+            for (int i = -1; i <= 1; i++) {
+                int16_t rx = kWxCx + (int16_t)(i * 22 * kWxIconScale);
+                for (int j = 0; j < 3; j++) {
+                    int16_t x0 = rx + (int16_t)(j * 5 * kWxIconScale);
+                    gfx->drawLine(x0, kWxIconY + (int16_t)(28 * kWxIconScale),
+                                  (int16_t)(x0 - (int16_t)(4 * kWxIconScale)),
+                                  kWxIconY + (int16_t)(54 * kWxIconScale), kWxAccent);
+                }
+            }
+            break;
+        case WEATHER_KIND_SNOWING:
+            drawWeatherCloud(kWxCx, kWxIconY - (int16_t)(6 * kWxIconScale), kWxCloud, kWxCloudHi, kWxIconScale);
+            for (int i = -2; i <= 2; i++) {
+                int16_t flakeR = (int16_t)(4 * kWxIconScale);
+                fillOval(kWxCx + (int16_t)(i * 18 * kWxIconScale), kWxIconY + (int16_t)(34 * kWxIconScale),
+                         flakeR, flakeR, 0xEFBF);
+                fillOval(kWxCx + (int16_t)((i * 18 + 6) * kWxIconScale), kWxIconY + (int16_t)(52 * kWxIconScale),
+                         flakeR, flakeR, 0xEFBF);
+            }
+            break;
+        default:
+            drawWeatherCloud(kWxCx, kWxIconY, kWxCloud, kWxCloudHi, kWxIconScale);
+            break;
+    }
+
+    drawTemperatureLineF(kWxTempCyTop, 5, kWxTemp);
+    wxInitAnimAfterFullPaint();
 }
 
 void drawEyes(int16_t eyeXOffset, int16_t eyeYOffset, int16_t eyeRyL, int16_t eyeRyR, uint16_t color) {
@@ -516,17 +875,129 @@ void drawDeltaTimeLine(const String& previous, const String& current, int16_t y,
 }
 
 void updateRecordingEyesAnimation() {
-    // Static red eyes while recording (no spinner animation).
-    gfx->fillScreen(BLACK);
+    const uint32_t now = millis();
+    if (now - lastRecordingEyesUpdate < 80) return;
+    lastRecordingEyesUpdate = now;
 
-    const int16_t yc = 112;
-    const int16_t rx = 46;
-    const int16_t ry = 66;
-    const int16_t cxL = 68;
-    const int16_t cxR = 172;
+    // Subtle movement so recording face doesn't feel static.
+    uint16_t step = (uint16_t)((now / 220) % 8);
+    int16_t eyeXOffset = 0;
+    if (step < 2) eyeXOffset = -3;
+    else if (step < 4) eyeXOffset = -1;
+    else if (step < 6) eyeXOffset = 1;
+    else eyeXOffset = 3;
 
-    fillOval(cxL, yc, rx, ry, RED);
-    fillOval(cxR, yc, rx, ry, RED);
+    int16_t eyeYOffset = 0;
+    int16_t ryPulse = (step % 2 == 0) ? 0 : 2;
+    int16_t eyeRyL = 52 - ryPulse; // slight squint + tiny pulse
+    int16_t eyeRyR = 52 - ryPulse;
+
+    if (!recordingAnim.hasPrevFrame) {
+        gfx->fillScreen(BLACK);
+        drawEyes(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR, RED);
+    } else {
+        drawEyesDelta(
+            recordingAnim.prevEyeXOffset,
+            recordingAnim.prevEyeYOffset,
+            recordingAnim.prevEyeRyL,
+            recordingAnim.prevEyeRyR,
+            eyeXOffset,
+            eyeYOffset,
+            eyeRyL,
+            eyeRyR,
+            RED
+        );
+    }
+
+    // Recording badge in the same area as the thinking question mark.
+    const int16_t recX = 164;
+    const int16_t recY = 24;
+    gfx->fillRect(recX - 18, recY - 1, 18 + (6 * 3) + 2, (8 * 2) + 2, BLACK);
+    fillOval(recX - 10, recY + 7, 4, 4, RED);
+    gfx->setTextSize(2);
+    gfx->setTextColor(RED);
+    gfx->setCursor(recX, recY);
+    gfx->print("REC");
+
+    recordingAnim.prevEyeXOffset = eyeXOffset;
+    recordingAnim.prevEyeYOffset = eyeYOffset;
+    recordingAnim.prevEyeRyL = eyeRyL;
+    recordingAnim.prevEyeRyR = eyeRyR;
+    recordingAnim.hasPrevFrame = true;
+}
+
+void updateUploadingThinkingAnimation() {
+    const uint32_t now = millis();
+    if (now - lastUploadingEyesUpdate < 80) return;
+    lastUploadingEyesUpdate = now;
+
+    // Simple looping "thinking" pose:
+    // - squinty cyan eyes
+    // - gaze shifts up and to one side
+    // - pulsing question mark near top-right
+    uint16_t step = (uint16_t)((now / 220) % 8);
+
+    int16_t eyeXOffset = 0;
+    int16_t eyeYOffset = 0; // centered like idle
+    int16_t eyeRyL = 26;
+    int16_t eyeRyR = 24;
+
+    if (step < 2) {
+        eyeXOffset = -8; // look up-left
+    } else if (step < 4) {
+        eyeXOffset = -4;
+    } else if (step < 6) {
+        eyeXOffset = 4;
+    } else {
+        eyeXOffset = 8; // look up-right
+    }
+
+    if (!uploadAnim.hasPrevFrame) {
+        drawEyes(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR, CYAN);
+    } else {
+        drawEyesDelta(
+            uploadAnim.prevEyeXOffset,
+            uploadAnim.prevEyeYOffset,
+            uploadAnim.prevEyeRyL,
+            uploadAnim.prevEyeRyR,
+            eyeXOffset,
+            eyeYOffset,
+            eyeRyL,
+            eyeRyR,
+            CYAN
+        );
+    }
+
+    // Redraw only the small brow region (old + new bounds).
+    int16_t prevBrowOffset = uploadAnim.prevBrowOffset;
+    int16_t newBrowOffset = eyeXOffset / 2;
+    int16_t browMinX = min((int16_t)(28 + prevBrowOffset), (int16_t)(28 + newBrowOffset));
+    int16_t browMaxX = max((int16_t)(212 + prevBrowOffset), (int16_t)(212 + newBrowOffset));
+    gfx->fillRect(browMinX, 58, browMaxX - browMinX + 1, 14, BLACK);
+    gfx->drawLine(30 + newBrowOffset, 68, 88 + newBrowOffset, 60, CYAN);
+    gfx->drawLine(152 + newBrowOffset, 60, 210 + newBrowOffset, 68, CYAN);
+
+    // Pulsing question mark at top-right.
+    uint8_t qSize = (step % 2 == 0) ? 3 : 2;
+    int16_t qX = 164;
+    int16_t qY = 24;
+    if (uploadAnim.prevQSize > 0) {
+        int16_t prevQw = 6 * uploadAnim.prevQSize;
+        int16_t prevQh = 8 * uploadAnim.prevQSize;
+        gfx->fillRect(qX - 1, qY - 1, prevQw + 2, prevQh + 2, BLACK);
+    }
+    gfx->setTextSize(qSize);
+    gfx->setTextColor(YELLOW);
+    gfx->setCursor(qX, qY);
+    gfx->print("?");
+
+    uploadAnim.prevEyeXOffset = eyeXOffset;
+    uploadAnim.prevEyeYOffset = eyeYOffset;
+    uploadAnim.prevEyeRyL = eyeRyL;
+    uploadAnim.prevEyeRyR = eyeRyR;
+    uploadAnim.prevBrowOffset = newBrowOffset;
+    uploadAnim.prevQSize = qSize;
+    uploadAnim.hasPrevFrame = true;
 }
 
 void updateTimeScreen() {
@@ -759,6 +1230,46 @@ void setupWiFi() {
                 isWsConnected = true;
                 break;
             case WStype_TEXT:
+                if (payload && length > 0) {
+                    StaticJsonDocument<384> doc;
+                    DeserializationError err = deserializeJson(doc, payload, length);
+                    if (!err) {
+                        const char* msgType = doc["type"] | "";
+                        const char* status = doc["status"] | "";
+
+                        if (strcmp(msgType, "gemini_first_token") == 0) {
+                            geminiFirstTokenReceived = true;
+                        } else if (strcmp(msgType, "show_weather") == 0) {
+                            float tRaw = doc["temperature"] | 0.0f;
+                            weatherTempDisplay = (int)(tRaw >= 0.0f ? (tRaw + 0.5f) : (tRaw - 0.5f));
+                            int dur = doc["duration_ms"] | 5000;
+                            const char* cond = doc["condition"] | "cloudy";
+                            if (strcmp(cond, "sunny") == 0) {
+                                weatherKind = WEATHER_KIND_SUNNY;
+                            } else if (strcmp(cond, "cloudy") == 0) {
+                                weatherKind = WEATHER_KIND_CLOUDY;
+                            } else if (strcmp(cond, "partially_cloudy") == 0) {
+                                weatherKind = WEATHER_KIND_PARTIALLY_CLOUDY;
+                            } else if (strcmp(cond, "raining") == 0) {
+                                weatherKind = WEATHER_KIND_RAINING;
+                            } else if (strcmp(cond, "snowing") == 0) {
+                                weatherKind = WEATHER_KIND_SNOWING;
+                            } else {
+                                weatherKind = WEATHER_KIND_CLOUDY;
+                            }
+                            weatherOverlayActive = true;
+                            weatherNeedsRedraw = true;
+                            weatherOverlayUntilMs = millis() + (uint32_t)dur;
+                            if (currentState == STATE_UPLOADING) {
+                                suppressUploadThinkingAfterWeather = true;
+                            }
+                        } else if (strcmp(status, "error") == 0) {
+                            // Don't leave user stuck in thinking animation on backend errors.
+                            geminiFirstTokenReceived = true;
+                        }
+                    }
+                }
+                break;
             case WStype_BIN:
             case WStype_ERROR:          
             case WStype_FRAGMENT_TEXT_START:
@@ -839,8 +1350,11 @@ void uploadDataTask(void * pvParameters) {
             }
 
             triggerUpload = false;
-            currentState = STATE_IDLE;
-            showIdleEyes();
+            if (!isWsConnected) {
+                currentState = STATE_IDLE;
+                suppressUploadThinkingAfterWeather = false;
+                showIdleEyes();
+            }
         }
         
         vTaskDelay(pdMS_TO_TICKS(10)); 
@@ -905,6 +1419,33 @@ void setup() {
 //                ARDUINO LOOP
 // ==========================================
 void loop() {
+    static RobotState previousVisualState = STATE_SETUP;
+
+    // Force a full refresh on transitions to/from the thinking animation.
+    if (currentState != previousVisualState) {
+        if ((currentState == STATE_UPLOADING || previousVisualState == STATE_UPLOADING) && !weatherOverlayActive) {
+            gfx->fillScreen(BLACK);
+            idleAnim.hasPrevFrame = false;
+            uploadAnim.hasPrevFrame = false;
+            uploadAnim.prevQSize = 0;
+            lastUploadingEyesUpdate = 0;
+            lastIdleEyesUpdate = 0;
+            lastRecordingEyesUpdate = 0;
+        }
+        previousVisualState = currentState;
+    }
+
+    if (weatherOverlayActive && millis() >= weatherOverlayUntilMs) {
+        weatherOverlayActive = false;
+        idleAnim.hasPrevFrame = false;
+        if (!timeScreenActive) {
+            showIdleEyes();
+            lastIdleEyesUpdate = 0;
+        } else {
+            gfx->fillScreen(BLACK);
+        }
+    }
+
     // --- RTC SERIAL TICKER ---
     if (millis() - lastRtcPrintTime > 1000) {
         lastRtcPrintTime = millis();
@@ -992,10 +1533,12 @@ void loop() {
                 
                 if (currentState == STATE_IDLE) {
                     Serial.println("\n*** TAP DETECTED: STARTING RECORD ***\n");
+                    weatherOverlayActive = false;
                     currentState = STATE_RECORDING;
                     timeScreenActive = false;
                     resetTimeScreenCache();
                     lastRecordingEyesUpdate = 0; // force immediate redraw
+                    recordingAnim.hasPrevFrame = false;
                     lastFrameTime = 0;
                     recordedAudioLen = 0;
                     video_frame_count = 0;
@@ -1003,10 +1546,12 @@ void loop() {
                 } 
                 else if (currentState == STATE_RECORDING) {
                     Serial.println("\n*** TAP DETECTED: STOPPING RECORD ***\n");
-                    currentState = STATE_UPLOADING; 
+                    currentState = STATE_UPLOADING;
+                    suppressUploadThinkingAfterWeather = false;
                     timeScreenActive = false;
                     resetTimeScreenCache();
-                    updateScreen("SENDING", YELLOW);
+                    lastUploadingEyesUpdate = 0; // force immediate redraw
+                    updateUploadingThinkingAnimation();
                     triggerUpload = true; 
                 }
             }
@@ -1065,9 +1610,34 @@ void loop() {
         return; 
     }
 
-    if (currentState == STATE_RECORDING) {
+    if (geminiFirstTokenReceived && currentState == STATE_UPLOADING) {
+        geminiFirstTokenReceived = false;
+        currentState = STATE_IDLE;
+        suppressUploadThinkingAfterWeather = false;
+        if (weatherOverlayActive) {
+            weatherNeedsRedraw = true;
+        } else {
+            showIdleEyes();
+        }
+    }
+
+    if (weatherOverlayActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
+        if (weatherNeedsRedraw) {
+            drawWeatherOverlay();
+            weatherNeedsRedraw = false;
+        } else {
+            updateWeatherOverlayAnimation(millis());
+        }
+    } else if (currentState == STATE_RECORDING) {
+        updateRecordingEyesAnimation();
         processAudio();
         captureVideoFrame(); 
+    } else if (currentState == STATE_UPLOADING) {
+        if (!suppressUploadThinkingAfterWeather) {
+            updateUploadingThinkingAnimation();
+        } else if (!timeScreenActive) {
+            updateIdleEyesAnimation();
+        }
     } else if (currentState == STATE_IDLE && !timeScreenActive) {
         updateIdleEyesAnimation();
     }

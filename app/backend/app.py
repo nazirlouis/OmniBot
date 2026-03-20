@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import json
+from typing import Optional
+
 from pydantic import BaseModel
 from bleak import BleakScanner, BleakClient
 import subprocess
@@ -30,7 +32,55 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 # Settings Configuration
 SETTINGS_FILE = "bot_settings.json"
 DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
-DEFAULT_SYSTEM_INSTRUCTION = "You are Pixel, a friendly and intelligent small desktop robot.\n\nContext:\n- If I provide audio, I am speaking directly to you through your microphone.\n- If I provide text, I am typing to you from the OmniBot Hub dashboard.\n- If I provide a video, it is a real-time recording from your onboard camera.\n\nRules:\n- Keep your answers concise and conversational, as if we are speaking face-to-face.\n- Only discuss or analyze the video content if it is relevant to my current prompt or question.\n- Do not greet me in every message.\n- You are helpful, slightly curious, and highly efficient."
+DEFAULT_SYSTEM_INSTRUCTION = (
+    "You are Pixel, a friendly and intelligent small desktop robot.\n\n"
+    "Context:\n"
+    "- If I provide audio, I am speaking directly to you through your microphone.\n"
+    "- If I provide text, I am typing to you from the OmniBot Hub dashboard.\n"
+    "- If I provide a video, it is a real-time recording from your onboard camera.\n\n"
+    "Rules:\n"
+    "- Keep your answers concise and conversational, as if we are speaking face-to-face.\n"
+    "- Only discuss or analyze the video content if it is relevant to my current prompt or question.\n"
+    "- Do not greet me in every message.\n"
+    "- You are helpful, slightly curious, and highly efficient.\n\n"
+    "Weather:\n"
+    "- When I ask about weather or current conditions, use Google Search for accurate details when needed.\n"
+    "- Then call show_weather exactly once with condition matching the sky/state and temperature as the numeric "
+    "value in degrees Fahrenheit (number only).\n"
+    "- condition must be one of: sunny, cloudy, partially_cloudy, raining, snowing.\n"
+    "- Still answer me naturally in your reply text."
+)
+
+WEATHER_DISPLAY_MS = 5000
+
+# Event loop used to push WebSocket messages from sync Gemini tool invocations (worker threads).
+_main_async_loop: Optional[asyncio.AbstractEventLoop] = None
+
+# OpenAPI-style declaration matching Gemini function-calling docs
+# (https://ai.google.dev/gemini-api/docs/function-calling — combine with Google Search).
+# The executable implementation is `_make_show_weather_tool` (automatic function calling).
+SHOW_WEATHER_FUNCTION_DECLARATION = {
+    "name": "show_weather",
+    "description": (
+        "Shows weather on the robot round display for several seconds. "
+        "Call when the user asks about weather or conditions; use Google Search grounding when you need live data."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "condition": {
+                "type": "string",
+                "enum": ["sunny", "cloudy", "partially_cloudy", "raining", "snowing"],
+                "description": "Sky / precipitation style for the on-device icon.",
+            },
+            "temperature": {
+                "type": "number",
+                "description": "Air temperature in degrees Fahrenheit (numeric only, e.g. 72).",
+            },
+        },
+        "required": ["condition", "temperature"],
+    },
+}
 
 if not API_KEY:
     print("ERROR: API Key not found in .env file!")
@@ -108,6 +158,44 @@ def create_wav_header(data_size: int, sample_rate: int = 16000, num_channels: in
 
 client = genai.Client(api_key=API_KEY)
 app = FastAPI(title="ESP32 Gemini Brain Monitor")
+
+
+def _google_search_builtin():
+    """Built-in Google Search tool; docs use types.ToolGoogleSearch() when available."""
+    ctor = getattr(types, "ToolGoogleSearch", None)
+    if ctor is not None:
+        return ctor()
+    return types.GoogleSearch()
+
+
+def _pixel_chat_generate_config(*, system_instruction, device_id: str) -> types.GenerateContentConfig:
+    """Tools + server-side tool flag per Gemini 3 multi-tool docs.
+
+    Docs show one types.Tool(google_search=..., function_declarations=[...]) plus
+    include_server_side_tool_invocations on the config. The current google-genai
+    client merges function declarations in a way that drops google_search if both
+    are on the same Tool, so we pass separate Tool(google_search=...) and the
+    show_weather callable (schema aligned with SHOW_WEATHER_FUNCTION_DECLARATION).
+    """
+    show_weather_fn = _make_show_weather_tool(device_id)
+    tools = [
+        types.Tool(google_search=_google_search_builtin()),
+        show_weather_fn,
+    ]
+    fields = types.GenerateContentConfig.model_fields
+    kwargs: dict = {
+        "system_instruction": system_instruction,
+        "thinking_config": types.ThinkingConfig(thinking_level="minimal"),
+        "tools": tools,
+    }
+    if "include_server_side_tool_invocations" in fields:
+        kwargs["include_server_side_tool_invocations"] = True
+    else:
+        kwargs["tool_config"] = types.ToolConfig(
+            include_server_side_tool_invocations=True,
+        )
+    return types.GenerateContentConfig(**kwargs)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -253,6 +341,53 @@ chat_sessions = {}
 chat_session_locks = {}
 vision_enabled_by_device = {}
 
+
+def _make_show_weather_tool(device_id: str):
+    """Builder so each chat session binds show_weather to the correct bot."""
+
+    allowed = frozenset(SHOW_WEATHER_FUNCTION_DECLARATION["parameters"]["properties"]["condition"]["enum"])
+
+    def show_weather(condition: str, temperature: float) -> dict:
+        """Pushes a weather graphic to Pixel's round display for several seconds.
+
+        Same contract as SHOW_WEATHER_FUNCTION_DECLARATION (enum + Fahrenheit).
+        """
+        c = (condition or "").strip().lower().replace(" ", "_").replace("-", "_")
+        if c not in allowed:
+            c = "cloudy"
+        _schedule_weather_to_esp32(device_id, c, float(temperature))
+        return {"ok": True, "display": "weather queued on robot"}
+
+    return show_weather
+
+
+async def _send_weather_json_to_esp32(device_id: str, condition: str, temperature: float) -> None:
+    ws = get_active_esp32_socket(device_id)
+    if not ws:
+        return
+    payload = {
+        "type": "show_weather",
+        "condition": condition,
+        "temperature": temperature,
+        "duration_ms": WEATHER_DISPLAY_MS,
+    }
+    try:
+        await ws.send_text(json.dumps(payload))
+    except Exception as e:
+        print(f"Failed to send show_weather to ESP32: {e}")
+
+
+def _schedule_weather_to_esp32(device_id: str, condition: str, temperature: float) -> None:
+    loop = _main_async_loop
+    if loop is None:
+        print("show_weather: no async loop yet; skipping robot display")
+        return
+    asyncio.run_coroutine_threadsafe(
+        _send_weather_json_to_esp32(device_id, condition, temperature),
+        loop,
+    )
+
+
 def is_vision_enabled(device_id: str) -> bool:
     return vision_enabled_by_device.get(device_id, True)
 
@@ -272,10 +407,10 @@ def get_or_create_chat(device_id: str):
 
     chat = client.chats.create(
         model=model,
-        config=types.GenerateContentConfig(
+        config=_pixel_chat_generate_config(
             system_instruction=system_instruction,
-            thinking_config=types.ThinkingConfig(thinking_level="low")
-        )
+            device_id=device_id,
+        ),
     )
 
     chat_sessions[device_id] = {
@@ -287,9 +422,13 @@ def get_or_create_chat(device_id: str):
 
 async def stream_chat_turn_response(device_id: str, message_content):
     """Streams one turn (text or multimodal) over a persistent chat session."""
+    global _main_async_loop
+    _main_async_loop = asyncio.get_running_loop()
+
     stream_id = str(uuid.uuid4())
     full_text = ""
     loop = asyncio.get_running_loop()
+    first_token_notified = False
 
     await manager.broadcast({
         "type": "ai_response_stream_start",
@@ -320,6 +459,18 @@ async def stream_chat_turn_response(device_id: str, message_content):
 
             if delta:
                 full_text += delta
+
+                if not first_token_notified:
+                    esp32_ws = get_active_esp32_socket(device_id)
+                    if esp32_ws:
+                        try:
+                            await esp32_ws.send_text(json.dumps({
+                                "type": "gemini_first_token"
+                            }))
+                        except Exception as e:
+                            print(f"Failed to notify ESP32 first token: {e}")
+                    first_token_notified = True
+
                 await manager.broadcast({
                     "type": "ai_response_stream_delta",
                     "stream_id": stream_id,

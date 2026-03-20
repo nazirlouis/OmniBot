@@ -3,7 +3,7 @@ python-dotenv
 Pillow
 fastapi
 uvicorn[standard]
-google-genai
+google-genai>=1.50.0
 bleak
 python-multipart
 opencv-python-headless
