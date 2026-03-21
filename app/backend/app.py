@@ -57,14 +57,16 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "Face Animation:\n"
     "- For most conversational replies, call face_animation exactly once before or during your text response.\n"
     "- Use animation speaking for conversational face reactions.\n"
+    "- Use animation happy for a smiling half-cut eye look.\n"
+    "- Use animation mad for an angry half-cut eye look (top of eyes hidden).\n"
     "- Use animation weather only for weather display mode.\n"
-    "- For speaking, pass at most two words shown with the face (e.g. \"hello\" or \"got it\").\n"
+    "- For speaking/happy/mad, pass at most two words shown with the face (e.g. \"hello\" or \"got it\").\n"
     "- Never call face_animation more than once in the same response turn."
 )
 
 WEATHER_DISPLAY_MS = 5000
 FACE_ANIMATION_DISPLAY_MS = 2500
-TOOL_SCHEMA_VERSION = "face-animation-v3"
+TOOL_SCHEMA_VERSION = "face-animation-v5"
 
 # Event loop used to push WebSocket messages from sync Gemini tool invocations (worker threads).
 _main_async_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -106,13 +108,13 @@ FACE_ANIMATION_FUNCTION_DECLARATION = {
         "properties": {
             "animation": {
                 "type": "string",
-                "enum": ["speaking", "weather"],
-                "description": "Display mode on Pixel: speaking face or weather overlay.",
+                "enum": ["speaking", "happy", "mad", "weather"],
+                "description": "Display mode on Pixel: speaking, happy, mad, or weather overlay.",
             },
             "words": {
                 "type": "string",
                 "description": (
-                    "For speaking: at most two words (e.g. \"hello\", \"nice one\"). "
+                    "For speaking/happy/mad: at most two words (e.g. \"hello\", \"nice one\"). "
                     "For weather: \"<condition> <temperature_f>\" (e.g. \"cloudy 74\")."
                 ),
             },
