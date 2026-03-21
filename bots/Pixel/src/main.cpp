@@ -266,8 +266,6 @@ struct WeatherAnimState {
         int16_t x0;
         int16_t y0;
     } rain[9];
-    // Single snowflake (center x/y), below cloud — no kWxBg erase over cloud art.
-    RainDrop snowflake;
 };
 static WeatherAnimState wAnim;
 const uint8_t WIFI_CONNECT_ATTEMPTS = 3;
@@ -390,6 +388,39 @@ static const int16_t kWxIconY = 92;
 static const float kWxIconScale = 1.65f;
 static const int16_t kWxTempCyTop = 142;
 static const uint16_t kWxAnimIntervalMs = 72;
+// Large decorative snowflake (no cloud) for WEATHER_KIND_SNOWING.
+static const int16_t kWxFlakeCx = 120;
+static const int16_t kWxFlakeCy = 86;
+static const int16_t kWxFlakeArm = 54;
+
+static void drawGiantSnowflake(int16_t cx, int16_t cy, int16_t armLen, uint16_t col) {
+    const float pi = 3.1415926f;
+    const int16_t hubR = 5;
+    fillOval(cx, cy, hubR, hubR, col);
+
+    for (int arm = 0; arm < 6; arm++) {
+        float a = (float)arm * pi / 3.0f;
+        int16_t xe = cx + (int16_t)(cosf(a) * (float)armLen);
+        int16_t ye = cy + (int16_t)(sinf(a) * (float)armLen);
+        gfx->drawLine(cx, cy, xe, ye, col);
+
+        float mx = cosf(a) * (float)armLen * 0.52f;
+        float my = sinf(a) * (float)armLen * 0.52f;
+        int16_t mx_i = cx + (int16_t)mx;
+        int16_t my_i = cy + (int16_t)my;
+        const int16_t br = (int16_t)(armLen / 4);
+        gfx->drawLine(mx_i, my_i, mx_i + (int16_t)(cosf(a + 0.65f) * (float)br), my_i + (int16_t)(sinf(a + 0.65f) * (float)br), col);
+        gfx->drawLine(mx_i, my_i, mx_i + (int16_t)(cosf(a - 0.65f) * (float)br), my_i + (int16_t)(sinf(a - 0.65f) * (float)br), col);
+
+        float tx = cosf(a) * (float)armLen * 0.78f;
+        float ty = sinf(a) * (float)armLen * 0.78f;
+        int16_t tx_i = cx + (int16_t)tx;
+        int16_t ty_i = cy + (int16_t)ty;
+        const int16_t tip = (int16_t)(armLen / 5);
+        gfx->drawLine(tx_i, ty_i, tx_i + (int16_t)(cosf(a + 0.5f) * (float)tip), ty_i + (int16_t)(sinf(a + 0.5f) * (float)tip), col);
+        gfx->drawLine(tx_i, ty_i, tx_i + (int16_t)(cosf(a - 0.5f) * (float)tip), ty_i + (int16_t)(sinf(a - 0.5f) * (float)tip), col);
+    }
+}
 
 static void drawTemperatureLineF(int16_t cyTop, uint8_t textSize, uint16_t textColor) {
     char buf[16];
@@ -455,12 +486,6 @@ static void wxInitAnimAfterFullPaint() {
                 n++;
             }
         }
-    }
-    if (weatherKind == WEATHER_KIND_SNOWING) {
-        const float sc = kWxIconScale;
-        const int16_t yTopMin = kWxIconY + (int16_t)(28 * sc);
-        wAnim.snowflake.x0 = kWxCx;
-        wAnim.snowflake.y0 = yTopMin;
     }
 }
 
@@ -546,23 +571,6 @@ static void updateWxRainAnim() {
     }
 }
 
-static void updateWxSnowAnim() {
-    const float sc = kWxIconScale;
-    const int16_t rr = (int16_t)(7 * sc);
-    const int16_t yTopMin = kWxIconY + (int16_t)(28 * sc);
-    const int16_t yTopMax = kWxIconY + (int16_t)(58 * sc);
-
-    int16_t x0 = wAnim.snowflake.x0;
-    int16_t y0 = wAnim.snowflake.y0;
-    fillOval(x0, y0, rr, rr, kWxBg);
-    y0 += 2;
-    if (y0 > yTopMax) {
-        y0 = yTopMin;
-    }
-    wAnim.snowflake.y0 = y0;
-    fillOval(x0, y0, rr, rr, 0xEFBF);
-}
-
 static void updateWeatherOverlayAnimation(uint32_t now) {
     if (now - wAnim.lastTickMs < kWxAnimIntervalMs) {
         return;
@@ -584,8 +592,7 @@ static void updateWeatherOverlayAnimation(uint32_t now) {
             wxRedrawTemperatureOnly();
             break;
         case WEATHER_KIND_SNOWING:
-            updateWxSnowAnim();
-            wxRedrawTemperatureOnly();
+            // Static giant snowflake; full overlay handles paint.
             break;
         default:
             updateWxCloudyAnim();
@@ -596,7 +603,6 @@ static void updateWeatherOverlayAnimation(uint32_t now) {
 static void drawWeatherOverlay() {
     gfx->fillScreen(kWxBg);
     gfx->drawCircle(120, 120, 118, kWxRing);
-    // Prime motion state before drawing (snow uses wAnim.snowflake on first paint).
     wxInitAnimAfterFullPaint();
 
     switch (weatherKind) {
@@ -640,13 +646,9 @@ static void drawWeatherOverlay() {
                 }
             }
             break;
-        case WEATHER_KIND_SNOWING: {
-            const float sc = kWxIconScale;
-            const int16_t rr = (int16_t)(7 * sc);
-            drawWeatherCloud(kWxCx, kWxIconY - (int16_t)(6 * sc), kWxCloud, kWxCloudHi, kWxIconScale);
-            fillOval(wAnim.snowflake.x0, wAnim.snowflake.y0, rr, rr, 0xEFBF);
+        case WEATHER_KIND_SNOWING:
+            drawGiantSnowflake(kWxFlakeCx, kWxFlakeCy, kWxFlakeArm, 0xEFBF);
             break;
-        }
         default:
             drawWeatherCloud(kWxCx, kWxIconY, kWxCloud, kWxCloudHi, kWxIconScale);
             break;
