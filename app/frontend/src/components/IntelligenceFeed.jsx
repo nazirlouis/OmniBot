@@ -134,10 +134,7 @@ const IntelligenceFeed = ({
   textMessage,
   setTextMessage,
   isSendingText,
-  onSendTextCommand,
-  visionEnabled,
-  isUpdatingVision,
-  onToggleVision
+  onSendTextCommand
 }) => {
   const logEndRef = useRef(null);
   const textInputRef = useRef(null);
@@ -157,16 +154,6 @@ const IntelligenceFeed = ({
       <header className="feed-header">
         <h2>Intelligence Feed</h2>
         <div className="feed-header-actions">
-          <button
-            type="button"
-            className={`vision-toggle ${visionEnabled ? 'on' : 'off'}`}
-            onClick={onToggleVision}
-            disabled={isUpdatingVision}
-          >
-            {isUpdatingVision
-              ? 'Updating...'
-              : `Vision ${visionEnabled ? 'On' : 'Off'}`}
-          </button>
           <div className={`ws-badge ${wsStatus}`}>
             <div className="status-dot"></div>
             {wsStatus === 'connected' ? 'Core Connected' : 'Core Disconnected'}

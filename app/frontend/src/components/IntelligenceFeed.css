@@ -66,35 +66,6 @@
 .ws-badge.disconnected { color: var(--error); }
 .ws-badge.disconnected .status-dot { background: var(--error); }
 
-.vision-toggle {
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 0.4rem 0.85rem;
-  font-size: 0.75rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  cursor: pointer;
-  transition: all 0.2s ease;
-}
-
-.vision-toggle.on {
-  background: rgba(63, 185, 80, 0.12);
-  color: var(--success);
-  border-color: rgba(63, 185, 80, 0.35);
-}
-
-.vision-toggle.off {
-  background: rgba(248, 81, 73, 0.08);
-  color: var(--error);
-  border-color: rgba(248, 81, 73, 0.25);
-}
-
-.vision-toggle:disabled {
-  opacity: 0.65;
-  cursor: not-allowed;
-}
-
 .feed-content {
   flex: 1;
   position: relative;

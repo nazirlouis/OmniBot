@@ -15,6 +15,7 @@ const BotSettings = ({ setAppMode }) => {
   const [model, setModel] = useState('gemini-3.1-flash-lite-preview');
   const [systemInstruction, setSystemInstruction] = useState('');
   const [timezoneRule, setTimezoneRule] = useState('EST5EDT,M3.2.0/2,M11.1.0/2');
+  const [visionEnabled, setVisionEnabled] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState(null); // 'success' | 'error' | null
@@ -27,6 +28,7 @@ const BotSettings = ({ setAppMode }) => {
         setModel(data.model);
         setSystemInstruction(data.system_instruction);
         setTimezoneRule(data.timezone_rule || 'EST5EDT,M3.2.0/2,M11.1.0/2');
+        setVisionEnabled(Boolean(data.vision_enabled));
       } catch (err) {
         console.error("Failed to fetch settings", err);
       } finally {
@@ -44,7 +46,8 @@ const BotSettings = ({ setAppMode }) => {
       await updateBotSettings(deviceId, {
         model,
         system_instruction: systemInstruction,
-        timezone_rule: timezoneRule
+        timezone_rule: timezoneRule,
+        vision_enabled: visionEnabled
       });
       setSaveStatus('success');
       setTimeout(() => setSaveStatus(null), 3000); // Clear success message after 3s
@@ -78,6 +81,22 @@ const BotSettings = ({ setAppMode }) => {
 
       <form className="settings-form" onSubmit={handleSave}>
         
+        <div className="form-group">
+          <label htmlFor="visionSelect">Vision Input to Model</label>
+          <div className="select-wrapper">
+            <select
+              id="visionSelect"
+              value={visionEnabled ? 'on' : 'off'}
+              onChange={(e) => setVisionEnabled(e.target.value === 'on')}
+              className="holo-select"
+            >
+              <option value="off">Off</option>
+              <option value="on">On</option>
+            </select>
+          </div>
+          <p className="help-text">Default is Off. This setting is remembered per bot.</p>
+        </div>
+
         <div className="form-group">
           <label htmlFor="timezoneSelect">Timezone (Clock Sync)</label>
           <div className="select-wrapper">

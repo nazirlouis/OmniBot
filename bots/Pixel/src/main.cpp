@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
 
 // ==========================================
@@ -140,6 +141,111 @@ int weatherTempDisplay = 0;
 bool weatherNeedsRedraw = true;
 // After show_weather during upload, do not resume thinking when the overlay ends.
 bool suppressUploadThinkingAfterWeather = false;
+
+bool faceAnimActive = false;
+uint32_t faceAnimStartMs = 0;
+uint32_t faceAnimUntilMs = 0;
+// Up to two words from face_animation tool (shown under eyes).
+char faceAnimWords[64] = "";
+
+#define FACE_ANIM_DURATION_MS 2500
+
+static void setFaceAnimWordsFromPayload(const char* src) {
+    faceAnimWords[0] = '\0';
+    if (!src || !src[0]) {
+        return;
+    }
+    char buf[80];
+    memset(buf, 0, sizeof(buf));
+    strncpy(buf, src, sizeof(buf) - 1);
+    char* p1 = strtok(buf, " \t\r\n");
+    if (!p1) {
+        return;
+    }
+    char* p2 = strtok(NULL, " \t\r\n");
+    if (p2) {
+        snprintf(faceAnimWords, sizeof(faceAnimWords), "%s %s", p1, p2);
+    } else {
+        strncpy(faceAnimWords, p1, sizeof(faceAnimWords) - 1);
+        faceAnimWords[sizeof(faceAnimWords) - 1] = '\0';
+    }
+}
+
+static bool parseWeatherWords(const char* src, uint8_t* outKind, int* outTempF) {
+    if (!src || !outKind || !outTempF) return false;
+    char buf[80];
+    memset(buf, 0, sizeof(buf));
+    strncpy(buf, src, sizeof(buf) - 1);
+    char* p1 = strtok(buf, " \t\r\n");
+    char* p2 = strtok(NULL, " \t\r\n");
+    if (!p1 || !p2) return false;
+
+    if (strcmp(p1, "sunny") == 0) *outKind = WEATHER_KIND_SUNNY;
+    else if (strcmp(p1, "cloudy") == 0) *outKind = WEATHER_KIND_CLOUDY;
+    else if (strcmp(p1, "partially_cloudy") == 0) *outKind = WEATHER_KIND_PARTIALLY_CLOUDY;
+    else if (strcmp(p1, "raining") == 0) *outKind = WEATHER_KIND_RAINING;
+    else if (strcmp(p1, "snowing") == 0) *outKind = WEATHER_KIND_SNOWING;
+    else return false;
+
+    *outTempF = atoi(p2);
+    return true;
+}
+
+// Caption is static for the whole speaking animation: draw once, skip until words change or end.
+static char s_faceCaptionLastText[64] = "";
+static int16_t s_faceCaptionBoxX = 0;
+static int16_t s_faceCaptionBoxY = 0;
+static int16_t s_faceCaptionBoxW = 0;
+static int16_t s_faceCaptionBoxH = 0;
+static bool s_faceCaptionVisible = false;
+
+static void clearFaceAnimCaptionBox() {
+    if (s_faceCaptionVisible) {
+        gfx->fillRect(s_faceCaptionBoxX, s_faceCaptionBoxY, s_faceCaptionBoxW, s_faceCaptionBoxH, BLACK);
+        s_faceCaptionVisible = false;
+    }
+    s_faceCaptionLastText[0] = '\0';
+}
+
+static void drawFaceAnimWordsLine() {
+    if (!faceAnimWords[0]) {
+        clearFaceAnimCaptionBox();
+        return;
+    }
+    // Same string as last draw: do nothing (avoids flicker from per-frame clear+redraw).
+    if (s_faceCaptionVisible && strcmp(faceAnimWords, s_faceCaptionLastText) == 0) {
+        return;
+    }
+
+    clearFaceAnimCaptionBox();
+
+    const uint8_t textSize = 2;
+    const int16_t charW = 6 * textSize;
+    const int16_t charH = 8 * textSize;
+    const int16_t y = 182;
+    int len = (int)strlen(faceAnimWords);
+    if (len < 1) {
+        return;
+    }
+    int16_t x = 120 - (len * charW) / 2;
+    if (x < 4) {
+        x = 4;
+    }
+    int16_t w = (int16_t)(len * charW);
+    gfx->fillRect(x - 2, y - 2, w + 4, charH + 4, BLACK);
+    gfx->setTextSize(textSize);
+    gfx->setTextColor(WHITE);
+    gfx->setCursor(x, y);
+    gfx->print(faceAnimWords);
+
+    strncpy(s_faceCaptionLastText, faceAnimWords, sizeof(s_faceCaptionLastText));
+    s_faceCaptionLastText[sizeof(s_faceCaptionLastText) - 1] = '\0';
+    s_faceCaptionBoxX = x - 2;
+    s_faceCaptionBoxY = y - 2;
+    s_faceCaptionBoxW = w + 4;
+    s_faceCaptionBoxH = charH + 4;
+    s_faceCaptionVisible = true;
+}
 
 // Weather overlay motion (delta-friendly: avoid full-screen clears on each tick).
 struct WeatherAnimState {
@@ -809,6 +915,7 @@ void updateIdleEyesAnimation() {
 
     // Differential redraw: update only pixels that changed between frames.
     if (!idleAnim.hasPrevFrame) {
+        gfx->fillScreen(BLACK);
         drawEyes(idleAnim.lookX, idleAnim.lookY, eyeRyL, eyeRyR, CYAN);
     } else {
         drawEyesDelta(
@@ -964,6 +1071,7 @@ void updateUploadingThinkingAnimation() {
     }
 
     if (!uploadAnim.hasPrevFrame) {
+        gfx->fillScreen(BLACK);
         drawEyes(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR, CYAN);
     } else {
         drawEyesDelta(
@@ -1009,6 +1117,52 @@ void updateUploadingThinkingAnimation() {
     uploadAnim.prevBrowOffset = newBrowOffset;
     uploadAnim.prevQSize = qSize;
     uploadAnim.hasPrevFrame = true;
+}
+
+void updateFaceEmotionAnimation() {
+    const uint32_t now = millis();
+    if (now - lastIdleEyesUpdate < 45) return;
+    lastIdleEyesUpdate = now;
+
+    uint32_t elapsed = now - faceAnimStartMs;
+    int16_t eyeXOffset = idleAnim.lookX;
+    int16_t eyeYOffset = idleAnim.lookY;
+    int16_t eyeRyL = 66;
+    int16_t eyeRyR = 66;
+    // Speaking face only: rhythmic squint pulses (mouth-like cadence).
+    int16_t cadence = (int16_t)triPulse(elapsed % 340, 340, 24);
+    eyeRyL -= cadence;
+    eyeRyR -= cadence;
+
+    if (eyeRyL < 10) eyeRyL = 10;
+    if (eyeRyR < 10) eyeRyR = 10;
+    if (eyeRyL > 78) eyeRyL = 78;
+    if (eyeRyR > 78) eyeRyR = 78;
+
+    if (!idleAnim.hasPrevFrame) {
+        gfx->fillScreen(BLACK);
+        drawEyes(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR, CYAN);
+    } else {
+        drawEyesDelta(
+            idleAnim.prevEyeXOffset,
+            idleAnim.prevEyeYOffset,
+            idleAnim.prevEyeRyL,
+            idleAnim.prevEyeRyR,
+            eyeXOffset,
+            eyeYOffset,
+            eyeRyL,
+            eyeRyR,
+            CYAN
+        );
+    }
+
+    drawFaceAnimWordsLine();
+
+    idleAnim.prevEyeXOffset = eyeXOffset;
+    idleAnim.prevEyeYOffset = eyeYOffset;
+    idleAnim.prevEyeRyL = eyeRyL;
+    idleAnim.prevEyeRyR = eyeRyR;
+    idleAnim.hasPrevFrame = true;
 }
 
 void updateTimeScreen() {
@@ -1399,6 +1553,45 @@ void setupWiFi() {
                                 syncRtcFromWifiNtp();
                                 lastRtcWifiSyncAttemptMs = millis();
                             }
+                        } else if (strcmp(msgType, "face_animation") == 0) {
+                            const char* anim = doc["animation"] | "speaking";
+                            const char* w = doc["words"] | "";
+                            int dur = doc["duration_ms"] | FACE_ANIM_DURATION_MS;
+                            if (dur < 800) dur = 800;
+                            if (dur > 10000) dur = 10000;
+
+                            if (strcmp(anim, "weather") == 0) {
+                                uint8_t kind = WEATHER_KIND_CLOUDY;
+                                int tempF = 72;
+                                if (parseWeatherWords(w, &kind, &tempF)) {
+                                    weatherKind = kind;
+                                    weatherTempDisplay = tempF;
+                                } else {
+                                    weatherKind = WEATHER_KIND_CLOUDY;
+                                    weatherTempDisplay = 72;
+                                }
+                                weatherOverlayActive = true;
+                                weatherNeedsRedraw = true;
+                                weatherOverlayUntilMs = millis() + (uint32_t)dur;
+                                faceAnimActive = false;
+                                faceAnimWords[0] = '\0';
+                                if (currentState == STATE_UPLOADING) {
+                                    suppressUploadThinkingAfterWeather = true;
+                                }
+                            } else {
+                                setFaceAnimWordsFromPayload(w);
+                                gfx->fillScreen(BLACK);
+                                // Force caption redraw; screen was cleared even if words match last animation.
+                                s_faceCaptionLastText[0] = '\0';
+                                s_faceCaptionVisible = false;
+                                faceAnimActive = true;
+                                faceAnimStartMs = millis();
+                                faceAnimUntilMs = millis() + (uint32_t)FACE_ANIM_DURATION_MS;
+                                idleAnim.hasPrevFrame = false;
+                                if (!timeScreenActive && !weatherOverlayActive && !idleAnim.hasPrevFrame) {
+                                    idleAnim.hasPrevFrame = false;
+                                }
+                            }
                         } else if (strcmp(msgType, "show_weather") == 0) {
                             float tRaw = doc["temperature"] | 0.0f;
                             weatherTempDisplay = (int)(tRaw >= 0.0f ? (tRaw + 0.5f) : (tRaw - 0.5f));
@@ -1599,11 +1792,24 @@ void loop() {
     if (weatherOverlayActive && millis() >= weatherOverlayUntilMs) {
         weatherOverlayActive = false;
         idleAnim.hasPrevFrame = false;
-        if (!timeScreenActive) {
+        if (!timeScreenActive && !faceAnimActive) {
             showIdleEyes();
             lastIdleEyesUpdate = 0;
         } else {
             gfx->fillScreen(BLACK);
+        }
+    }
+
+    if (faceAnimActive && millis() >= faceAnimUntilMs) {
+        faceAnimActive = false;
+        faceAnimWords[0] = '\0';
+        clearFaceAnimCaptionBox();
+        gfx->fillScreen(BLACK);
+        idleAnim.hasPrevFrame = false;
+        uploadAnim.hasPrevFrame = false;
+        recordingAnim.hasPrevFrame = false;
+        if (!timeScreenActive && !weatherOverlayActive && currentState == STATE_IDLE) {
+            lastIdleEyesUpdate = 0;
         }
     }
 
@@ -1817,6 +2023,9 @@ void loop() {
         suppressUploadThinkingAfterWeather = false;
         if (weatherOverlayActive) {
             weatherNeedsRedraw = true;
+        } else if (faceAnimActive) {
+            // Keep the active face animation fully in control of the frame.
+            lastIdleEyesUpdate = 0;
         } else {
             showIdleEyes();
         }
@@ -1829,6 +2038,8 @@ void loop() {
         } else {
             updateWeatherOverlayAnimation(millis());
         }
+    } else if (faceAnimActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
+        updateFaceEmotionAnimation();
     } else if (currentState == STATE_RECORDING) {
         updateRecordingEyesAnimation();
         processAudio();

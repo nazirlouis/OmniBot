@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import json
+import re
 from typing import Optional
 
 from pydantic import BaseModel
@@ -33,6 +34,7 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 SETTINGS_FILE = "bot_settings.json"
 DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
 DEFAULT_TIMEZONE_RULE = "EST5EDT,M3.2.0/2,M11.1.0/2"
+DEFAULT_VISION_ENABLED = False
 DEFAULT_SYSTEM_INSTRUCTION = (
     "You are Pixel, a friendly and intelligent small desktop robot.\n\n"
     "Context:\n"
@@ -46,13 +48,23 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "- You are helpful, slightly curious, and highly efficient.\n\n"
     "Weather:\n"
     "- When I ask about weather or current conditions, use Google Search for accurate details when needed.\n"
-    "- Then call show_weather exactly once with condition matching the sky/state and temperature as the numeric "
-    "value in degrees Fahrenheit (number only).\n"
+    "- Then call face_animation exactly once with animation set to weather and words formatted as "
+    "\"<condition> <temperature_f>\", e.g. \"cloudy 74\".\n"
     "- condition must be one of: sunny, cloudy, partially_cloudy, raining, snowing.\n"
-    "- Still answer me naturally in your reply text."
+    "- Do NOT use animation speaking for weather turns.\n"
+    "- Do NOT pass JSON in words; words must be plain text in the exact 2-token format above.\n"
+    "- Still answer me naturally in your reply text.\n\n"
+    "Face Animation:\n"
+    "- For most conversational replies, call face_animation exactly once before or during your text response.\n"
+    "- Use animation speaking for conversational face reactions.\n"
+    "- Use animation weather only for weather display mode.\n"
+    "- For speaking, pass at most two words shown with the face (e.g. \"hello\" or \"got it\").\n"
+    "- Never call face_animation more than once in the same response turn."
 )
 
 WEATHER_DISPLAY_MS = 5000
+FACE_ANIMATION_DISPLAY_MS = 2500
+TOOL_SCHEMA_VERSION = "face-animation-v3"
 
 # Event loop used to push WebSocket messages from sync Gemini tool invocations (worker threads).
 _main_async_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -83,6 +95,35 @@ SHOW_WEATHER_FUNCTION_DECLARATION = {
     },
 }
 
+FACE_ANIMATION_FUNCTION_DECLARATION = {
+    "name": "face_animation",
+    "description": (
+        "Animates Pixel's speaking face on the round display. "
+        "Pass a short words caption (at most two words). Display duration is fixed on the device."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "animation": {
+                "type": "string",
+                "enum": ["speaking", "weather"],
+                "description": "Display mode on Pixel: speaking face or weather overlay.",
+            },
+            "words": {
+                "type": "string",
+                "description": (
+                    "For speaking: at most two words (e.g. \"hello\", \"nice one\"). "
+                    "For weather: \"<condition> <temperature_f>\" (e.g. \"cloudy 74\")."
+                ),
+            },
+        },
+        "required": ["animation", "words"],
+    },
+}
+
+# Per-device, per-turn tool usage guardrails.
+turn_tool_state_by_device: dict[str, dict[str, bool]] = {}
+
 if not API_KEY:
     print("ERROR: API Key not found in .env file!")
     exit()
@@ -111,6 +152,7 @@ def get_bot_settings(device_id: str):
         "model": bot_conf.get("model", DEFAULT_MODEL),
         "system_instruction": bot_conf.get("system_instruction", DEFAULT_SYSTEM_INSTRUCTION),
         "timezone_rule": bot_conf.get("timezone_rule", DEFAULT_TIMEZONE_RULE),
+        "vision_enabled": bool(bot_conf.get("vision_enabled", DEFAULT_VISION_ENABLED)),
     }
 
 def assemble_video(jpeg_frames: list[bytes], fps: int = 10) -> bytes:
@@ -177,12 +219,12 @@ def _pixel_chat_generate_config(*, system_instruction, device_id: str) -> types.
     include_server_side_tool_invocations on the config. The current google-genai
     client merges function declarations in a way that drops google_search if both
     are on the same Tool, so we pass separate Tool(google_search=...) and the
-    show_weather callable (schema aligned with SHOW_WEATHER_FUNCTION_DECLARATION).
+    show_weather + face_animation callables.
     """
-    show_weather_fn = _make_show_weather_tool(device_id)
+    face_animation_fn = _make_face_animation_tool(device_id)
     tools = [
         types.Tool(google_search=_google_search_builtin()),
-        show_weather_fn,
+        face_animation_fn,
     ]
     fields = types.GenerateContentConfig.model_fields
     kwargs: dict = {
@@ -249,6 +291,7 @@ class BotSettingsSchema(BaseModel):
     model: str
     system_instruction: str
     timezone_rule: str = DEFAULT_TIMEZONE_RULE
+    vision_enabled: bool = DEFAULT_VISION_ENABLED
 
 class TextCommandRequest(BaseModel):
     message: str
@@ -337,9 +380,12 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
         "model": new_settings.model,
         "system_instruction": new_settings.system_instruction,
         "timezone_rule": new_settings.timezone_rule or DEFAULT_TIMEZONE_RULE,
+        "vision_enabled": bool(new_settings.vision_enabled),
     }
     save_all_settings(settings)
+    vision_enabled_by_device[device_id] = settings[device_id]["vision_enabled"]
     timezone_rule_by_device[device_id] = settings[device_id]["timezone_rule"]
+    await _send_runtime_vision_to_esp32(device_id, settings[device_id]["vision_enabled"])
     await _send_runtime_timezone_to_esp32(device_id, settings[device_id]["timezone_rule"])
     return {"status": "success", "settings": settings[device_id]}
 
@@ -367,6 +413,10 @@ def _make_show_weather_tool(device_id: str):
         c = (condition or "").strip().lower().replace(" ", "_").replace("-", "_")
         if c not in allowed:
             c = "cloudy"
+        tool_state = turn_tool_state_by_device.setdefault(device_id, {"show_weather": False, "face_animation": False})
+        if tool_state.get("face_animation", False):
+            return {"ok": False, "skipped": True, "reason": "face_animation already called this turn"}
+        tool_state["show_weather"] = True
         _schedule_weather_to_esp32(device_id, c, float(temperature))
         _broadcast_tool_call_to_frontend(
             "show_weather",
@@ -378,6 +428,66 @@ def _make_show_weather_tool(device_id: str):
         return {"ok": True, "display": "weather queued on robot"}
 
     return show_weather
+
+
+def _clamp_face_animation_words(raw: str) -> str:
+    parts = (raw or "").strip().split()
+    return " ".join(parts[:2])
+
+
+def _normalize_weather_words(raw: str) -> str:
+    allowed = frozenset(SHOW_WEATHER_FUNCTION_DECLARATION["parameters"]["properties"]["condition"]["enum"])
+    text = (raw or "").strip().lower().replace("-", "_")
+    condition_match = re.search(r"\b(sunny|cloudy|partially_cloudy|raining|snowing)\b", text)
+    temp_match = re.search(r"(-?\d+(?:\.\d+)?)", text)
+    condition = condition_match.group(1) if condition_match else "cloudy"
+    if condition not in allowed:
+        condition = "cloudy"
+    temp = int(float(temp_match.group(1))) if temp_match else 72
+    return f"{condition} {temp}"
+
+
+def _make_face_animation_tool(device_id: str):
+    """Builder so each chat session binds face_animation to the correct bot."""
+
+    allowed = frozenset(
+        FACE_ANIMATION_FUNCTION_DECLARATION["parameters"]["properties"]["animation"]["enum"]
+    )
+
+    def face_animation(animation: str, words: str = "") -> dict:
+        a = (animation or "").strip().lower()
+        if a not in allowed:
+            a = "speaking"
+        raw_words = words or ""
+
+        # Safety: if weather-like payload arrives while animation is speaking, reroute.
+        if a == "speaking":
+            weather_guess = _normalize_weather_words(raw_words)
+            if weather_guess != "cloudy 72" or any(
+                token in raw_words.lower() for token in ["condition", "temperature", "sunny", "cloudy", "raining", "snowing"]
+            ):
+                if any(t in raw_words.lower() for t in ["sunny", "cloudy", "partially", "raining", "snowing", "condition", "temperature"]):
+                    a = "weather"
+
+        w = _normalize_weather_words(raw_words) if a == "weather" else _clamp_face_animation_words(raw_words)
+
+        tool_state = turn_tool_state_by_device.setdefault(device_id, {"show_weather": False, "face_animation": False})
+        if tool_state.get("face_animation", False):
+            return {"ok": False, "skipped": True, "reason": "face_animation already called this turn"}
+        tool_state["face_animation"] = True
+
+        _schedule_face_animation_to_esp32(device_id, a, w)
+        _broadcast_tool_call_to_frontend(
+            "face_animation",
+            {
+                "animation": a,
+                "words": w,
+                "duration_ms": WEATHER_DISPLAY_MS if a == "weather" else FACE_ANIMATION_DISPLAY_MS,
+            },
+        )
+        return {"ok": True, "display": "face animation queued on robot"}
+
+    return face_animation
 
 
 async def _send_weather_json_to_esp32(device_id: str, condition: str, temperature: float) -> None:
@@ -406,6 +516,33 @@ def _schedule_weather_to_esp32(device_id: str, condition: str, temperature: floa
         loop,
     )
 
+
+async def _send_face_animation_json_to_esp32(device_id: str, animation: str, words: str) -> None:
+    ws = get_active_esp32_socket(device_id)
+    if not ws:
+        return
+    payload = {
+        "type": "face_animation",
+        "animation": animation,
+        "duration_ms": WEATHER_DISPLAY_MS if animation == "weather" else FACE_ANIMATION_DISPLAY_MS,
+        "words": words,
+    }
+    try:
+        await ws.send_text(json.dumps(payload))
+    except Exception as e:
+        print(f"Failed to send face_animation to ESP32: {e}")
+
+
+def _schedule_face_animation_to_esp32(device_id: str, animation: str, words: str) -> None:
+    loop = _main_async_loop
+    if loop is None:
+        print("face_animation: no async loop yet; skipping robot display")
+        return
+    asyncio.run_coroutine_threadsafe(
+        _send_face_animation_json_to_esp32(device_id, animation, words),
+        loop,
+    )
+
 def _broadcast_tool_call_to_frontend(function_name: str, arguments: dict) -> None:
     """Broadcast tool-call telemetry to the dashboard websocket monitor.
 
@@ -429,7 +566,9 @@ def _broadcast_tool_call_to_frontend(function_name: str, arguments: dict) -> Non
 
 
 def is_vision_enabled(device_id: str) -> bool:
-    return vision_enabled_by_device.get(device_id, True)
+    if device_id in vision_enabled_by_device:
+        return bool(vision_enabled_by_device[device_id])
+    return bool(get_bot_settings(device_id).get("vision_enabled", DEFAULT_VISION_ENABLED))
 
 
 async def _send_runtime_vision_to_esp32(device_id: str, enabled: bool) -> None:
@@ -480,6 +619,7 @@ def get_or_create_chat(device_id: str):
         current
         and current.get("model") == model
         and current.get("system_instruction") == system_instruction
+        and current.get("tool_schema_version") == TOOL_SCHEMA_VERSION
     ):
         return current["chat"]
 
@@ -494,7 +634,8 @@ def get_or_create_chat(device_id: str):
     chat_sessions[device_id] = {
         "chat": chat,
         "model": model,
-        "system_instruction": system_instruction
+        "system_instruction": system_instruction,
+        "tool_schema_version": TOOL_SCHEMA_VERSION,
     }
     return chat
 
@@ -515,6 +656,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
 
     lock = chat_session_locks.setdefault(device_id, asyncio.Lock())
     async with lock:
+        turn_tool_state_by_device[device_id] = {"show_weather": False, "face_animation": False}
         chat = get_or_create_chat(device_id)
         response_stream = chat.send_message_stream(message_content)
 
@@ -572,6 +714,8 @@ async def stream_chat_turn_response(device_id: str, message_content):
                     "data": delta
                 })
 
+    turn_tool_state_by_device.pop(device_id, None)
+
     await manager.broadcast({
         "type": "ai_response_stream_end",
         "stream_id": stream_id,
@@ -599,6 +743,13 @@ async def esp32_stream_endpoint(websocket: WebSocket):
         "video_frames": [],
         "device_id": stream_device_id,
     }
+    await manager.broadcast(
+        {
+            "type": "esp32_connected",
+            "device_id": stream_device_id,
+            "data": "ESP32 stream connected",
+        }
+    )
 
     try:
         await websocket.send_text(
@@ -632,8 +783,14 @@ async def esp32_stream_endpoint(websocket: WebSocket):
                     msg_type = j.get("type", "")
                     dev_id = active_streams[websocket].get("device_id", "default_bot")
                     if msg_type == "vision_changed":
-                        vision_enabled_by_device[dev_id] = j.get("enabled", True)
-                        await manager.broadcast({"type": "vision_changed", "device_id": dev_id, "enabled": j.get("enabled", True)})
+                        enabled = bool(j.get("enabled", DEFAULT_VISION_ENABLED))
+                        vision_enabled_by_device[dev_id] = enabled
+                        settings = get_all_settings()
+                        bot_conf = settings.get(dev_id, get_bot_settings(dev_id))
+                        bot_conf["vision_enabled"] = enabled
+                        settings[dev_id] = bot_conf
+                        save_all_settings(settings)
+                        await manager.broadcast({"type": "vision_changed", "device_id": dev_id, "enabled": enabled})
                     elif msg_type == "timezone_changed":
                         tz = str(j.get("timezone_rule", DEFAULT_TIMEZONE_RULE) or DEFAULT_TIMEZONE_RULE)
                         timezone_rule_by_device[dev_id] = tz
@@ -738,11 +895,27 @@ async def esp32_stream_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         print("ESP32 disconnected from streaming endpoint.")
         if websocket in active_streams:
+            dev_id = active_streams[websocket].get("device_id", "default_bot")
             del active_streams[websocket]
+            await manager.broadcast(
+                {
+                    "type": "esp32_disconnected",
+                    "device_id": dev_id,
+                    "data": "ESP32 stream disconnected",
+                }
+            )
     except Exception as e:
         print(f"Stream error: {e}")
         if websocket in active_streams:
+            dev_id = active_streams[websocket].get("device_id", "default_bot")
             del active_streams[websocket]
+            await manager.broadcast(
+                {
+                    "type": "esp32_disconnected",
+                    "device_id": dev_id,
+                    "data": "ESP32 stream disconnected",
+                }
+            )
 
 @app.post("/api/text-command")
 async def text_command(req: TextCommandRequest):
@@ -789,6 +962,11 @@ async def get_vision_setting(device_id: str):
 async def set_vision_setting(device_id: str, payload: VisionToggleRequest):  # noqa: F811
     """Sets whether video frames are included in model requests."""
     vision_enabled_by_device[device_id] = payload.enabled
+    settings = get_all_settings()
+    bot_conf = settings.get(device_id, get_bot_settings(device_id))
+    bot_conf["vision_enabled"] = bool(payload.enabled)
+    settings[device_id] = bot_conf
+    save_all_settings(settings)
     await _send_runtime_vision_to_esp32(device_id, payload.enabled)
     return {"status": "success", "device_id": device_id, "enabled": payload.enabled}
 

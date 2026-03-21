@@ -18,7 +18,19 @@ const Sidebar = ({
         <h3>Connected Bots</h3>
         
         {/* Pixel Bot Status Card */}
-        <div className={`bot-card ${esp32Status}`}>
+        <div
+          className={`bot-card ${esp32Status}`}
+          role="button"
+          tabIndex={0}
+          title="Open Pixel Intelligence Feed"
+          onClick={() => setAppMode('dashboard')}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              setAppMode('dashboard');
+            }
+          }}
+        >
           <div className="bot-card-header">
             <div className="bot-icon">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="holo-icon">
@@ -40,7 +52,10 @@ const Sidebar = ({
           <button 
             className="bot-settings-btn" 
             title="Configure Bot Settings"
-            onClick={() => setAppMode('settings')}
+            onClick={(e) => {
+              e.stopPropagation();
+              setAppMode('settings');
+            }}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <circle cx="12" cy="12" r="3"></circle>
@@ -51,18 +66,6 @@ const Sidebar = ({
       </div>
 
       <div className="sidebar-actions">
-        <button 
-          className={`nav-btn ${appMode === 'dashboard' ? 'active' : ''}`}
-          onClick={() => setAppMode('dashboard')}
-        >
-          <span className="nav-icon">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
-            </svg>
-          </span>
-          Intelligence Feed
-        </button>
-        
         <button 
           className={`nav-btn ${appMode === 'setup' ? 'active' : ''}`}
           onClick={() => {
