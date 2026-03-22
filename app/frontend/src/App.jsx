@@ -83,6 +83,15 @@ function App() {
             appendAiStreamDelta(message.stream_id, message.data);
           } else if (message.type === 'ai_response_stream_end') {
             setEsp32Status('online');
+            if (message.maps_sources && message.maps_sources.length > 0) {
+              setLogs((prev) =>
+                prev.map((log) =>
+                  log.sender === 'ai' && log.streamId === message.stream_id
+                    ? { ...log, mapsSources: message.maps_sources }
+                    : log
+                )
+              );
+            }
           } else if (message.type === 'error') {
             setEsp32Status('online');
             addLog('error', message.data);

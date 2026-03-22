@@ -77,7 +77,7 @@
   margin: 0;
 }
 
-.holo-select, .holo-textarea {
+.holo-select, .holo-textarea, .holo-input {
   width: 100%;
   background: rgba(255,255,255,0.8);
   border: 1px solid rgba(0, 102, 204, 0.2);
@@ -88,6 +88,7 @@
   color: var(--text-main);
   transition: all 0.2s ease;
   outline: none;
+  box-sizing: border-box;
 }
 
 .holo-textarea {
@@ -96,10 +97,40 @@
   line-height: 1.5;
 }
 
-.holo-select:focus, .holo-textarea:focus {
+.holo-select:focus, .holo-textarea:focus, .holo-input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(0, 136, 255, 0.15);
   background: #ffffff;
+}
+
+.maps-resolved-block {
+  padding: 1rem 1.25rem;
+  border-radius: 10px;
+  background: rgba(0, 136, 255, 0.06);
+  border: 1px solid rgba(0, 102, 204, 0.15);
+}
+
+.maps-resolved-title {
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.maps-coords {
+  font-family: ui-monospace, monospace;
+  font-size: 0.9rem;
+  margin: 0;
+  color: var(--text-main);
+}
+
+.maps-display-name {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin: 0.5rem 0 0;
+  line-height: 1.4;
+}
+
+.maps-geocode-error {
+  margin-top: 0;
 }
 
 .select-wrapper {

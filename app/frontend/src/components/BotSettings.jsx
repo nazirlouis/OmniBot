@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import './BotSettings.css';
 import { getBotSettings, updateBotSettings } from './setupService';
+import { getCountryOptions, normalizeSavedCountryCode } from './countrySelectOptions';
 
 const TIMEZONE_OPTIONS = [
   { value: 'EST5EDT,M3.2.0/2,M11.1.0/2', label: 'US Eastern (EST/EDT)' },
@@ -16,10 +17,18 @@ const BotSettings = ({ setAppMode }) => {
   const [systemInstruction, setSystemInstruction] = useState('');
   const [timezoneRule, setTimezoneRule] = useState('EST5EDT,M3.2.0/2,M11.1.0/2');
   const [visionEnabled, setVisionEnabled] = useState(false);
+  const [mapsGroundingEnabled, setMapsGroundingEnabled] = useState(false);
+  const [mapsPostalCode, setMapsPostalCode] = useState('');
+  const [mapsCountry, setMapsCountry] = useState('');
+  const [mapsLatitude, setMapsLatitude] = useState(null);
+  const [mapsLongitude, setMapsLongitude] = useState(null);
+  const [mapsDisplayName, setMapsDisplayName] = useState('');
+  const [mapsGeocodeMessage, setMapsGeocodeMessage] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState(null); // 'success' | 'error' | null
   const hasTimezoneOption = TIMEZONE_OPTIONS.some((tz) => tz.value === timezoneRule);
+  const countryOptions = useMemo(() => getCountryOptions(), []);
 
   useEffect(() => {
     const fetchSettings = async () => {
@@ -29,6 +38,13 @@ const BotSettings = ({ setAppMode }) => {
         setSystemInstruction(data.system_instruction);
         setTimezoneRule(data.timezone_rule || 'EST5EDT,M3.2.0/2,M11.1.0/2');
         setVisionEnabled(Boolean(data.vision_enabled));
+        setMapsGroundingEnabled(Boolean(data.maps_grounding_enabled));
+        setMapsPostalCode(data.maps_postal_code || '');
+        setMapsCountry(normalizeSavedCountryCode(data.maps_country) || '');
+        setMapsLatitude(data.maps_latitude ?? null);
+        setMapsLongitude(data.maps_longitude ?? null);
+        setMapsDisplayName(data.maps_display_name || '');
+        setMapsGeocodeMessage(null);
       } catch (err) {
         console.error("Failed to fetch settings", err);
       } finally {
@@ -42,13 +58,28 @@ const BotSettings = ({ setAppMode }) => {
     e.preventDefault();
     setIsSaving(true);
     setSaveStatus(null);
+    setMapsGeocodeMessage(null);
     try {
-      await updateBotSettings(deviceId, {
+      const res = await updateBotSettings(deviceId, {
         model,
         system_instruction: systemInstruction,
         timezone_rule: timezoneRule,
-        vision_enabled: visionEnabled
+        vision_enabled: visionEnabled,
+        maps_grounding_enabled: mapsGroundingEnabled,
+        maps_postal_code: mapsPostalCode,
+        maps_country: mapsCountry,
+        maps_latitude: mapsLatitude,
+        maps_longitude: mapsLongitude,
+        maps_display_name: mapsDisplayName || null
       });
+      const saved = res.settings || {};
+      setMapsLatitude(saved.maps_latitude ?? null);
+      setMapsLongitude(saved.maps_longitude ?? null);
+      setMapsDisplayName(saved.maps_display_name || '');
+      const geo = res.maps_geocode;
+      if (geo && geo.ok === false && geo.error) {
+        setMapsGeocodeMessage(geo.error);
+      }
       setSaveStatus('success');
       setTimeout(() => setSaveStatus(null), 3000); // Clear success message after 3s
     } catch (err) {
@@ -118,6 +149,79 @@ const BotSettings = ({ setAppMode }) => {
           </div>
           <p className="help-text">Used by Pixel for NTP sync and RTC display time.</p>
         </div>
+
+        <div className="form-group">
+          <label htmlFor="mapsGroundingSelect">Google Maps grounding (Gemini)</label>
+          <div className="select-wrapper">
+            <select
+              id="mapsGroundingSelect"
+              value={mapsGroundingEnabled ? 'on' : 'off'}
+              onChange={(e) => setMapsGroundingEnabled(e.target.value === 'on')}
+              className="holo-select"
+            >
+              <option value="off">Off</option>
+              <option value="on">On</option>
+            </select>
+          </div>
+          <p className="help-text">
+            When on, Pixel uses your postal location for local {'"near me"'} answers via Google Maps grounding.
+            The Gemini API does not allow Maps and Google Search in the same session, so{' '}
+            <strong>Search grounding is off</strong> while this is on. Enter postal/ZIP and country; geocoding uses
+            OpenStreetMap Nominatim (set <code>NOMINATIM_USER_AGENT</code> in backend .env). Countries from{' '}
+            <code>i18n-iso-countries</code>.
+          </p>
+        </div>
+
+        <div className="form-group">
+          <label htmlFor="mapsCountrySelect">Country</label>
+          <div className="select-wrapper">
+            <select
+              id="mapsCountrySelect"
+              value={mapsCountry}
+              onChange={(e) => setMapsCountry(e.target.value)}
+              className="holo-select"
+            >
+              <option value="">Select country</option>
+              {countryOptions.map(({ code, name }) => (
+                <option key={code} value={code}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div className="form-group">
+          <label htmlFor="mapsPostal">Postal or ZIP code</label>
+          <input
+            id="mapsPostal"
+            type="text"
+            className="holo-input"
+            value={mapsPostalCode}
+            onChange={(e) => setMapsPostalCode(e.target.value)}
+            placeholder="e.g. 30309 or SW1A 1AA"
+            autoComplete="postal-code"
+          />
+          <p className="help-text">Nominatim uses this together with your country to pick a map center.</p>
+        </div>
+
+        {(mapsLatitude != null && mapsLongitude != null) && (
+          <div className="form-group maps-resolved-block">
+            <p className="help-text maps-resolved-title">Resolved for Maps tool</p>
+            <p className="maps-coords">
+              {Number(mapsLatitude).toFixed(5)}, {Number(mapsLongitude).toFixed(5)}
+            </p>
+            {mapsDisplayName && (
+              <p className="maps-display-name">{mapsDisplayName}</p>
+            )}
+          </div>
+        )}
+
+        {mapsGeocodeMessage && (
+          <div className="status-message error slide-enter maps-geocode-error">
+            Location lookup failed: {mapsGeocodeMessage}
+          </div>
+        )}
 
         <div className="form-group">
           <label htmlFor="modelSelect">Generative Model Core</label>

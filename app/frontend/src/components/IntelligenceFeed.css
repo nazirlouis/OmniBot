@@ -73,6 +73,41 @@
   background: var(--bg-color);
 }
 
+.maps-grounding-sources {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid rgba(0, 102, 204, 0.12);
+}
+
+.maps-grounding-line {
+  margin: 0 0 0.35rem;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--text-main);
+}
+
+.maps-grounding-line a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.maps-grounding-line a:hover {
+  text-decoration: none;
+}
+
+/* Google Maps text attribution guidelines: Roboto optional; neutral gray */
+.gmp-attribution {
+  margin: 0;
+  font-family: Roboto, ui-sans-serif, system-ui, sans-serif;
+  font-style: normal;
+  font-weight: 400;
+  font-size: 0.8125rem;
+  letter-spacing: normal;
+  white-space: nowrap;
+  color: #5e5e5e;
+}
+
 .empty-feed {
   position: absolute;
   inset: 0;

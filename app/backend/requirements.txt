@@ -1,6 +1,6 @@
 requests
 python-dotenv
-Pillow
+Pillow>=11.0.0,<12.0.0
 fastapi
 uvicorn[standard]
 google-genai>=1.50.0
@@ -9,3 +9,5 @@ python-multipart
 opencv-python-headless
 imageio
 imageio-ffmpeg
+semantic-router[fastembed]>=0.1.12
+fastembed>=0.7.0

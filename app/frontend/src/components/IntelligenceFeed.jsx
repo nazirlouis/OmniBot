@@ -43,6 +43,27 @@ const parseShowWeatherFromText = (text) => {
   return { condition, temperature };
 };
 
+const MapsGroundingSources = ({ sources }) => {
+  if (!sources || sources.length === 0) return null;
+  return (
+    <div className="maps-grounding-sources">
+      <p className="maps-grounding-line">
+        {sources.map((s, i) => (
+          <span key={s.uri}>
+            {i > 0 && <span>, </span>}
+            <a href={s.uri} target="_blank" rel="noopener noreferrer">
+              {s.title || 'Place'}
+            </a>
+          </span>
+        ))}
+      </p>
+      <p className="gmp-attribution" translate="no">
+        Google Maps
+      </p>
+    </div>
+  );
+};
+
 const WeatherOverlay = ({ condition, temperature, durationMs = 5000 }) => {
   const [animating, setAnimating] = useState(true);
 
@@ -217,7 +238,12 @@ const IntelligenceFeed = ({
                   ) : log.sender === 'tool' ? (
                     <code className="tool-call-code">{log.text}</code>
                   ) : (
-                    log.text
+                    <>
+                      {log.text}
+                      {log.sender === 'ai' && log.mapsSources && (
+                        <MapsGroundingSources sources={log.mapsSources} />
+                      )}
+                    </>
                   )}
                 </div>
               </div>
