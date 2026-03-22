@@ -29,7 +29,7 @@ Firmware lives in this folder as a **PlatformIO** project (`platformio.ini` + `s
 - **Gemini** — backend builds WAV and optional MP4 from frames, runs multimodal chat, returns text to the device
 - **On-device settings** — swipe-down screen to toggle vision; syncs to backend over the same WebSocket
 - **Clock screen** — swipe to show RTC-oriented time display (timezone rule pushed from backend when connected)
-- **Weather + face tools** — backend can send `show_weather` and `face_animation` JSON so Pixel shows icons, temperature, and short captions
+- **Weather + face tools** — backend can send `show_weather` and `face_animation` JSON so Pixel shows icons, temperature, short captions, and **map** overlays (JPEG via `0x04`)
 
 ## First-time Wi‑Fi (BLE)
 
@@ -72,6 +72,7 @@ Long **press-and-hold** is not the primary model; recording is started/stopped w
 | `0x01` | Raw PCM | 16-bit little-endian, mono, **16 kHz** |
 | `0x02` | JPEG | One frame; backend can assemble ~10 fps MP4 when vision is on |
 | `0x03` | (empty) | **End of turn** — process buffers with Gemini |
+| `0x04` | JPEG | **Map snapshot** — hub screenshot of the Maps contextual widget (240×240 target); shown while `face_animation` **map** overlay is active |
 
 ### JSON (server → device)
 
@@ -80,7 +81,7 @@ Examples sent by the backend:
 - `runtime_vision` — `{ "type": "runtime_vision", "enabled": true|false }`
 - `runtime_timezone` — `{ "type": "runtime_timezone", "timezone_rule": "..." }`
 - `show_weather` — weather overlay duration and condition/temperature
-- `face_animation` — speaking / happy / mad / weather display modes with short `words`
+- `face_animation` — speaking / happy / mad / weather / **map** (map mode uses empty `words`; hub may follow with binary `0x04` JPEG)
 - `gemini_first_token` — optional UI hint that the model started streaming
 - Success/error replies — e.g. `{ "status": "success", "reply": "..." }`
 
@@ -113,6 +114,7 @@ From `platformio.ini`:
 - `bblanchon/ArduinoJson`
 - `links2004/WebSockets`
 - `adafruit/RTClib`
+- `bitbank2/JPEGDEC` (decode hub map JPEGs)
 
 ESP32 BLE and Wi‑Fi come from the Arduino-ESP32 core.
 

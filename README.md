@@ -16,7 +16,7 @@ OmniBot/
 ## What it does
 
 - **Bots** open a WebSocket to the backend and stream **PCM audio** (16-bit, 16 kHz) and optional **JPEG video** frames. A stop packet triggers Gemini to answer using the buffered turn.
-- **Gemini** uses **per-device in-memory conversation history** (list of prior turns). Each request builds a **fresh** `GenerateContentConfig` with **Google Search** *or* **Maps** grounding (never both—Gemini returns `400` if combined), plus `face_animation`. **[semantic-router](https://github.com/aurelio-labs/semantic-router)** (FastEmbed local embeddings, no PyTorch) classifies the **current user turn** into local/geo intent (traffic, directions, “near me”, etc.) → **Maps** when allowed, otherwise **Search**. The model still receives **full history + new user content**.
+- **Gemini** uses **per-device in-memory conversation history** (list of prior turns). Each request builds a **fresh** `GenerateContentConfig` with **Google Search** *or* **Maps** grounding (never both—Gemini returns `400` if combined), plus `face_animation`. On **Maps** turns the model is instructed to use `face_animation` with **`map`** (empty words); after the turn the hub renders the contextual map in headless Chromium and sends a **JPEG** to Pixel over the bot WebSocket. **[semantic-router](https://github.com/aurelio-labs/semantic-router)** (FastEmbed local embeddings, no PyTorch) classifies the **current user turn** into local/geo intent (traffic, directions, “near me”, etc.) → **Maps** when allowed, otherwise **Search**. The model still receives **full history + new user content**.
 - **Dashboard** connects to a separate monitor WebSocket for live logs, streamed AI text, audio/video previews, and tool telemetry.
 - **BLE provisioning** sends Wi‑Fi credentials from the PC to Pixel (no credentials baked into firmware beyond first-hop backend IP/port).
 
@@ -37,6 +37,8 @@ GEMINI_API_KEY=your_key_here
 # Required for OpenStreetMap Nominatim (geocoding postal + country into lat/lng for Maps grounding).
 # Use a stable app name + contact URL or email per https://operations.osmfoundation.org/policies/nominatim/
 NOMINATIM_USER_AGENT=OmnibotHub/1.0 (your-contact-or-repo-url)
+# Maps JavaScript API key: dashboard contextual widget + headless screenshot for Pixel (optional if Maps grounding off).
+# GOOGLE_MAPS_JS_API_KEY=your_maps_js_key
 # Optional: print Maps/location diagnostics to the backend terminal (postal, country, lat/lng, tools, history length).
 OMNIBOT_MAPS_DEBUG=1
 # Optional: also log semantic route decisions (routing text, prefer_maps, effective builtin tool). Enabled automatically when OMNIBOT_MAPS_DEBUG is on.
@@ -64,8 +66,11 @@ cd app/backend
 python -m venv .venv
 .venv\Scripts\activate          # Windows; on macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+python -m playwright install chromium
 python app.py
 ```
+
+The hub uses **Playwright** to capture a screenshot of the Google Maps contextual widget for Pixel when Maps grounding returns a widget context token. Chromium is installed by `python -m playwright install chromium` (once per machine). Ensure `GOOGLE_MAPS_JS_API_KEY` is set in `.env` if you use Maps grounding and want that snapshot on the bot (same key as the dashboard contextual map).
 
 The server listens on **http://0.0.0.0:8000** (all interfaces). If you use Conda, activate your environment instead of `venv` before `pip install` / `python app.py`.
 

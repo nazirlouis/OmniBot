@@ -22,6 +22,8 @@ import requests
 
 from semantic_pixel_router import classify_retrieval
 
+from maps_widget_screenshot import capture_contextual_map_jpeg_sync
+
 from pydantic import BaseModel
 from bleak import BleakScanner, BleakClient
 import subprocess
@@ -72,6 +74,15 @@ DEFAULT_SYSTEM_INSTRUCTION = (
 
 WEATHER_DISPLAY_MS = 5000
 FACE_ANIMATION_DISPLAY_MS = 2500
+MAP_DISPLAY_MS = 9000
+
+MAPS_TURN_SYSTEM_APPEND = (
+    "\n\nMaps display (this turn only):\n"
+    "- This session uses Google Maps grounding only (no Google Search).\n"
+    "- Call face_animation exactly once with animation set to map and words set to an empty string \"\".\n"
+    "- Do not use speaking, happy, mad, or weather for this turn.\n"
+    "- You may still answer the user normally in your reply text; nothing from words is shown on the robot display for map mode."
+)
 
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 DEFAULT_NOMINATIM_USER_AGENT = (
@@ -155,22 +166,25 @@ SHOW_WEATHER_FUNCTION_DECLARATION = {
 FACE_ANIMATION_FUNCTION_DECLARATION = {
     "name": "face_animation",
     "description": (
-        "Animates Pixel's speaking face on the round display. "
-        "Pass a short words caption (at most two words). Display duration is fixed on the device."
+        "Animates Pixel's face on the round display. "
+        "Pass words only when needed; display duration is fixed on the device."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "animation": {
                 "type": "string",
-                "enum": ["speaking", "happy", "mad", "weather"],
-                "description": "Display mode on Pixel: speaking, happy, mad, or weather overlay.",
+                "enum": ["speaking", "happy", "mad", "weather", "map"],
+                "description": (
+                    "Display mode: speaking, happy, mad, weather overlay, or map snapshot (maps grounding turns only)."
+                ),
             },
             "words": {
                 "type": "string",
                 "description": (
                     "For speaking/happy/mad: at most two words (e.g. \"hello\", \"nice one\"). "
-                    "For weather: \"<condition> <temperature_f>\" (e.g. \"cloudy 74\")."
+                    "For weather: \"<condition> <temperature_f>\" (e.g. \"cloudy 74\"). "
+                    "For map: use empty string; the hub ignores any text for map mode."
                 ),
             },
         },
@@ -268,6 +282,18 @@ def _extract_maps_sources_from_grounding_metadata(gm) -> list[dict]:
         by_uri[str(uri)] = {"title": title, "uri": str(uri)}
     return list(by_uri.values())
 
+
+def _extract_maps_widget_token_from_grounding_metadata(gm) -> Optional[str]:
+    """Context token for the Maps JavaScript contextual Places widget (Gemini Maps grounding)."""
+    if gm is None:
+        return None
+    tok = getattr(gm, "google_maps_widget_context_token", None)
+    if tok is None:
+        return None
+    s = str(tok).strip()
+    return s or None
+
+
 def assemble_video(jpeg_frames: list[bytes], fps: int = 10) -> bytes:
     """Takes a list of JPEG byte arrays and assembles them into an MP4 (H.264) video in memory."""
     if not jpeg_frames:
@@ -329,8 +355,8 @@ def _google_maps_builtin():
     """Built-in Google Maps grounding tool (Gemini API)."""
     ctor = getattr(types, "ToolGoogleMaps", None)
     if ctor is not None:
-        return ctor()
-    return types.GoogleMaps()
+        return ctor(enable_widget=True)
+    return types.GoogleMaps(enable_widget=True)
 
 
 def _pixel_chat_generate_config(
@@ -404,8 +430,12 @@ def _pixel_chat_generate_config(
         else:
             _maps_debug("Built-in retrieval: google_search only (Maps off or no coordinates).")
 
+    effective_system_instruction = system_instruction
+    if maps_tool_active:
+        effective_system_instruction = f"{system_instruction}{MAPS_TURN_SYSTEM_APPEND}"
+
     return types.GenerateContentConfig(
-        system_instruction=system_instruction,
+        system_instruction=effective_system_instruction,
         thinking_config=types.ThinkingConfig(thinking_level="minimal"),
         tools=tools,
         tool_config=types.ToolConfig(**tool_cfg_kwargs),
@@ -683,7 +713,10 @@ def _make_face_animation_tool(device_id: str):
                 if any(t in raw_words.lower() for t in ["sunny", "cloudy", "partially", "raining", "snowing", "condition", "temperature"]):
                     a = "weather"
 
-        w = _normalize_weather_words(raw_words) if a == "weather" else _clamp_face_animation_words(raw_words)
+        if a == "map":
+            w = ""
+        else:
+            w = _normalize_weather_words(raw_words) if a == "weather" else _clamp_face_animation_words(raw_words)
 
         tool_state = turn_tool_state_by_device.setdefault(device_id, {"show_weather": False, "face_animation": False})
         if tool_state.get("face_animation", False):
@@ -691,12 +724,18 @@ def _make_face_animation_tool(device_id: str):
         tool_state["face_animation"] = True
 
         _schedule_face_animation_to_esp32(device_id, a, w)
+        if a == "weather":
+            anim_ms = WEATHER_DISPLAY_MS
+        elif a == "map":
+            anim_ms = MAP_DISPLAY_MS
+        else:
+            anim_ms = FACE_ANIMATION_DISPLAY_MS
         _broadcast_tool_call_to_frontend(
             "face_animation",
             {
                 "animation": a,
                 "words": w,
-                "duration_ms": WEATHER_DISPLAY_MS if a == "weather" else FACE_ANIMATION_DISPLAY_MS,
+                "duration_ms": anim_ms,
             },
         )
         return {"ok": True, "display": "face animation queued on robot"}
@@ -735,10 +774,16 @@ async def _send_face_animation_json_to_esp32(device_id: str, animation: str, wor
     ws = get_active_esp32_socket(device_id)
     if not ws:
         return
+    if animation == "weather":
+        dur = WEATHER_DISPLAY_MS
+    elif animation == "map":
+        dur = MAP_DISPLAY_MS
+    else:
+        dur = FACE_ANIMATION_DISPLAY_MS
     payload = {
         "type": "face_animation",
         "animation": animation,
-        "duration_ms": WEATHER_DISPLAY_MS if animation == "weather" else FACE_ANIMATION_DISPLAY_MS,
+        "duration_ms": dur,
         "words": words,
     }
     try:
@@ -822,6 +867,29 @@ async def _send_runtime_timezone_to_esp32(device_id: str, timezone_rule: str) ->
 
 
 
+async def _send_map_jpeg_to_esp32_after_turn(device_id: str, widget_token: str, api_key: str) -> None:
+    """Runs Playwright screenshot off the event loop, then pushes JPEG to Pixel (opcode 0x04)."""
+    loop = asyncio.get_running_loop()
+    try:
+        jpeg = await loop.run_in_executor(
+            None,
+            lambda: capture_contextual_map_jpeg_sync(widget_token, api_key),
+        )
+    except Exception as e:
+        print(f"[Omnibot] Map screenshot error: {e}")
+        return
+    if not jpeg:
+        print("[Omnibot] Map screenshot returned no image (check Playwright/Chromium, Maps JS key, or token).")
+        return
+    ws = get_active_esp32_socket(device_id)
+    if not ws:
+        return
+    try:
+        await ws.send_bytes(bytes([0x04]) + jpeg)
+    except Exception as e:
+        print(f"[Omnibot] Failed to send map JPEG to ESP32: {e}")
+
+
 async def stream_chat_turn_response(device_id: str, message_content):
     """Streams one Gemini turn using local history and a fresh config each request (one-shot Chat)."""
     global _main_async_loop
@@ -832,6 +900,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
     loop = asyncio.get_running_loop()
     first_token_notified = False
     last_maps_sources: list[dict] = []
+    last_maps_widget_token: Optional[str] = None
 
     await manager.broadcast({
         "type": "ai_response_stream_start",
@@ -908,6 +977,9 @@ async def stream_chat_turn_response(device_id: str, message_content):
                             src = _extract_maps_sources_from_grounding_metadata(gm)
                             if src:
                                 last_maps_sources = src
+                            wtok = _extract_maps_widget_token_from_grounding_metadata(gm)
+                            if wtok:
+                                last_maps_widget_token = wtok
                             if candidate.content and candidate.content.parts:
                                 for part in candidate.content.parts:
                                     fc = getattr(part, "function_call", None)
@@ -969,7 +1041,17 @@ async def stream_chat_turn_response(device_id: str, message_content):
     }
     if last_maps_sources:
         end_msg["maps_sources"] = last_maps_sources
+    if last_maps_widget_token:
+        end_msg["maps_widget_context_token"] = last_maps_widget_token
     await manager.broadcast(end_msg)
+
+    tok = (last_maps_widget_token or "").strip()
+    if tok:
+        maps_key = (os.getenv("GOOGLE_MAPS_JS_API_KEY") or "").strip()
+        if maps_key:
+            asyncio.create_task(_send_map_jpeg_to_esp32_after_turn(device_id, tok, maps_key))
+        else:
+            print("[Omnibot] Maps widget token present but GOOGLE_MAPS_JS_API_KEY is missing; skipping map screenshot.")
 
     return full_text
 
@@ -1233,6 +1315,13 @@ async def set_timezone_setting(device_id: str, payload: TimezoneRuleRequest):
     timezone_rule_by_device[device_id] = tz
     await _send_runtime_timezone_to_esp32(device_id, tz)
     return {"status": "success", "device_id": device_id, "timezone_rule": tz}
+
+@app.get("/api/hub-config")
+async def hub_config():
+    """Public values the dashboard needs (Maps JS key for contextual widget is browser-exposed)."""
+    key = (os.getenv("GOOGLE_MAPS_JS_API_KEY") or "").strip()
+    return {"maps_js_api_key": key}
+
 
 @app.get("/ping")
 async def ping():

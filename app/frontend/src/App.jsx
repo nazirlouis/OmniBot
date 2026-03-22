@@ -83,11 +83,20 @@ function App() {
             appendAiStreamDelta(message.stream_id, message.data);
           } else if (message.type === 'ai_response_stream_end') {
             setEsp32Status('online');
-            if (message.maps_sources && message.maps_sources.length > 0) {
+            const hasMapsSources =
+              message.maps_sources && message.maps_sources.length > 0;
+            const mapsToken = message.maps_widget_context_token;
+            if (hasMapsSources || mapsToken) {
               setLogs((prev) =>
                 prev.map((log) =>
                   log.sender === 'ai' && log.streamId === message.stream_id
-                    ? { ...log, mapsSources: message.maps_sources }
+                    ? {
+                        ...log,
+                        ...(hasMapsSources ? { mapsSources: message.maps_sources } : {}),
+                        ...(mapsToken
+                          ? { mapsWidgetContextToken: mapsToken }
+                          : {})
+                      }
                     : log
                 )
               );
@@ -113,6 +122,8 @@ function App() {
                   durationMs: 5000
                 }
               );
+            } else if (fnName.includes('face_animation') && String(args.animation ?? '').toLowerCase() === 'map') {
+              addLog('tool', `${message.function_name}(${argsStr}) — map snapshot on Pixel`);
             } else {
               addLog('tool', `${message.function_name}(${argsStr})`);
             }

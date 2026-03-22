@@ -1,5 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import './IntelligenceFeed.css';
+import {
+  loadMapsPlacesForContextual,
+  resolveMapsJsApiKey
+} from '../mapsContextualLoader';
 
 const normalizeWeatherCondition = (condition) => {
   return String(condition ?? '')
@@ -33,7 +37,7 @@ const parseShowWeatherFromText = (text) => {
   const raw = String(text ?? '');
   if (!/show_weather/i.test(raw)) return null;
 
-  const conditionMatch = raw.match(/condition\s*:\s*([^,\)]+)/i);
+  const conditionMatch = raw.match(/condition\s*:\s*([^,)]+)/i);
   const temperatureMatch = raw.match(/temperature\s*:\s*([-+]?\d*\.?\d+)/i);
 
   const condition = conditionMatch ? conditionMatch[1].trim() : '';
@@ -60,6 +64,83 @@ const MapsGroundingSources = ({ sources }) => {
       <p className="gmp-attribution" translate="no">
         Google Maps
       </p>
+    </div>
+  );
+};
+
+const MapsContextualWidget = ({ contextToken }) => {
+  const hostRef = useRef(null);
+  const [phase, setPhase] = useState('loading');
+
+  useEffect(() => {
+    const token = String(contextToken || '').trim();
+    if (!token) return undefined;
+
+    let cancelled = false;
+    const hostEl = hostRef.current;
+
+    (async () => {
+      try {
+        const apiKey = await resolveMapsJsApiKey();
+        if (!apiKey) {
+          if (!cancelled) setPhase('no_key');
+          return;
+        }
+        await loadMapsPlacesForContextual(apiKey);
+        if (cancelled || !hostEl) return;
+        hostEl.replaceChildren();
+        const el = document.createElement('gmp-place-contextual');
+        el.contextToken = token;
+        hostEl.appendChild(el);
+        if (!cancelled) setPhase('ready');
+      } catch {
+        if (!cancelled) setPhase('error');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      hostEl?.replaceChildren();
+    };
+  }, [contextToken]);
+
+  if (!String(contextToken || '').trim()) return null;
+
+  return (
+    <div className="maps-contextual-wrap">
+      {phase === 'loading' && (
+        <p className="maps-widget-hint">Loading map widget…</p>
+      )}
+      {phase === 'no_key' && (
+        <p className="maps-widget-hint maps-widget-hint-warn">
+          Set <code>GOOGLE_MAPS_JS_API_KEY</code> in the hub backend environment (or{' '}
+          <code>VITE_GOOGLE_MAPS_JS_API_KEY</code> in the dashboard) to show the contextual Google Maps
+          widget. Use a key with the Maps JavaScript API enabled.
+        </p>
+      )}
+      {phase === 'error' && (
+        <p className="maps-widget-hint maps-widget-hint-warn">
+          Could not load the Google Maps contextual widget.
+        </p>
+      )}
+      <div ref={hostRef} className="maps-contextual-host" />
+    </div>
+  );
+};
+
+const MapsGroundingBlock = ({ sources, widgetContextToken }) => {
+  const hasSources = sources && sources.length > 0;
+  const token = String(widgetContextToken || '').trim();
+  if (!hasSources && !token) return null;
+  return (
+    <div className="maps-grounding-block">
+      {hasSources && <MapsGroundingSources sources={sources} />}
+      {token && <MapsContextualWidget key={token} contextToken={token} />}
+      {token && !hasSources && (
+        <p className="gmp-attribution" translate="no">
+          Google Maps
+        </p>
+      )}
     </div>
   );
 };
@@ -240,8 +321,11 @@ const IntelligenceFeed = ({
                   ) : (
                     <>
                       {log.text}
-                      {log.sender === 'ai' && log.mapsSources && (
-                        <MapsGroundingSources sources={log.mapsSources} />
+                      {log.sender === 'ai' && (
+                        <MapsGroundingBlock
+                          sources={log.mapsSources}
+                          widgetContextToken={log.mapsWidgetContextToken}
+                        />
                       )}
                     </>
                   )}

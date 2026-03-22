@@ -11,6 +11,8 @@
 #include <BLE2902.h>
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
+#include <JPEGDEC.h>
+#include <esp_heap_caps.h>
 #include <Wire.h> 
 #include <RTClib.h>
 #include <stdio.h>
@@ -141,6 +143,33 @@ int weatherTempDisplay = 0;
 bool weatherNeedsRedraw = true;
 // After show_weather during upload, do not resume thinking when the overlay ends.
 bool suppressUploadThinkingAfterWeather = false;
+
+// Map snapshot from hub (face_animation map + binary 0x04 JPEG)
+#define MAP_DISPLAY_PX 240
+#define MAP_OVERLAY_EXTEND_MS 9000
+bool mapOverlayActive = false;
+bool mapHasImage = false;
+uint32_t mapOverlayUntilMs = 0;
+bool mapNeedsRedraw = false;
+bool suppressUploadThinkingAfterMap = false;
+static uint16_t *s_mapRgb565 = nullptr;
+static JPEGDEC s_jpegDec;
+
+static int mapJpegDrawCallback(JPEGDRAW *pDraw) {
+    if (!s_mapRgb565) {
+        return 0;
+    }
+    uint16_t *src = pDraw->pPixels;
+    int16_t x = pDraw->x;
+    int16_t y = pDraw->y;
+    int16_t w = pDraw->iWidth;
+    int16_t h = pDraw->iHeight;
+    for (int16_t row = 0; row < h; row++) {
+        uint16_t *dst = s_mapRgb565 + (y + row) * MAP_DISPLAY_PX + x;
+        memcpy(dst, src + row * w, w * sizeof(uint16_t));
+    }
+    return 1;
+}
 
 bool faceAnimActive = false;
 uint32_t faceAnimStartMs = 0;
@@ -1921,6 +1950,22 @@ void setupWiFi() {
                                 if (currentState == STATE_UPLOADING) {
                                     suppressUploadThinkingAfterWeather = true;
                                 }
+                            } else if (strcmp(anim, "map") == 0) {
+                                faceAnimActive = false;
+                                faceAnimWords[0] = '\0';
+                                clearFaceAnimCaptionBox();
+                                mapHasImage = false;
+                                mapNeedsRedraw = false;
+                                mapOverlayActive = true;
+                                mapOverlayUntilMs = millis() + (uint32_t)dur;
+                                gfx->fillScreen(0x1082);
+                                gfx->setTextColor(0xDEFB);
+                                gfx->setTextSize(3);
+                                gfx->setCursor(80, 110);
+                                gfx->print("Map");
+                                if (currentState == STATE_UPLOADING) {
+                                    suppressUploadThinkingAfterMap = true;
+                                }
                             } else {
                                 setFaceAnimWordsFromPayload(w);
                                 gfx->fillScreen(BLACK);
@@ -1981,6 +2026,27 @@ void setupWiFi() {
                 }
                 break;
             case WStype_BIN:
+                if (payload && length > 1 && payload[0] == 0x04) {
+                    const uint8_t *jpg = payload + 1;
+                    size_t jpgLen = length - 1;
+                    if (s_mapRgb565 == nullptr) {
+                        s_mapRgb565 = (uint16_t *)heap_caps_malloc(
+                            MAP_DISPLAY_PX * MAP_DISPLAY_PX * sizeof(uint16_t),
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                    }
+                    if (s_mapRgb565 != nullptr && jpgLen > 0) {
+                        if (s_jpegDec.openRAM((uint8_t *)jpg, (int32_t)jpgLen, mapJpegDrawCallback)) {
+                            s_jpegDec.setPixelType(RGB565_BIG_ENDIAN);
+                            s_jpegDec.decode(0, 0, 0);
+                            s_jpegDec.close();
+                            mapHasImage = true;
+                            mapNeedsRedraw = true;
+                            mapOverlayActive = true;
+                            mapOverlayUntilMs = millis() + MAP_OVERLAY_EXTEND_MS;
+                        }
+                    }
+                }
+                break;
             case WStype_ERROR:          
             case WStype_FRAGMENT_TEXT_START:
             case WStype_FRAGMENT_BIN_START:
@@ -2134,7 +2200,7 @@ void loop() {
 
     // Force a full refresh on transitions to/from the thinking animation.
     if (currentState != previousVisualState) {
-        if ((currentState == STATE_UPLOADING || previousVisualState == STATE_UPLOADING) && !weatherOverlayActive) {
+        if ((currentState == STATE_UPLOADING || previousVisualState == STATE_UPLOADING) && !weatherOverlayActive && !mapOverlayActive) {
             gfx->fillScreen(BLACK);
             idleAnim.hasPrevFrame = false;
             uploadAnim.hasPrevFrame = false;
@@ -2149,7 +2215,21 @@ void loop() {
     if (weatherOverlayActive && millis() >= weatherOverlayUntilMs) {
         weatherOverlayActive = false;
         idleAnim.hasPrevFrame = false;
-        if (!timeScreenActive && !faceAnimActive) {
+        if (!timeScreenActive && !faceAnimActive && !mapOverlayActive) {
+            showIdleEyes();
+            lastIdleEyesUpdate = 0;
+        } else {
+            gfx->fillScreen(BLACK);
+        }
+    }
+
+    if (mapOverlayActive && millis() >= mapOverlayUntilMs) {
+        mapOverlayActive = false;
+        mapHasImage = false;
+        mapNeedsRedraw = false;
+        suppressUploadThinkingAfterMap = false;
+        idleAnim.hasPrevFrame = false;
+        if (!timeScreenActive && !faceAnimActive && !weatherOverlayActive) {
             showIdleEyes();
             lastIdleEyesUpdate = 0;
         } else {
@@ -2166,7 +2246,7 @@ void loop() {
         idleAnim.hasPrevFrame = false;
         uploadAnim.hasPrevFrame = false;
         recordingAnim.hasPrevFrame = false;
-        if (!timeScreenActive && !weatherOverlayActive && currentState == STATE_IDLE) {
+        if (!timeScreenActive && !weatherOverlayActive && !mapOverlayActive && currentState == STATE_IDLE) {
             lastIdleEyesUpdate = 0;
         }
     }
@@ -2379,8 +2459,11 @@ void loop() {
         geminiFirstTokenReceived = false;
         currentState = STATE_IDLE;
         suppressUploadThinkingAfterWeather = false;
+        suppressUploadThinkingAfterMap = false;
         if (weatherOverlayActive) {
             weatherNeedsRedraw = true;
+        } else if (mapOverlayActive) {
+            lastIdleEyesUpdate = 0;
         } else if (faceAnimActive) {
             // Keep the active face animation fully in control of the frame.
             lastIdleEyesUpdate = 0;
@@ -2396,6 +2479,11 @@ void loop() {
         } else {
             updateWeatherOverlayAnimation(millis());
         }
+    } else if (mapOverlayActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
+        if (mapHasImage && mapNeedsRedraw && s_mapRgb565 != nullptr) {
+            gfx->draw16bitRGBBitmap(0, 0, s_mapRgb565, MAP_DISPLAY_PX, MAP_DISPLAY_PX);
+            mapNeedsRedraw = false;
+        }
     } else if (faceAnimActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
         updateFaceEmotionAnimation();
     } else if (currentState == STATE_RECORDING) {
@@ -2403,7 +2491,7 @@ void loop() {
         processAudio();
         captureVideoFrame(); 
     } else if (currentState == STATE_UPLOADING) {
-        if (!suppressUploadThinkingAfterWeather) {
+        if (!suppressUploadThinkingAfterWeather && !suppressUploadThinkingAfterMap) {
             updateUploadingThinkingAnimation();
         } else if (!timeScreenActive) {
             updateIdleEyesAnimation();
