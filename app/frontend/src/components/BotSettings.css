@@ -156,10 +156,42 @@
 
 .form-actions {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 1rem;
+  justify-content: space-between;
   margin-top: 1rem;
   border-top: 1px solid rgba(0, 102, 204, 0.15);
   padding-top: 2rem;
+}
+
+.form-actions-trailing {
+  display: flex;
+  gap: 1rem;
+  margin-left: auto;
+}
+
+.btn-reset-defaults {
+  font-family: inherit;
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 0.75rem 1.25rem;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(200, 80, 80, 0.35);
+  color: #b71c1c;
+}
+
+.btn-reset-defaults:hover:not(:disabled) {
+  background: rgba(255, 235, 238, 0.9);
+  border-color: rgba(200, 80, 80, 0.55);
+}
+
+.btn-reset-defaults:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .status-message {

@@ -1,6 +1,6 @@
 import React, { useMemo, useState, useEffect } from 'react';
 import './BotSettings.css';
-import { getBotSettings, updateBotSettings } from './setupService';
+import { getBotSettings, updateBotSettings, resetBotSettingsToDefault } from './setupService';
 import { getCountryOptions, normalizeSavedCountryCode } from './countrySelectOptions';
 
 const TIMEZONE_OPTIONS = [
@@ -73,9 +73,7 @@ const BotSettings = ({ setAppMode }) => {
         maps_display_name: mapsDisplayName || null
       });
       const saved = res.settings || {};
-      setMapsLatitude(saved.maps_latitude ?? null);
-      setMapsLongitude(saved.maps_longitude ?? null);
-      setMapsDisplayName(saved.maps_display_name || '');
+      applySettingsFromResponse(saved);
       const geo = res.maps_geocode;
       if (geo && geo.ok === false && geo.error) {
         setMapsGeocodeMessage(geo.error);
@@ -84,6 +82,47 @@ const BotSettings = ({ setAppMode }) => {
       setTimeout(() => setSaveStatus(null), 3000); // Clear success message after 3s
     } catch (err) {
       console.error("Failed to save settings", err);
+      setSaveStatus('error');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const applySettingsFromResponse = (saved) => {
+    setModel(saved.model);
+    setSystemInstruction(saved.system_instruction);
+    setTimezoneRule(saved.timezone_rule || 'EST5EDT,M3.2.0/2,M11.1.0/2');
+    setVisionEnabled(Boolean(saved.vision_enabled));
+    setMapsGroundingEnabled(Boolean(saved.maps_grounding_enabled));
+    setMapsPostalCode(saved.maps_postal_code || '');
+    setMapsCountry(normalizeSavedCountryCode(saved.maps_country) || '');
+    setMapsLatitude(saved.maps_latitude ?? null);
+    setMapsLongitude(saved.maps_longitude ?? null);
+    setMapsDisplayName(saved.maps_display_name || '');
+    setMapsGeocodeMessage(null);
+  };
+
+  const handleResetToDefaults = async () => {
+    if (
+      !window.confirm(
+        'Reset all settings for this bot to defaults? Your current values will be replaced on the server.'
+      )
+    ) {
+      return;
+    }
+    setIsSaving(true);
+    setSaveStatus(null);
+    setMapsGeocodeMessage(null);
+    try {
+      const res = await resetBotSettingsToDefault(deviceId);
+      if (res.status !== 'success' || !res.settings) {
+        throw new Error(res.detail || 'Reset failed');
+      }
+      applySettingsFromResponse(res.settings);
+      setSaveStatus('success');
+      setTimeout(() => setSaveStatus(null), 3000);
+    } catch (err) {
+      console.error('Failed to reset settings', err);
       setSaveStatus('error');
     } finally {
       setIsSaving(false);
@@ -253,20 +292,31 @@ const BotSettings = ({ setAppMode }) => {
         </div>
 
         <div className="form-actions">
-          <button 
-            type="button" 
-            className="btn btn-secondary" 
-            onClick={() => setAppMode('dashboard')}
-          >
-            Cancel
-          </button>
-          <button 
-            type="submit" 
-            className="btn btn-primary"
+          <button
+            type="button"
+            className="btn btn-reset-defaults"
+            onClick={handleResetToDefaults}
             disabled={isSaving}
           >
-            {isSaving ? "Syncing..." : "Sync to Core"}
+            Reset to defaults
           </button>
+          <div className="form-actions-trailing">
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => setAppMode('dashboard')}
+              disabled={isSaving}
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              className="btn btn-primary"
+              disabled={isSaving}
+            >
+              {isSaving ? 'Syncing...' : 'Sync to Core'}
+            </button>
+          </div>
         </div>
 
         {saveStatus === 'success' && (

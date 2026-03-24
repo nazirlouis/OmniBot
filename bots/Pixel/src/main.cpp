@@ -1951,6 +1951,7 @@ void setupWiFi() {
                                     suppressUploadThinkingAfterWeather = true;
                                 }
                             } else if (strcmp(anim, "map") == 0) {
+                                // Hub sends a JPEG (WS binary 0x04) after this; avoid showing the word "Map".
                                 faceAnimActive = false;
                                 faceAnimWords[0] = '\0';
                                 clearFaceAnimCaptionBox();
@@ -1959,10 +1960,6 @@ void setupWiFi() {
                                 mapOverlayActive = true;
                                 mapOverlayUntilMs = millis() + (uint32_t)dur;
                                 gfx->fillScreen(0x1082);
-                                gfx->setTextColor(0xDEFB);
-                                gfx->setTextSize(3);
-                                gfx->setCursor(80, 110);
-                                gfx->print("Map");
                                 if (currentState == STATE_UPLOADING) {
                                     suppressUploadThinkingAfterMap = true;
                                 }
@@ -2036,13 +2033,19 @@ void setupWiFi() {
                     }
                     if (s_mapRgb565 != nullptr && jpgLen > 0) {
                         if (s_jpegDec.openRAM((uint8_t *)jpg, (int32_t)jpgLen, mapJpegDrawCallback)) {
-                            s_jpegDec.setPixelType(RGB565_BIG_ENDIAN);
+                            // draw16bitRGBBitmap consumes native RGB565 in this buffer path.
+                            s_jpegDec.setPixelType(RGB565_LITTLE_ENDIAN);
                             s_jpegDec.decode(0, 0, 0);
                             s_jpegDec.close();
                             mapHasImage = true;
                             mapNeedsRedraw = true;
                             mapOverlayActive = true;
                             mapOverlayUntilMs = millis() + MAP_OVERLAY_EXTEND_MS;
+                            if (currentState == STATE_UPLOADING) {
+                                suppressUploadThinkingAfterMap = true;
+                            }
+                        } else {
+                            Serial.printf("[map] JPEG decode failed (%u bytes)\n", (unsigned)jpgLen);
                         }
                     }
                 }

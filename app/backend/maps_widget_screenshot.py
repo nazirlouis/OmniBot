@@ -99,5 +99,6 @@ const TOKEN = {token_js};
     if im.size != (size, size):
         im = im.resize((size, size), Image.Resampling.LANCZOS)
     out = BytesIO()
-    im.save(out, format="JPEG", quality=85, optimize=True)
+    # Baseline JPEG only — ESP32 JPEGDEC often fails on progressive scans.
+    im.save(out, format="JPEG", quality=85, optimize=True, progressive=False)
     return out.getvalue()

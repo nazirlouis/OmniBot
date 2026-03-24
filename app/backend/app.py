@@ -16,13 +16,11 @@ from google.genai import types
 import json
 import re
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
 
 from semantic_pixel_router import classify_retrieval_with_reason
-
-from maps_widget_screenshot import capture_contextual_map_jpeg_sync
 
 from pydantic import BaseModel
 from bleak import BleakScanner, BleakClient
@@ -43,50 +41,27 @@ DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
 DEFAULT_TIMEZONE_RULE = "EST5EDT,M3.2.0/2,M11.1.0/2"
 DEFAULT_VISION_ENABLED = False
 DEFAULT_SYSTEM_INSTRUCTION = (
-    "You are Pixel, a friendly and intelligent small desktop robot.\n\n"
-    "Context:\n"
-    "- If I provide audio, I am speaking directly to you through your microphone.\n"
-    "- If I provide text, I am typing to you from the OmniBot Hub dashboard.\n"
-    "- If I provide a video, it is a real-time recording from your onboard camera.\n\n"
-    "Rules:\n"
-    "- Keep your answers concise and conversational, as if we are speaking face-to-face.\n"
-    "- Only discuss or analyze the video content if it is relevant to my current prompt or question.\n"
-    "- Do not greet me in every message.\n"
-    "- You are helpful, slightly curious, and highly efficient.\n\n"
-    "Real-time information:\n"
-    "- For any question that depends on current, live, or rapidly changing facts, use Google Search when that tool is available.\n"
-    "- This includes weather, news, sports scores/results, traffic conditions, market/finance updates, and similar real-time topics.\n"
-    "- Prefer grounded, source-backed answers for these topics over model memory.\n\n"
-    "Weather:\n"
-    "- When I ask about weather or current conditions, use Google Search for live details when that tool is available.\n"
-    "- If only Google Maps grounding is available (no Search in this session), answer from general knowledge and pick a plausible condition and temperature for the display.\n"
-    "- Then call face_animation exactly once with animation set to weather and words formatted as "
-    "\"<condition> <temperature_f>\", e.g. \"cloudy 74\".\n"
-    "- condition must be one of: sunny, cloudy, partially_cloudy, raining, snowing.\n"
-    "- Do NOT use animation speaking for weather turns.\n"
-    "- Do NOT pass JSON in words; words must be plain text in the exact 2-token format above.\n"
-    "- Still answer me naturally in your reply text.\n\n"
-    "Face Animation:\n"
-    "- For most conversational replies, call face_animation exactly once before or during your text response.\n"
-    "- Use animation speaking for conversational face reactions.\n"
-    "- Use animation happy for a smiling half-cut eye look.\n"
-    "- Use animation mad for an angry half-cut eye look (top of eyes hidden).\n"
-    "- Use animation weather only for weather display mode.\n"
-    "- For speaking/happy/mad, pass at most two words shown with the face (e.g. \"hello\" or \"got it\").\n"
-    "- Never call face_animation more than once in the same response turn."
+    "You are Pixel, a friendly small desktop robot.\n\n"
+    "Inputs: audio = my voice; text = OmniBot Hub; video = live camera (only mention it when relevant).\n"
+    "Be concise and conversational; do not greet me every turn.\n\n"
+    "For live or fast-changing facts, use Google Search when that tool is available; prefer grounded answers.\n\n"
+    "Every turn: call face_animation exactly once (never twice). Choose one mode:\n"
+    "- weather — If I ask about weather or current conditions: animation=weather. "
+    "words must be plain text \"<condition> <temperature_f>\" (two tokens), e.g. \"cloudy 74\". "
+    "condition is one of: sunny, cloudy, partially_cloudy, raining, snowing. "
+    "Use Search when available; if only Maps grounding exists, pick a plausible condition and °F for the display.\n"
+    "- map — If this reply uses Google Maps grounding at all (places, routes, \"near me\", navigation): "
+    "animation=map, words=\"\" (empty). Do not use speaking, happy, mad, or weather on that turn.\n"
+    "- speaking — Default for normal chat; at most two short words on the face.\n"
+    "- happy — Good or exciting news.\n"
+    "- mad — Bad or disappointing news, or if I am annoying you.\n\n"
+    "Weather turns must use weather (not speaking). Map-grounded turns must use map. "
+    "You may still answer in full in your text; map/weather may not show those words on the face."
 )
 
 WEATHER_DISPLAY_MS = 5000
 FACE_ANIMATION_DISPLAY_MS = 2500
 MAP_DISPLAY_MS = 9000
-
-MAPS_TURN_SYSTEM_APPEND = (
-    "\n\nMaps display (this turn only):\n"
-    "- This session uses Google Maps grounding only (no Google Search).\n"
-    "- Call face_animation exactly once with animation set to map and words set to an empty string \"\".\n"
-    "- Do not use speaking, happy, mad, or weather for this turn.\n"
-    "- You may still answer the user normally in your reply text; nothing from words is shown on the robot display for map mode."
-)
 
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 DEFAULT_NOMINATIM_USER_AGENT = (
@@ -180,7 +155,10 @@ FACE_ANIMATION_FUNCTION_DECLARATION = {
                 "type": "string",
                 "enum": ["speaking", "happy", "mad", "weather", "map"],
                 "description": (
-                    "Display mode: speaking, happy, mad, weather overlay, or map snapshot (maps grounding turns only)."
+                    "Display mode: speaking, happy, mad, weather overlay, or map. "
+                    "Use map whenever this response used Google Maps grounding (directions, nearby places, "
+                    "navigation). Required on those turns so the hub can screenshot the grounded map and "
+                    "push it to the robot display."
                 ),
             },
             "words": {
@@ -188,7 +166,7 @@ FACE_ANIMATION_FUNCTION_DECLARATION = {
                 "description": (
                     "For speaking/happy/mad: at most two words (e.g. \"hello\", \"nice one\"). "
                     "For weather: \"<condition> <temperature_f>\" (e.g. \"cloudy 74\"). "
-                    "For map: use empty string; the hub ignores any text for map mode."
+                    "For map: always \"\" (empty). The hub screenshots the contextual map and sends JPEG to Pixel."
                 ),
             },
         },
@@ -198,6 +176,11 @@ FACE_ANIMATION_FUNCTION_DECLARATION = {
 
 # Per-device, per-turn tool usage guardrails.
 turn_tool_state_by_device: dict[str, dict[str, bool]] = {}
+
+# Latest Maps widget context token seen while streaming (for face_animation(map) -> screenshot).
+maps_widget_token_latest_by_device: dict[str, str] = {}
+# Avoid sending duplicate map JPEGs in the same turn (face_animation path vs end-of-turn fallback).
+map_jpeg_sent_this_turn_by_device: dict[str, bool] = {}
 
 if not API_KEY:
     print("ERROR: API Key not found in .env file!")
@@ -234,6 +217,22 @@ def get_bot_settings(device_id: str):
         "maps_latitude": bot_conf.get("maps_latitude"),
         "maps_longitude": bot_conf.get("maps_longitude"),
         "maps_display_name": bot_conf.get("maps_display_name"),
+    }
+
+
+def _default_stored_bot_settings() -> dict:
+    """Persisted row for a bot after reset-to-default (matches app defaults, clears maps)."""
+    return {
+        "model": DEFAULT_MODEL,
+        "system_instruction": DEFAULT_SYSTEM_INSTRUCTION,
+        "timezone_rule": DEFAULT_TIMEZONE_RULE,
+        "vision_enabled": DEFAULT_VISION_ENABLED,
+        "maps_grounding_enabled": False,
+        "maps_postal_code": "",
+        "maps_country": "",
+        "maps_latitude": None,
+        "maps_longitude": None,
+        "maps_display_name": None,
     }
 
 
@@ -395,9 +394,11 @@ def _pixel_chat_generate_config(
     """Tools + server-side tool flag per Gemini 3 multi-tool docs.
 
     The Gemini API does not allow ``google_maps`` and ``google_search`` in the same
-    request (400 INVALID_ARGUMENT). When ``prefer_maps`` is true and Maps grounding
+    request (400 INVALID_ARGUMENT).     When ``prefer_maps`` is true and Maps grounding
     is enabled with stored coordinates, we attach only ``google_maps`` +
     ``face_animation``; otherwise ``google_search`` + ``face_animation``.
+    On maps turns the model should call ``face_animation(animation=map)`` so the hub can
+    screenshot the grounded map and push JPEG to the ESP32.
     """
     bot = get_bot_settings(device_id)
     face_animation_fn = _make_face_animation_tool(device_id)
@@ -457,12 +458,8 @@ def _pixel_chat_generate_config(
         else:
             _maps_debug("Built-in retrieval: google_search only (Maps off or no coordinates).")
 
-    effective_system_instruction = system_instruction
-    if maps_tool_active:
-        effective_system_instruction = f"{system_instruction}{MAPS_TURN_SYSTEM_APPEND}"
-
     return types.GenerateContentConfig(
-        system_instruction=effective_system_instruction,
+        system_instruction=system_instruction,
         thinking_config=types.ThinkingConfig(thinking_level="minimal"),
         tools=tools,
         tool_config=types.ToolConfig(**tool_cfg_kwargs),
@@ -659,6 +656,22 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
         )
     return {"status": "success", "settings": settings[device_id], "maps_geocode": maps_geocode}
 
+
+@app.post("/api/settings/{device_id}/reset")
+async def reset_settings_to_default(device_id: str):
+    """Restore all stored settings for this bot to application defaults and sync runtime state."""
+    row = _default_stored_bot_settings()
+    settings = get_all_settings()
+    settings[device_id] = row
+    save_all_settings(settings)
+    history_by_device.pop(device_id, None)
+    vision_enabled_by_device[device_id] = row["vision_enabled"]
+    timezone_rule_by_device[device_id] = row["timezone_rule"]
+    await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
+    await _send_runtime_timezone_to_esp32(device_id, row["timezone_rule"])
+    return {"status": "success", "settings": row, "maps_geocode": {"ok": True, "error": None}}
+
+
 # ==========================================
 #          ESP32 WEBSOCKET STREAMING
 # ==========================================
@@ -751,6 +764,8 @@ def _make_face_animation_tool(device_id: str):
         tool_state["face_animation"] = True
 
         _schedule_face_animation_to_esp32(device_id, a, w)
+        if a == "map":
+            _schedule_map_jpeg_after_face_animation_map(device_id)
         if a == "weather":
             anim_ms = WEATHER_DISPLAY_MS
         elif a == "map":
@@ -894,27 +909,191 @@ async def _send_runtime_timezone_to_esp32(device_id: str, timezone_rule: str) ->
 
 
 
-async def _send_map_jpeg_to_esp32_after_turn(device_id: str, widget_token: str, api_key: str) -> None:
-    """Runs Playwright screenshot off the event loop, then pushes JPEG to Pixel (opcode 0x04)."""
+def _extract_query_from_maps_uri(uri: str) -> str:
+    raw = (uri or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        qs = parse_qs(parsed.query or "")
+        q = (qs.get("q", [""])[0] or "").strip()
+        if q:
+            return q
+        daddr = (qs.get("daddr", [""])[0] or "").strip()
+        if daddr:
+            return daddr
+        path_tail = (parsed.path or "").strip("/").split("/")[-1]
+        return path_tail.replace("+", " ").strip()
+    except Exception:
+        return ""
+
+
+def _best_maps_location_query(maps_sources: list[dict]) -> str:
+    for s in maps_sources or []:
+        title = str(s.get("title") or "").strip()
+        if title:
+            return title
+    for s in maps_sources or []:
+        q = _extract_query_from_maps_uri(str(s.get("uri") or ""))
+        if q:
+            return q
+    return ""
+
+
+def _capture_static_map_jpeg_sync(
+    *,
+    api_key: str,
+    maps_sources: list[dict],
+    fallback_lat: Optional[float],
+    fallback_lng: Optional[float],
+    size: int = 240,
+) -> Optional[bytes]:
+    key = (api_key or "").strip()
+    if not key:
+        return None
+    location_query = _best_maps_location_query(maps_sources)
+    center = (
+        f"{float(fallback_lat):.6f},{float(fallback_lng):.6f}"
+        if (fallback_lat is not None and fallback_lng is not None)
+        else ""
+    )
+    params = {
+        "size": f"{size}x{size}",
+        "scale": "1",
+        "format": "jpg-baseline",
+        "maptype": "roadmap",
+        "key": key,
+    }
+    if location_query:
+        params["markers"] = f"size:mid|color:red|{location_query}"
+        params["center"] = location_query
+        params["zoom"] = "15"
+    elif center:
+        params["center"] = center
+        params["zoom"] = "14"
+        params["markers"] = f"size:mid|color:red|{center}"
+    else:
+        return None
+    # Keep the robot display clean: remove most labels and POI clutter.
+    styles = [
+        "feature:poi|element:labels|visibility:off",
+        "feature:transit|visibility:off",
+        "feature:road|element:labels|visibility:off",
+    ]
+    for style in styles:
+        params.setdefault("style", []).append(style)
+    try:
+        r = requests.get("https://maps.googleapis.com/maps/api/staticmap", params=params, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[Omnibot] Static map request failed: {e}")
+        return None
+    data = r.content or b""
+    if len(data) < 256:
+        return None
+    # Normalize to exactly 240x240 baseline JPEG for ESP32 decoder/display.
+    try:
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        if im.size != (240, 240):
+            im = im.resize((240, 240), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=85, optimize=True, progressive=False)
+        data = out.getvalue()
+    except Exception as e:
+        print(f"[Omnibot] Static map image normalization failed: {e}")
+        return None
+    return data
+
+
+async def _send_static_map_jpeg_to_esp32(
+    device_id: str,
+    maps_sources: list[dict],
+    api_key: str,
+    fallback_lat: Optional[float],
+    fallback_lng: Optional[float],
+) -> bool:
     loop = asyncio.get_running_loop()
     try:
         jpeg = await loop.run_in_executor(
             None,
-            lambda: capture_contextual_map_jpeg_sync(widget_token, api_key),
+            lambda: _capture_static_map_jpeg_sync(
+                api_key=api_key,
+                maps_sources=maps_sources,
+                fallback_lat=fallback_lat,
+                fallback_lng=fallback_lng,
+            ),
         )
     except Exception as e:
-        print(f"[Omnibot] Map screenshot error: {e}")
-        return
+        print(f"[Omnibot] Static map render failed: {e}")
+        return False
     if not jpeg:
-        print("[Omnibot] Map screenshot returned no image (check Playwright/Chromium, Maps JS key, or token).")
-        return
+        return False
     ws = get_active_esp32_socket(device_id)
     if not ws:
-        return
+        return False
     try:
-        await ws.send_bytes(bytes([0x04]) + jpeg)
+        packet = bytes([0x04]) + jpeg
+        await ws.send_bytes(packet)
+        print(f"[Omnibot] Sent static map JPEG to ESP32 ({len(jpeg)} bytes image, {len(packet)} total)")
     except Exception as e:
-        print(f"[Omnibot] Failed to send map JPEG to ESP32: {e}")
+        print(f"[Omnibot] Failed to send static map JPEG to ESP32: {e}")
+        return False
+    return True
+
+
+async def _send_map_jpeg_to_esp32_after_turn(
+    device_id: str,
+    maps_sources: list[dict],
+    api_key: str,
+    fallback_lat: Optional[float],
+    fallback_lng: Optional[float],
+) -> None:
+    """End-of-turn fallback: send map JPEG if not already sent (e.g. model omitted face_animation(map))."""
+    if map_jpeg_sent_this_turn_by_device.get(device_id):
+        return
+    ok = await _send_static_map_jpeg_to_esp32(
+        device_id=device_id,
+        maps_sources=maps_sources,
+        api_key=api_key,
+        fallback_lat=fallback_lat,
+        fallback_lng=fallback_lng,
+    )
+    if ok:
+        map_jpeg_sent_this_turn_by_device[device_id] = True
+
+
+async def _send_map_jpeg_after_face_animation_map(device_id: str, api_key: str) -> None:
+    """Best-effort immediate static map (before end-of-turn metadata)."""
+    if map_jpeg_sent_this_turn_by_device.get(device_id):
+        return
+    bot = get_bot_settings(device_id)
+    ok = await _send_static_map_jpeg_to_esp32(
+        device_id=device_id,
+        maps_sources=[],
+        api_key=api_key,
+        fallback_lat=bot.get("maps_latitude"),
+        fallback_lng=bot.get("maps_longitude"),
+    )
+    if ok:
+        map_jpeg_sent_this_turn_by_device[device_id] = True
+
+
+def _schedule_map_jpeg_after_face_animation_map(device_id: str) -> None:
+    """Schedule map screenshot from Gemini tool thread when model calls face_animation(map)."""
+    loop = _main_async_loop
+    if loop is None:
+        print("face_animation(map): no async loop yet; skipping map screenshot")
+        return
+    maps_key = (os.getenv("GOOGLE_MAPS_JS_API_KEY") or "").strip()
+    if not maps_key:
+        print(
+            "[Omnibot] face_animation(map): GOOGLE_MAPS_JS_API_KEY missing; cannot screenshot map for ESP32."
+        )
+        return
+    asyncio.run_coroutine_threadsafe(
+        _send_map_jpeg_after_face_animation_map(device_id, maps_key),
+        loop,
+    )
 
 
 async def stream_chat_turn_response(device_id: str, message_content):
@@ -939,6 +1118,8 @@ async def stream_chat_turn_response(device_id: str, message_content):
     lock = gemini_turn_locks.setdefault(device_id, asyncio.Lock())
     async with lock:
         turn_tool_state_by_device[device_id] = {"show_weather": False, "face_animation": False}
+        map_jpeg_sent_this_turn_by_device[device_id] = False
+        maps_widget_token_latest_by_device[device_id] = ""
         bot_settings = get_bot_settings(device_id)
         model = bot_settings["model"]
         system_instruction = bot_settings["system_instruction"]
@@ -1018,6 +1199,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
                             wtok = _extract_maps_widget_token_from_grounding_metadata(gm)
                             if wtok:
                                 last_maps_widget_token = wtok
+                                maps_widget_token_latest_by_device[device_id] = wtok
                             if candidate.content and candidate.content.parts:
                                 for part in candidate.content.parts:
                                     fc = getattr(part, "function_call", None)
@@ -1091,12 +1273,27 @@ async def stream_chat_turn_response(device_id: str, message_content):
     await manager.broadcast(end_msg)
 
     tok = (last_maps_widget_token or "").strip()
-    if tok:
-        maps_key = (os.getenv("GOOGLE_MAPS_JS_API_KEY") or "").strip()
+    if last_maps_sources or tok:
+        maps_key = (
+            (os.getenv("GOOGLE_MAPS_STATIC_API_KEY") or "").strip()
+            or (os.getenv("GOOGLE_MAPS_JS_API_KEY") or "").strip()
+        )
         if maps_key:
-            asyncio.create_task(_send_map_jpeg_to_esp32_after_turn(device_id, tok, maps_key))
+            bot = get_bot_settings(device_id)
+            asyncio.create_task(
+                _send_map_jpeg_to_esp32_after_turn(
+                    device_id=device_id,
+                    maps_sources=last_maps_sources,
+                    api_key=maps_key,
+                    fallback_lat=bot.get("maps_latitude"),
+                    fallback_lng=bot.get("maps_longitude"),
+                )
+            )
         else:
-            print("[Omnibot] Maps widget token present but GOOGLE_MAPS_JS_API_KEY is missing; skipping map screenshot.")
+            print(
+                "[Omnibot] Maps grounding present but no GOOGLE_MAPS_STATIC_API_KEY/GOOGLE_MAPS_JS_API_KEY found; "
+                "skipping ESP32 map image."
+            )
 
     return full_text
 

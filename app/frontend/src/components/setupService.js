@@ -50,3 +50,11 @@ export const updateBotSettings = async (device_id, settings) => {
   });
   return await res.json();
 };
+
+export const resetBotSettingsToDefault = async (device_id) => {
+  const res = await fetch(
+    `http://localhost:8000/api/settings/${encodeURIComponent(device_id)}/reset`,
+    { method: 'POST' }
+  );
+  return await res.json();
+};
