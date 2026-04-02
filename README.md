@@ -2,6 +2,8 @@
 
 Open-source stack for ESP32-based AI robots that talk to Google Gemini over Wi-Fi, with a FastAPI "brain" and a React control room on your PC.
 
+Licensed under the [MIT License](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+
 ## Repository layout
 
 ```
@@ -26,11 +28,11 @@ OmniBot/
 - **Node.js** (for the frontend)
 - **Google AI API key** for Gemini ([Google AI Studio](https://aistudio.google.com/))
 - **Bluetooth** on the PC (for provisioning real hardware)
-- **Windows** for automatic Wi‑Fi SSID scan in the setup UI (`netsh`). On other OSes, enter SSID manually or extend `setup_wifi_networks` in `app/backend/app.py`.
+- **Wi‑Fi scan (optional):** automatic listing uses **Windows** (`netsh`), **Linux** with NetworkManager (`nmcli`), or **macOS** (`airport` when available). If scanning is unavailable, use **Join Other Network** and type the SSID manually.
 
 ## Configuration
 
-Create `app/backend/.env`:
+Create `app/backend/.env` from [`app/backend/.env.example`](app/backend/.env.example):
 
 ```env
 GEMINI_API_KEY=your_key_here
@@ -45,9 +47,13 @@ NOMINATIM_USER_AGENT=OmnibotHub/1.0 (your-contact-or-repo-url)
 OMNIBOT_MAPS_DEBUG=1
 # Optional: also log semantic route decisions (routing text, prefer_maps, effective builtin tool). Enabled automatically when OMNIBOT_MAPS_DEBUG is on.
 OMNIBOT_ROUTE_DEBUG=1
+# Optional: directory for bot_settings.json, hub_secrets.json, hub_app_settings.json, and .env loading (default: folder containing app.py).
+# OMNIBOT_DATA_DIR=/path/to/data
 ```
 
-Per-bot settings (model, system instruction, timezone, vision on/off, optional Maps grounding + location) are stored in `app/backend/bot_settings.json` when you save from the UI or when the device reports vision changes.
+**Hub secrets:** API keys can also be set from the dashboard under **Hub settings** (stored in `hub_secrets.json` under the data directory). **Environment variables always override** file-based secrets, which is what you want for Docker and production injectors.
+
+**Pixel (per device id, e.g. `default_bot`):** model, system instruction, and vision on/off are stored in `bot_settings.json`. **Hub-wide:** API keys go in `hub_secrets.json`; timezone and Maps grounding location go in `hub_app_settings.json`. The UI splits these into **Pixel bot** vs **Hub / application** settings.
 
 **Maps grounding:** Turning this on in **Settings** geocodes **postal/ZIP + country** on each save via **Nominatim** (no Maps API key needed for geocoding). The country dropdown uses **`i18n-iso-countries`**. Coordinates are passed as `toolConfig.retrievalConfig` for the [Google Maps grounding tool](https://ai.google.dev/gemini-api/docs/maps-grounding). **Routing:** each turn is classified with **semantic-router** (`semantic-router[fastembed]`; first run downloads a FastEmbed model). If the prompt looks like local/geo/navigation intent **and** Maps grounding is **on** **and** valid **lat/lng** are stored, that turn uses **only** `google_maps` + `face_animation`. Otherwise it uses **Google Search** + `face_animation`. If Maps is **off**, every turn uses Search. If the router prefers Maps but coordinates are missing, that turn falls back to Search.
 
@@ -64,6 +70,7 @@ cd app/backend
 python -m venv .venv
 .venv\Scripts\activate          # Windows; on macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+copy .env.example .env          # Windows; on macOS/Linux: cp .env.example .env — then add at least GEMINI_API_KEY
 python app.py
 ```
 
@@ -79,7 +86,7 @@ npm install
 npm run dev
 ```
 
-The UI currently targets **http://localhost:8000** for REST and **ws://localhost:8000/ws/monitor** for monitor events in the main app flow (see `app/frontend/src/App.jsx` and `setupService.js`). The maps widget loader can also read `VITE_HUB_API_ORIGIN` as an override path for hub config lookup.
+The dev server **proxies** `/api`, `/setup`, `/ping`, and `/ws` to the backend on port 8000 (see `app/frontend/vite.config.js`). The client resolves the hub URL via `app/frontend/src/hubOrigin.js`: optional **`VITE_HUB_API_ORIGIN`**, otherwise **`window.location.origin`** (works when the built UI is served from the same host as the API, e.g. Docker or a reverse proxy), with a localhost fallback. The maps loader can still set **`VITE_GOOGLE_MAPS_JS_API_KEY`** for the Maps script.
 
 ### Pixel firmware
 
@@ -90,7 +97,7 @@ Open `bots/Pixel` in **PlatformIO**, set `backend_ip` / `backend_port` in `src/m
 ```
 [Pixel]  ──WebSocket /ws/stream──▶  [FastAPI backend]  ──▶  [Gemini + Google Search + optional Maps + tools]
                                            │
-                                           ├── bot_settings.json
+                                           ├── bot_settings.json, hub_secrets.json, hub_app_settings.json
                                            │
 [React dashboard]  ◀──WebSocket /ws/monitor──┘
         │
@@ -103,7 +110,12 @@ Modes from the sidebar:
 
 - **Dashboard** — intelligence feed, typed commands to Gemini (`POST /api/text-command`), connection status.
 - **Setup** — BLE scan (`GET /setup/scan`), Wi‑Fi list (`GET /setup/wifi-networks`), provision (`POST /setup/provision`).
-- **Settings** — load/save `GET`/`POST /api/settings/{device_id}` (default target id in UI: `default_bot`), including optional Maps grounding and Nominatim-backed location fields.
+- **Pixel bot settings** (gear on the Pixel card) — `GET`/`POST /api/settings/{device_id}` (default `default_bot`): model, system instructions, and vision only.
+- **Hub settings** (sidebar) — `GET`/`POST /api/hub/settings` for API keys; `GET`/`POST /api/hub/app-settings` for timezone and Maps location; **`GET /api/hub/status`** reports whether Gemini is configured.
+
+## Docker (preview)
+
+Run the backend and frontend in containers or behind one reverse proxy; mount a volume for **`OMNIBOT_DATA_DIR`** so `bot_settings.json`, `hub_secrets.json`, and `hub_app_settings.json` persist. Pass secrets with **environment variables** rather than committing files. A multi-stage image can build the Vite app and serve static files while the FastAPI process handles `/api` and WebSockets.
 
 ## Backend API summary
 
@@ -111,11 +123,16 @@ Modes from the sidebar:
 |--------|------|---------|
 | `GET` | `/ping` | Health check; also broadcasts an `esp32_connected`-style event to monitor clients |
 | `GET` | `/setup/scan` | BLE scan; lists devices whose name contains `Pixel` |
-| `GET` | `/setup/wifi-networks` | Wi‑Fi SSIDs (Windows `netsh`) |
+| `GET` | `/setup/wifi-networks` | Wi‑Fi SSIDs (`networks`) plus optional `message` (scan hints / errors) |
+| `GET` | `/api/hub/status` | `{ gemini_configured, data_dir }` |
+| `GET` | `/api/hub/settings` | Masked hub secret status (never returns raw keys) |
+| `POST` | `/api/hub/settings` | Update `hub_secrets.json` fields; env vars still win at runtime |
+| `GET` | `/api/hub/app-settings` | Hub-wide timezone and Maps grounding / address fields |
+| `POST` | `/api/hub/app-settings` | Save clock & location; geocodes when Maps grounding is on; clears all in-memory chat histories |
 | `POST` | `/setup/provision` | Write JSON `{"ssid","password"}` to Pixel’s BLE Wi‑Fi characteristic |
-| `GET` | `/api/settings/{device_id}` | Read model, system instruction, timezone rule, vision flag, Maps/location fields |
-| `POST` | `/api/settings/{device_id}` | Save those fields; geocodes via Nominatim when Maps grounding is on; response includes `maps_geocode: { ok, error? }`; pushes runtime vision/timezone to the bot if connected |
-| `POST` | `/api/settings/{device_id}/reset` | Reset settings to defaults for that device and push runtime vision/timezone when connected |
+| `GET` | `/api/settings/{device_id}` | Read merged view: Pixel fields from `bot_settings.json` plus hub timezone/Maps from `hub_app_settings.json` |
+| `POST` | `/api/settings/{device_id}` | Save **Pixel-only** fields (model, system instruction, vision); pushes runtime vision to the bot if connected |
+| `POST` | `/api/settings/{device_id}/reset` | Reset Pixel-only fields to defaults; push vision; does **not** change hub clock/Maps |
 | `POST` | `/api/text-command` | Body: `{ "message", "device_id" }` — one Gemini turn (appends to in-memory history), stream to UI, reply to bot WebSocket |
 | `POST` | `/api/text-command/reset/{device_id}` | Clear in-memory multi-turn history for that device |
 | `GET` / `POST` | `/api/runtime/{device_id}/vision` | Get/set whether JPEG frames are assembled into video for the model |
@@ -156,6 +173,6 @@ See `app/backend/requirements.txt` (FastAPI, uvicorn, `google-genai`, `semantic-
 
 Frontend also depends on **`i18n-iso-countries`** for the settings country list (`npm install` in `app/frontend`).
 
-## License / contributing
+## License
 
-Add your preferred license and contribution notes here if you publish the repo publicly.
+[MIT](LICENSE). Contributions welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).

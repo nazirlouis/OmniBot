@@ -3,6 +3,8 @@ __pycache__/
 app/backend/models/
 *.pyc
 .env
+app/backend/hub_secrets.json
+app/backend/hub_app_settings.json
 
 # Node
 node_modules/

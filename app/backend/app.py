@@ -10,8 +10,6 @@ import asyncio # Added for non-blocking operations
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-from dotenv import load_dotenv
-from google import genai
 from google.genai import types
 import json
 import re
@@ -21,22 +19,34 @@ from urllib.parse import urlencode, urlparse, parse_qs
 import requests
 
 from semantic_pixel_router import classify_retrieval_with_reason
+from wifi_scan import scan_wifi_ssids
 
-from pydantic import BaseModel
+from hub_config import (
+    DEFAULT_NOMINATIM_USER_AGENT,
+    SETTINGS_FILE,
+    get_genai_client,
+    get_gemini_api_key,
+    get_google_maps_js_api_key,
+    get_maps_key_js_for_screenshot,
+    get_maps_key_static_then_js,
+    get_nominatim_user_agent_raw,
+    hub_public_status,
+    hub_settings_public_view,
+    load_hub_app_settings,
+    merge_hub_secrets,
+    save_hub_app_settings,
+)
+
+from pydantic import BaseModel, ConfigDict
 from bleak import BleakScanner, BleakClient
-import subprocess
 import uuid
 from functools import partial
 
 # ==========================================
-#          LOAD SECRETS & SETUP
+#          LOAD SECRETS & SETUP (see hub_config: OMNIBOT_DATA_DIR, .env, hub_secrets.json)
 # ==========================================
-load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Settings Configuration
-SETTINGS_FILE = "bot_settings.json"
+# Settings file path is resolved in hub_config (not cwd-dependent).
 DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_TIMEZONE_RULE = "EST5EDT,M3.2.0/2,M11.1.0/2"
 DEFAULT_VISION_ENABLED = False
@@ -74,14 +84,11 @@ CALLING_CARD_CATEGORY_MAX = 48
 CALLING_CARD_JPEG_MAX_BYTES = 14 * 1024
 
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
-DEFAULT_NOMINATIM_USER_AGENT = (
-    "OmnibotHub/1.0 (set NOMINATIM_USER_AGENT in .env - Nominatim usage policy)"
-)
 
 
 def _nominatim_user_agent_header() -> str:
     """HTTP headers must be latin-1; strip/replace non-ASCII (e.g. from .env)."""
-    raw = (os.getenv("NOMINATIM_USER_AGENT") or "").strip() or DEFAULT_NOMINATIM_USER_AGENT
+    raw = get_nominatim_user_agent_raw() or DEFAULT_NOMINATIM_USER_AGENT
     ascii_only = raw.encode("ascii", "replace").decode("ascii").strip()
     return (ascii_only[:200] if ascii_only else None) or "OmnibotHub/1.0"
 
@@ -223,10 +230,6 @@ map_location_override_by_device: dict[str, str] = {}
 # Store display_style from show_map_animation tool call for end-of-turn rendering.
 map_display_style_by_device: dict[str, str] = {}
 
-if not API_KEY:
-    print("ERROR: API Key not found in .env file!")
-    exit()
-
 def get_all_settings():
     if not os.path.exists(SETTINGS_FILE):
         return {}
@@ -245,39 +248,32 @@ def save_all_settings(settings):
         print(f"Error saving settings: {e}")
 
 def get_bot_settings(device_id: str):
+    """Merge per-device Pixel fields from bot_settings.json with hub-wide location/clock from hub_app_settings.json."""
     settings = get_all_settings()
     bot_conf = settings.get(device_id, {})
+    hub = load_hub_app_settings()
     return {
         "model": bot_conf.get("model", DEFAULT_MODEL),
         "system_instruction": bot_conf.get("system_instruction", DEFAULT_SYSTEM_INSTRUCTION),
-        "timezone_rule": bot_conf.get("timezone_rule", DEFAULT_TIMEZONE_RULE),
         "vision_enabled": bool(bot_conf.get("vision_enabled", DEFAULT_VISION_ENABLED)),
-        "maps_grounding_enabled": bool(bot_conf.get("maps_grounding_enabled", False)),
-        "maps_street": (bot_conf.get("maps_street") or "").strip(),
-        "maps_state": (bot_conf.get("maps_state") or "").strip(),
-        "maps_postal_code": (bot_conf.get("maps_postal_code") or "").strip(),
-        "maps_country": (bot_conf.get("maps_country") or "").strip(),
-        "maps_latitude": bot_conf.get("maps_latitude"),
-        "maps_longitude": bot_conf.get("maps_longitude"),
-        "maps_display_name": bot_conf.get("maps_display_name"),
+        "timezone_rule": hub.get("timezone_rule", DEFAULT_TIMEZONE_RULE),
+        "maps_grounding_enabled": bool(hub.get("maps_grounding_enabled", False)),
+        "maps_street": (hub.get("maps_street") or "").strip(),
+        "maps_state": (hub.get("maps_state") or "").strip(),
+        "maps_postal_code": (hub.get("maps_postal_code") or "").strip(),
+        "maps_country": (hub.get("maps_country") or "").strip(),
+        "maps_latitude": hub.get("maps_latitude"),
+        "maps_longitude": hub.get("maps_longitude"),
+        "maps_display_name": hub.get("maps_display_name"),
     }
 
 
 def _default_stored_bot_settings() -> dict:
-    """Persisted row for a bot after reset-to-default (matches app defaults, clears maps)."""
+    """Persisted row for a bot after reset-to-default (model, system prompt, vision only)."""
     return {
         "model": DEFAULT_MODEL,
         "system_instruction": DEFAULT_SYSTEM_INSTRUCTION,
-        "timezone_rule": DEFAULT_TIMEZONE_RULE,
         "vision_enabled": DEFAULT_VISION_ENABLED,
-        "maps_grounding_enabled": False,
-        "maps_street": "",
-        "maps_state": "",
-        "maps_postal_code": "",
-        "maps_country": "",
-        "maps_latitude": None,
-        "maps_longitude": None,
-        "maps_display_name": None,
     }
 
 
@@ -308,7 +304,7 @@ def _geocode_address(street: str, state: str, postal: str, country: str) -> tupl
     q = ", ".join(parts)
     
     # Try Google Geocoding first if key available
-    g_key = os.getenv("GOOGLE_MAPS_JS_API_KEY") or os.getenv("GOOGLE_MAPS_STATIC_API_KEY")
+    g_key = get_maps_key_static_then_js()
     if g_key:
         try:
             params = urlencode({"address": q, "key": g_key.strip()})
@@ -441,8 +437,13 @@ def create_wav_header(data_size: int, sample_rate: int = 16000, num_channels: in
     header.extend(data_size.to_bytes(4, byteorder='little'))
     return bytes(header)
 
-client = genai.Client(api_key=API_KEY)
+
 app = FastAPI(title="ESP32 Gemini Brain Monitor")
+
+if not get_gemini_api_key():
+    print(
+        "WARNING: No Gemini API key — set GEMINI_API_KEY or configure keys in Hub settings (UI / POST /api/hub/settings)."
+    )
 
 
 def _google_search_builtin():
@@ -595,10 +596,17 @@ class WifiCredentials(BaseModel):
     device_address: str
 
 class BotSettingsSchema(BaseModel):
+    """Pixel-only fields stored per device_id in bot_settings.json."""
+
     model: str
     system_instruction: str
-    timezone_rule: str = DEFAULT_TIMEZONE_RULE
     vision_enabled: bool = DEFAULT_VISION_ENABLED
+
+
+class HubAppSettingsSchema(BaseModel):
+    """Hub-wide clock and Maps grounding location (hub_app_settings.json)."""
+
+    timezone_rule: str = DEFAULT_TIMEZONE_RULE
     maps_grounding_enabled: bool = False
     maps_street: str = ""
     maps_state: str = ""
@@ -618,6 +626,15 @@ class VisionToggleRequest(BaseModel):
 
 class TimezoneRuleRequest(BaseModel):
     timezone_rule: str
+
+
+class HubSettingsUpdate(BaseModel):
+    gemini_api_key: Optional[str] = None
+    google_maps_js_api_key: Optional[str] = None
+    google_maps_static_api_key: Optional[str] = None
+    nominatim_user_agent: Optional[str] = None
+
+    model_config = ConfigDict(extra="forbid")
 
 
 # Use a standard BLE UUID for our custom generic characteristic
@@ -665,19 +682,11 @@ async def setup_provision(creds: WifiCredentials):
 
 @app.get("/setup/wifi-networks")
 async def setup_wifi_networks():
-    """Scans for nearby Wi-Fi networks using the host OS (Windows)."""
-    try:
-        out = subprocess.run(["netsh", "wlan", "show", "networks"], capture_output=True, text=True).stdout
-        networks = []
-        for line in out.split('\n'):
-            if 'SSID' in line and ':' in line:
-                ssid = line.split(':', 1)[1].strip()
-                if ssid and ssid not in networks:
-                    networks.append(ssid)
-        return {"networks": networks}
-    except Exception as e:
-        print(f"Wi-Fi Scan Error: {e}")
-        return {"networks": []}
+    """Scans for nearby Wi-Fi networks when the host OS supports it (Windows netsh, Linux nmcli, macOS airport)."""
+    result = scan_wifi_ssids()
+    if result.get("message"):
+        print(f"[Omnibot/wifi-scan] {result['message']}")
+    return {"networks": result["networks"], "message": result.get("message")}
 
 # ==========================================
 #          API ENDPOINTS (SETTINGS)
@@ -689,75 +698,40 @@ async def get_settings(device_id: str):
 
 @app.post("/api/settings/{device_id}")
 async def update_settings(device_id: str, new_settings: BotSettingsSchema):
-    """Updates the settings for a specific bot."""
+    """Updates Pixel-only settings (model, system instruction, vision) for a bot."""
     settings = get_all_settings()
-    prev = settings.get(device_id, {})
-
-    maps_geocode: dict = {"ok": True, "error": None}
-    street = (new_settings.maps_street or "").strip()
-    state = (new_settings.maps_state or "").strip()
-    postal = (new_settings.maps_postal_code or "").strip()
-    country = (new_settings.maps_country or "").strip()
-    maps_enabled = bool(new_settings.maps_grounding_enabled)
-
     row = {
         "model": new_settings.model,
         "system_instruction": new_settings.system_instruction,
-        "timezone_rule": new_settings.timezone_rule or DEFAULT_TIMEZONE_RULE,
         "vision_enabled": bool(new_settings.vision_enabled),
-        "maps_grounding_enabled": maps_enabled,
-        "maps_street": street,
-        "maps_state": state,
-        "maps_postal_code": postal,
-        "maps_country": country,
     }
-
-    if maps_enabled:
-        lat, lon, disp, err = _geocode_address(street, state, postal, country)
-        if err:
-            maps_geocode = {"ok": False, "error": err}
-            row["maps_latitude"] = None
-            row["maps_longitude"] = None
-            row["maps_display_name"] = None
-        else:
-            row["maps_latitude"] = lat
-            row["maps_longitude"] = lon
-            row["maps_display_name"] = disp
-    else:
-        row["maps_latitude"] = prev.get("maps_latitude")
-        row["maps_longitude"] = prev.get("maps_longitude")
-        row["maps_display_name"] = prev.get("maps_display_name")
-
     settings[device_id] = row
     save_all_settings(settings)
     history_by_device.pop(device_id, None)
-    vision_enabled_by_device[device_id] = settings[device_id]["vision_enabled"]
-    timezone_rule_by_device[device_id] = settings[device_id]["timezone_rule"]
-    await _send_runtime_vision_to_esp32(device_id, settings[device_id]["vision_enabled"])
-    await _send_runtime_timezone_to_esp32(device_id, settings[device_id]["timezone_rule"])
+    vision_enabled_by_device[device_id] = row["vision_enabled"]
+    await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
     if _maps_debug_enabled():
-        sd = settings[device_id]
         _maps_debug(
-            f"settings_saved device_id={device_id!r} maps_enabled={maps_enabled} maps_geocode={maps_geocode!r} "
-            f"stored lat/lng=({sd.get('maps_latitude')!r}, {sd.get('maps_longitude')!r}) "
-            f"display_name={sd.get('maps_display_name')!r} in_memory_history_cleared=True"
+            f"pixel_settings_saved device_id={device_id!r} in_memory_history_cleared=True"
         )
-    return {"status": "success", "settings": settings[device_id], "maps_geocode": maps_geocode}
+    return {
+        "status": "success",
+        "settings": get_bot_settings(device_id),
+        "maps_geocode": {"ok": True, "error": None},
+    }
 
 
 @app.post("/api/settings/{device_id}/reset")
 async def reset_settings_to_default(device_id: str):
-    """Restore all stored settings for this bot to application defaults and sync runtime state."""
+    """Restore Pixel-only stored settings to defaults; hub clock/Maps are unchanged."""
     row = _default_stored_bot_settings()
     settings = get_all_settings()
     settings[device_id] = row
     save_all_settings(settings)
     history_by_device.pop(device_id, None)
     vision_enabled_by_device[device_id] = row["vision_enabled"]
-    timezone_rule_by_device[device_id] = row["timezone_rule"]
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
-    await _send_runtime_timezone_to_esp32(device_id, row["timezone_rule"])
-    return {"status": "success", "settings": row, "maps_geocode": {"ok": True, "error": None}}
+    return {"status": "success", "settings": get_bot_settings(device_id), "maps_geocode": {"ok": True, "error": None}}
 
 
 # ==========================================
@@ -770,6 +744,17 @@ history_by_device: dict[str, list] = {}
 gemini_turn_locks: dict[str, asyncio.Lock] = {}
 vision_enabled_by_device = {}
 timezone_rule_by_device = {}
+
+
+async def _push_timezone_to_all_streams(timezone_rule: str) -> None:
+    """Notify all connected ESP32 streams of a hub timezone update."""
+    tr = str(timezone_rule or DEFAULT_TIMEZONE_RULE)
+    payload = json.dumps({"type": "runtime_timezone", "timezone_rule": tr})
+    for ws in list(active_streams.keys()):
+        try:
+            await ws.send_text(payload)
+        except Exception as e:
+            print(f"Failed to push timezone to stream: {e}")
 
 
 def _make_show_weather_tool(device_id: str):
@@ -1691,9 +1676,7 @@ async def _try_send_directions_map_early(device_id: str) -> None:
     lat, lng = bot.get("maps_latitude"), bot.get("maps_longitude")
     if lat is None or lng is None:
         return
-    maps_key = (os.getenv("GOOGLE_MAPS_STATIC_API_KEY") or "").strip() or (
-        os.getenv("GOOGLE_MAPS_JS_API_KEY") or ""
-    ).strip()
+    maps_key = get_maps_key_static_then_js()
     if not maps_key:
         return
     try:
@@ -1782,7 +1765,7 @@ def _schedule_map_jpeg_after_face_animation_map(device_id: str) -> None:
     if loop is None:
         print("face_animation(map): no async loop yet; skipping map screenshot")
         return
-    maps_key = (os.getenv("GOOGLE_MAPS_JS_API_KEY") or "").strip()
+    maps_key = get_maps_key_js_for_screenshot()
     if not maps_key:
         print(
             "[Omnibot] face_animation(map): GOOGLE_MAPS_JS_API_KEY missing; cannot screenshot map for ESP32."
@@ -1867,7 +1850,12 @@ async def stream_chat_turn_response(device_id: str, message_content):
             device_id=device_id,
             prefer_maps=prefer_maps,
         )
-        chat = client.chats.create(
+        gc = get_genai_client()
+        if gc is None:
+            raise RuntimeError(
+                "Gemini API key not configured. Set GEMINI_API_KEY or add a key in Hub settings."
+            )
+        chat = gc.chats.create(
             model=model,
             config=config,
             history=list(prior_history),
@@ -2023,10 +2011,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
     # Trigger map rendering if the model used grounding OR explicitly called
     # show_map_animation with a location (no grounding needed in that case).
     if last_maps_sources or tok or loc_override:
-        maps_key = (
-            (os.getenv("GOOGLE_MAPS_STATIC_API_KEY") or "").strip()
-            or (os.getenv("GOOGLE_MAPS_JS_API_KEY") or "").strip()
-        )
+        maps_key = get_maps_key_static_then_js()
         if maps_key:
             bot = get_bot_settings(device_id)
             asyncio.create_task(
@@ -2118,6 +2103,9 @@ async def esp32_stream_endpoint(websocket: WebSocket):
                     elif msg_type == "timezone_changed":
                         tz = str(j.get("timezone_rule", DEFAULT_TIMEZONE_RULE) or DEFAULT_TIMEZONE_RULE)
                         timezone_rule_by_device[dev_id] = tz
+                        hub_tz = load_hub_app_settings()
+                        hub_tz["timezone_rule"] = tz
+                        save_hub_app_settings(hub_tz)
                         await manager.broadcast({"type": "timezone_changed", "device_id": dev_id, "timezone_rule": tz})
                 except Exception as e:
                     print(f"Error parsing ESP32 text message: {e}")
@@ -2257,6 +2245,11 @@ async def text_command(req: TextCommandRequest):
     message = (req.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if not get_gemini_api_key():
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini API key not configured. Set GEMINI_API_KEY or configure in Hub settings.",
+        )
 
     await manager.broadcast({
         "type": "processing_started",
@@ -2316,14 +2309,92 @@ async def set_timezone_setting(device_id: str, payload: TimezoneRuleRequest):
     """Sets timezone rule used by the device for RTC/NTP sync."""
     tz = str(payload.timezone_rule or DEFAULT_TIMEZONE_RULE)
     timezone_rule_by_device[device_id] = tz
+    hub = load_hub_app_settings()
+    hub["timezone_rule"] = tz
+    save_hub_app_settings(hub)
     await _send_runtime_timezone_to_esp32(device_id, tz)
     return {"status": "success", "device_id": device_id, "timezone_rule": tz}
+
+
+@app.get("/api/hub/app-settings")
+async def get_hub_app_settings_endpoint():
+    """Hub-wide timezone and Maps grounding location (not per-Pixel)."""
+    return load_hub_app_settings()
+
+
+@app.post("/api/hub/app-settings")
+async def post_hub_app_settings_endpoint(new_settings: HubAppSettingsSchema):
+    """Save hub clock and Maps location; clears all in-memory Gemini histories."""
+    hub_prev = load_hub_app_settings()
+    maps_geocode: dict = {"ok": True, "error": None}
+    street = (new_settings.maps_street or "").strip()
+    state = (new_settings.maps_state or "").strip()
+    postal = (new_settings.maps_postal_code or "").strip()
+    country = (new_settings.maps_country or "").strip()
+    maps_enabled = bool(new_settings.maps_grounding_enabled)
+    tz = str(new_settings.timezone_rule or DEFAULT_TIMEZONE_RULE)
+
+    row = {
+        "timezone_rule": tz,
+        "maps_grounding_enabled": maps_enabled,
+        "maps_street": street,
+        "maps_state": state,
+        "maps_postal_code": postal,
+        "maps_country": country,
+    }
+
+    if maps_enabled:
+        lat, lon, disp, err = _geocode_address(street, state, postal, country)
+        if err:
+            maps_geocode = {"ok": False, "error": err}
+            row["maps_latitude"] = None
+            row["maps_longitude"] = None
+            row["maps_display_name"] = None
+        else:
+            row["maps_latitude"] = lat
+            row["maps_longitude"] = lon
+            row["maps_display_name"] = disp
+    else:
+        row["maps_latitude"] = hub_prev.get("maps_latitude")
+        row["maps_longitude"] = hub_prev.get("maps_longitude")
+        row["maps_display_name"] = hub_prev.get("maps_display_name")
+
+    save_hub_app_settings(row)
+    history_by_device.clear()
+    for did in list(get_all_settings().keys()):
+        timezone_rule_by_device[did] = row["timezone_rule"]
+    await _push_timezone_to_all_streams(row["timezone_rule"])
+    if _maps_debug_enabled():
+        _maps_debug(
+            f"hub_app_settings_saved maps_enabled={maps_enabled} maps_geocode={maps_geocode!r} "
+            f"stored lat/lng=({row.get('maps_latitude')!r}, {row.get('maps_longitude')!r}) "
+            f"all_device_history_cleared=True"
+        )
+    return {"status": "success", "settings": row, "maps_geocode": maps_geocode}
+
 
 @app.get("/api/hub-config")
 async def hub_config():
     """Public values the dashboard needs (Maps JS key for contextual widget is browser-exposed)."""
-    key = (os.getenv("GOOGLE_MAPS_JS_API_KEY") or "").strip()
+    key = get_google_maps_js_api_key()
     return {"maps_js_api_key": key}
+
+
+@app.get("/api/hub/status")
+async def api_hub_status():
+    return hub_public_status()
+
+
+@app.get("/api/hub/settings")
+async def api_hub_settings_get():
+    return hub_settings_public_view()
+
+
+@app.post("/api/hub/settings")
+async def api_hub_settings_post(body: HubSettingsUpdate):
+    payload = body.model_dump(exclude_unset=True)
+    merge_hub_secrets(payload)
+    return {"status": "success", "settings": hub_settings_public_view()}
 
 
 @app.get("/ping")

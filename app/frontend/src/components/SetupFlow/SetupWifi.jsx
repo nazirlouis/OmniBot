@@ -1,13 +1,17 @@
 import React from 'react';
 
 const SetupWifi = ({ state, setters }) => {
-  const { wifiNetworks, isScanningWifi } = state;
+  const { wifiNetworks, wifiScanMessage, isScanningWifi } = state;
   const { setSsid, setPassword, setSetupStep } = setters;
 
   return (
     <div className="setup-section slide-enter">
       <h3 className="section-title">Select Wi-Fi Network</h3>
-      
+      {wifiScanMessage && (
+        <p className="help-text" style={{ marginBottom: '1rem' }}>
+          {wifiScanMessage}
+        </p>
+      )}
       {isScanningWifi ? (
         <div className="scanning-container">
           <div className="pulse-ring mx-auto"></div>

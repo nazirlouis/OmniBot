@@ -4,8 +4,9 @@ import './index.css';
 import Sidebar from './components/Sidebar';
 import IntelligenceFeed from './components/IntelligenceFeed';
 import SetupOrchestrator from './components/SetupOrchestrator';
-import BotSettings from './components/BotSettings';
+import SettingsShell from './components/SettingsShell';
 import { initialSetupState, scanForDevices, scanForWifi, sendProvision } from './components/setupService';
+import { hubUrl, getHubWebSocketUrl } from './hubOrigin';
 
 function App() {
   // --- WebSocket Monitor States ---
@@ -18,6 +19,7 @@ function App() {
   
   // --- Orchestrator & Setup States ---
   const [setupState, setSetupState] = useState(initialSetupState);
+  const [settingsTab, setSettingsTab] = useState('pixel');
 
   // Helper to cleanly update nested setup state
   const updateSetup = (key, value) => {
@@ -54,7 +56,7 @@ function App() {
     let reconnectTimer;
 
     const connectWebSocket = () => {
-      ws = new WebSocket('ws://localhost:8000/ws/monitor');
+      ws = new WebSocket(getHubWebSocketUrl('/ws/monitor'));
 
       ws.onopen = () => {
         setWsStatus('connected');
@@ -175,8 +177,9 @@ function App() {
   const handleWifiScan = async () => {
     updateSetup('isScanningWifi', true);
     try {
-      const networks = await scanForWifi();
+      const { networks, message } = await scanForWifi();
       updateSetup('wifiNetworks', networks);
+      updateSetup('wifiScanMessage', message);
     } catch (e) {
       console.error("Wi-Fi Scan error", e);
     } finally {
@@ -211,7 +214,7 @@ function App() {
     setIsSendingText(true);
 
     try {
-      const res = await fetch('http://localhost:8000/api/text-command', {
+      const res = await fetch(hubUrl('/api/text-command'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -254,6 +257,8 @@ function App() {
         appMode={setupState.appMode}
         setAppMode={setupSetters.setAppMode}
         setSetupStep={setupSetters.setSetupStep}
+        setSettingsTab={setSettingsTab}
+        settingsTab={settingsTab}
       />
       
       <main className="main-content">
@@ -277,7 +282,7 @@ function App() {
         )}
         
         {setupState.appMode === 'settings' && (
-          <BotSettings setAppMode={setupSetters.setAppMode} />
+          <SettingsShell setAppMode={setupSetters.setAppMode} tab={settingsTab} setTab={setSettingsTab} />
         )}
       </main>
     </div>

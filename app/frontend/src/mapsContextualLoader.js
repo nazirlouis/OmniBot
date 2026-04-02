@@ -4,6 +4,8 @@
  * Bootstrap matches Google's dynamic library import snippet (v=alpha for contextual view).
  */
 
+import { hubUrl } from './hubOrigin';
+
 export function installGoogleMapsBootstrap(apiKey) {
   if (typeof window === 'undefined') return;
   if (window.google?.maps?.importLibrary) return;
@@ -56,15 +58,13 @@ export async function loadMapsPlacesForContextual(apiKey) {
   await window.google.maps.importLibrary('places');
 }
 
-const HUB_ORIGIN = import.meta.env.VITE_HUB_API_ORIGIN || 'http://localhost:8000';
-
 /**
  * @returns {Promise<string>}
  */
 export async function resolveMapsJsApiKey() {
   const fromEnv = import.meta.env.VITE_GOOGLE_MAPS_JS_API_KEY?.trim();
   if (fromEnv) return fromEnv;
-  const r = await fetch(`${HUB_ORIGIN}/api/hub-config`);
+  const r = await fetch(hubUrl('/api/hub-config'));
   if (!r.ok) throw new Error('hub-config failed');
   const cfg = await r.json();
   return (cfg.maps_js_api_key || '').trim();

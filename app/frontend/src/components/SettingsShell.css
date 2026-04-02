@@ -1,0 +1,69 @@
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1.75rem;
+}
+
+.settings-tab {
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 0.55rem 1.1rem;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 102, 204, 0.25);
+  background: rgba(255, 255, 255, 0.5);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.settings-tab:hover {
+  border-color: rgba(0, 102, 204, 0.45);
+  color: var(--text-main);
+}
+
+.settings-tab.active {
+  background: linear-gradient(135deg, rgba(0, 136, 255, 0.12), rgba(0, 102, 204, 0.08));
+  border-color: rgba(0, 136, 255, 0.45);
+  color: var(--accent);
+}
+
+.settings-panel-inner {
+  max-width: 650px;
+}
+
+.settings-subheader {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  border-bottom: 1px solid rgba(0, 102, 204, 0.12);
+  padding-bottom: 1.25rem;
+  margin-bottom: 1.75rem;
+}
+
+.settings-subheader h2 {
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: 0.3px;
+  background: var(--brand-grad);
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.settings-shell-back {
+  flex-shrink: 0;
+}
+
+.hub-section-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin: 2rem 0 0.75rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid rgba(0, 102, 204, 0.12);
+  color: var(--text-main);
+}
