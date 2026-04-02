@@ -11,6 +11,8 @@ OmniBot/
 ├── app/
 │   ├── backend/          # FastAPI + Google GenAI (Gemini), BLE provisioning, WebSockets
 │   └── frontend/         # React + Vite dashboard
+├── Dockerfile            # Multi-stage: build UI + run hub
+├── docker-compose.yml
 └── bots/
     └── Pixel/            # First bot: Seeed XIAO ESP32S3 Sense + round display (PlatformIO)
 ```
@@ -94,6 +96,28 @@ The dev server **proxies** `/api`, `/setup`, `/ping`, and `/ws` to the backend o
 ### Pixel firmware
 
 Open `bots/Pixel` in **PlatformIO**, set `backend_ip` / `backend_port` in `src/main.cpp`, build, and upload. Details: [`bots/Pixel/README.md`](bots/Pixel/README.md).
+
+### Docker (one container)
+
+**Docker** packages the app into an **image** (a filesystem snapshot + run instructions). A **container** is a running instance of that image. **Volumes** persist data on your machine when the container is recreated (`bot_settings.json`, `hub_secrets.json`, etc. under `OMNIBOT_DATA_DIR`).
+
+Prerequisites: [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows/macOS) or Docker Engine (Linux).
+
+From the repository root:
+
+```bash
+docker compose up --build
+```
+
+Then open **http://localhost:8080** (host port `8080` maps to port `8000` in the container). The built React UI is served by FastAPI from the same origin; paste your Gemini API key on the welcome screen if you did not set `GEMINI_API_KEY`.
+
+- **Data:** A named volume `omnibot_data` stores `/data` inside the container (JSON settings and secrets). It survives `docker compose down`. To remove the volume and wipe hub data: `docker compose down -v` (destructive).
+- **Optional env:** Set `GEMINI_API_KEY` in a `.env` file next to `docker-compose.yml` or export it before `docker compose up`; the compose file passes it through. Other variables match [`app/backend/.env.example`](app/backend/.env.example).
+- **Ports:** Change the left side of `ports` in [`docker-compose.yml`](docker-compose.yml) (e.g. `9080:8000`) if `8080` is busy. Point Pixel’s `backend_ip` in firmware to your **host machine’s LAN IP** (not `localhost` from the device) and the mapped port (e.g. `8080`).
+- **Health:** Compose uses `GET /ping` for health checks (first startup can take a while while **semantic-router** downloads its embedding model).
+- **BLE / Wi‑Fi setup:** Bluetooth from the host is **often not available inside desktop Docker** the same way as on your PC. If BLE provisioning fails from the containerized UI, run the **frontend + backend on the host** for setup, or use advanced Linux device passthrough. Core chat and settings still work in Docker.
+
+Files: [`Dockerfile`](Dockerfile) (multi-stage: build Vite, then Python), [`.dockerignore`](.dockerignore), [`docker-compose.yml`](docker-compose.yml).
 
 ## Architecture
 

@@ -37,3 +37,7 @@ Thanks for your interest in Omnibot.
 ## CI
 
 GitHub Actions runs `python -m compileall` on the backend and `npm run build` on the frontend. Ensure both pass before opening a PR.
+
+## Docker
+
+From the repo root, `docker compose up --build` should build and start the hub (see README). Change requires updating the `Dockerfile` / `docker-compose.yml` if you alter how the frontend is built or how static files are served.

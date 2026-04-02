@@ -9,5 +9,5 @@ python-multipart
 opencv-python-headless
 imageio
 imageio-ffmpeg
+# fastembed is installed via this extra; keep bounds aligned (0.1.x pins fastembed<0.4 on Python <3.13)
 semantic-router[fastembed]>=0.1.12
-fastembed>=0.7.0

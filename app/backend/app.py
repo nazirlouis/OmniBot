@@ -9,6 +9,7 @@ import imageio
 import asyncio # Added for non-blocking operations
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from google.genai import types
 import json
@@ -2406,11 +2407,23 @@ async def ping():
     })
     return {"status": "ready"}
 
+
+# Optional: serve production Vite build (Docker). Register after all API/WebSocket routes.
+_omnibot_static_root = (os.getenv("OMNIBOT_STATIC_ROOT") or "").strip()
+if _omnibot_static_root and os.path.isdir(_omnibot_static_root):
+    app.mount(
+        "/",
+        StaticFiles(directory=_omnibot_static_root, html=True),
+        name="static",
+    )
+
 # ==========================================
 #          MAIN RUNNER
 # ==========================================
 if __name__ == "__main__":
-    print(f"--- AUDIO/VISUAL BRAIN SERVER STARTED ---")
-    print("Listening on http://0.0.0.0:8000")
+    _host = os.getenv("HOST", "0.0.0.0")
+    _port = int(os.getenv("PORT", "8000"))
+    print("--- AUDIO/VISUAL BRAIN SERVER STARTED ---")
+    print(f"Listening on http://{_host}:{_port}")
     print("Waiting for ESP32 to connect to /ws/stream ...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=_host, port=_port)
