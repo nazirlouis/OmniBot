@@ -15,7 +15,7 @@ from google import genai
 from google.genai import types
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
@@ -832,7 +832,13 @@ def _make_show_map_animation_tool(device_id: str):
         # Teal "map mode" placeholder only for directions; calling card is drawn on-device when data arrives.
         if style == "directions":
             _schedule_face_animation_to_esp32(device_id, "map", "")
-        # NOTE: Map JPEG / calling card payload is sent in the end-of-turn handler.
+            # Start Directions + Static Map now while the model is still streaming (see _try_send_directions_map_early).
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_try_send_directions_map_early(device_id))
+            except RuntimeError:
+                pass
+        # NOTE: Map JPEG / calling card payload is also sent in the end-of-turn handler if not early-sent.
         _broadcast_tool_call_to_frontend("show_map_animation", {"location": loc, "display_style": style})
         return {"ok": True, "display": "map animation queued on robot", "display_style": style}
 
@@ -1077,14 +1083,41 @@ def _best_maps_location_query(maps_sources: list[dict]) -> str:
     return ""
 
 
-def _normalize_map_jpeg(im: "Image.Image", size: int = 240) -> Optional[bytes]:
-    """Resize to size×size and re-encode as baseline JPEG ready for ESP32."""
+# links2004/WebSockets defaults to ~15KB RX unless WEBSOCKETS_MAX_DATA_SIZE is raised in firmware.
+# Keep under this so a single binary frame never drops the connection on stock builds.
+_MAP_JPEG_MAX_BYTES = 14000
+
+
+def _normalize_map_jpeg(
+    im: "Image.Image", size: int = 240, max_bytes: int = _MAP_JPEG_MAX_BYTES
+) -> Optional[bytes]:
+    """Resize to size×size and re-encode as baseline JPEG ready for ESP32.
+
+    Lowers JPEG quality as needed so the buffer stays under ``max_bytes`` (long routes
+    produce busier images that exceed ~15KB at quality 85 and can disconnect the client).
+    """
     try:
         if im.size != (size, size):
             im = im.resize((size, size), Image.Resampling.LANCZOS)
-        out = io.BytesIO()
-        im.save(out, format="JPEG", quality=85, optimize=True, progressive=False)
-        return out.getvalue()
+        smallest: Optional[bytes] = None
+        for quality in (85, 78, 70, 62, 55, 48, 40):
+            out = io.BytesIO()
+            im.save(out, format="JPEG", quality=quality, optimize=True, progressive=False)
+            data = out.getvalue()
+            if len(data) <= max_bytes:
+                if quality < 85:
+                    print(
+                        f"[Omnibot] Map JPEG encoded at quality={quality} ({len(data)} bytes, cap={max_bytes})"
+                    )
+                return data
+            if smallest is None or len(data) < len(smallest):
+                smallest = data
+        if smallest is not None:
+            print(
+                f"[Omnibot] Map JPEG still {len(smallest)} bytes > {max_bytes}; sending smallest attempt"
+            )
+            return smallest
+        return None
     except Exception as e:
         print(f"[Omnibot] Map JPEG normalization failed: {e}")
         return None
@@ -1361,12 +1394,15 @@ def _capture_directions_map_jpeg_sync(
     destination: str,
     fallback_plain_params: dict,
     size: int = 240,
-) -> Optional[bytes]:
+) -> Tuple[Optional[bytes], Optional[float], Optional[int]]:
     """Build a 240x240 route map JPEG using the Directions + Static Maps APIs.
 
-    Falls back to the plain static map on any error.
+    Returns ``(jpeg_bytes, distance_miles, duration_minutes)``. Miles/minutes come from the
+    first leg when routing succeeds; otherwise ``(fallback_jpeg, None, None)``.
     """
     polyline_str: Optional[str] = None
+    distance_miles: Optional[float] = None
+    duration_minutes: Optional[int] = None
     try:
         dir_params = {
             "origin": f"{origin_lat:.6f},{origin_lng:.6f}",
@@ -1383,6 +1419,26 @@ def _capture_directions_map_jpeg_sync(
             overview = routes[0].get("overview_polyline", {})
             polyline_str = overview.get("points", "")
             print(f"[Omnibot] Directions polyline length: {len(polyline_str)} chars")
+            legs = routes[0].get("legs") or []
+            if legs:
+                leg0 = legs[0]
+                dist_obj = leg0.get("distance") or {}
+                dur_obj = leg0.get("duration") or {}
+                if isinstance(dist_obj, dict) and dist_obj.get("value") is not None:
+                    try:
+                        meters = float(dist_obj["value"])
+                        distance_miles = round(meters / 1609.344, 2)
+                    except (TypeError, ValueError):
+                        pass
+                if isinstance(dur_obj, dict) and dur_obj.get("value") is not None:
+                    try:
+                        secs = float(dur_obj["value"])
+                        duration_minutes = max(1, int(round(secs / 60.0)))
+                    except (TypeError, ValueError):
+                        pass
+                print(
+                    f"[Omnibot] Directions leg: {distance_miles!r} mi, {duration_minutes!r} min"
+                )
         else:
             status = dir_data.get("status", "UNKNOWN")
             print(f"[Omnibot] Directions API returned no routes (status={status!r}); falling back.")
@@ -1390,7 +1446,8 @@ def _capture_directions_map_jpeg_sync(
         print(f"[Omnibot] Directions API request failed: {e}")
 
     if not polyline_str:
-        return _fetch_plain_static_map(**fallback_plain_params)
+        fb = _fetch_plain_static_map(**fallback_plain_params)
+        return (fb, None, None)
 
     # Build a Static Map with the route polyline + origin/destination markers
     # scale=1 keeps the JPEG small enough for the ESP32 JPEG decoder.
@@ -1416,23 +1473,28 @@ def _capture_directions_map_jpeg_sync(
         r.raise_for_status()
     except Exception as e:
         print(f"[Omnibot] Directions static map request failed: {e}")
-        return _fetch_plain_static_map(**fallback_plain_params)
+        fb = _fetch_plain_static_map(**fallback_plain_params)
+        return (fb, None, None)
 
     api_warning = r.headers.get("X-Staticmap-API-Warning", "")
     if api_warning:
         print(f"[Omnibot] Directions map API warning: {api_warning}")
-        return _fetch_plain_static_map(**fallback_plain_params)
+        fb = _fetch_plain_static_map(**fallback_plain_params)
+        return (fb, None, None)
 
     data = r.content or b""
     if _detect_error_tile(data):
-        return _fetch_plain_static_map(**fallback_plain_params)
+        fb = _fetch_plain_static_map(**fallback_plain_params)
+        return (fb, None, None)
 
     try:
         im = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception as e:
         print(f"[Omnibot] Directions map image open failed: {e}")
-        return _fetch_plain_static_map(**fallback_plain_params)
-    return _normalize_map_jpeg(im, size)
+        fb = _fetch_plain_static_map(**fallback_plain_params)
+        return (fb, None, None)
+    jpg = _normalize_map_jpeg(im, size)
+    return (jpg, distance_miles, duration_minutes)
 
 
 def _capture_static_map_jpeg_sync(
@@ -1444,11 +1506,11 @@ def _capture_static_map_jpeg_sync(
     location_override: str = "",
     display_style: str = "calling_card",
     size: int = 240,
-) -> Optional[bytes]:
-    """Route to the correct map renderer based on display_style."""
+) -> Tuple[Optional[bytes], Optional[float], Optional[int]]:
+    """Route to the correct map renderer. Returns ``(jpeg, distance_miles, duration_min)``."""
     key = (api_key or "").strip()
     if not key:
-        return None
+        return (None, None, None)
 
     # Priority: explicit location from tool call > grounding title > fallback coords
     location_query = (location_override or "").strip() or _best_maps_location_query(maps_sources)
@@ -1480,10 +1542,12 @@ def _capture_static_map_jpeg_sync(
                 size=size,
             )
         print("[Omnibot] Directions requested but no home coordinates; using plain static map.")
-        return _fetch_plain_static_map(**fallback_plain_params)
+        fb = _fetch_plain_static_map(**fallback_plain_params)
+        return (fb, None, None)
 
     # Non-directions callers should use _send_calling_card_to_esp32 instead.
-    return _fetch_plain_static_map(**fallback_plain_params)
+    fb = _fetch_plain_static_map(**fallback_plain_params)
+    return (fb, None, None)
 
 
 async def _send_calling_card_to_esp32(
@@ -1565,10 +1629,10 @@ async def _send_static_map_jpeg_to_esp32(
     fallback_lng: Optional[float],
     location_override: str = "",
 ) -> bool:
-    """Send a full-frame directions or plain static map as binary 0x04 (not calling cards)."""
+    """Send optional ``show_directions`` JSON (distance/duration) then full-frame map binary 0x04."""
     loop = asyncio.get_running_loop()
     try:
-        jpeg = await loop.run_in_executor(
+        jpeg, distance_miles, duration_minutes = await loop.run_in_executor(
             None,
             lambda: _capture_static_map_jpeg_sync(
                 api_key=api_key,
@@ -1588,13 +1652,63 @@ async def _send_static_map_jpeg_to_esp32(
     if not ws:
         return False
     try:
-        packet = bytes([0x04]) + jpeg
+        dir_payload: dict[str, Any] = {
+            "type": "show_directions",
+            "duration_ms": MAP_DISPLAY_MS,
+        }
+        if distance_miles is not None:
+            dir_payload["distance_miles"] = float(distance_miles)
+        if duration_minutes is not None:
+            dir_payload["duration_minutes"] = int(duration_minutes)
+        await ws.send_text(json.dumps(dir_payload))
+        packet = bytes([0x04]) + bytes(jpeg)
         await ws.send_bytes(packet)
-        print(f"[Omnibot] Sent directions map JPEG to ESP32 ({len(jpeg)} bytes)")
+        print(
+            f"[Omnibot] Sent directions map JPEG to ESP32 ({len(jpeg)} bytes, "
+            f"mi={distance_miles!r} min={duration_minutes!r})"
+        )
     except Exception as e:
         print(f"[Omnibot] Failed to send map JPEG to ESP32: {e}")
         return False
     return True
+
+
+async def _try_send_directions_map_early(device_id: str) -> None:
+    """Fetch and send directions map as soon as the tool runs.
+
+    Without this, the hub waits until the Gemini stream ends before calling Directions +
+    Static Maps, so the robot shows a placeholder for the entire reply plus API latency.
+    """
+    if map_jpeg_sent_this_turn_by_device.get(device_id):
+        return
+    loc = (map_location_override_by_device.get(device_id) or "").strip()
+    if not loc:
+        return
+    style = map_display_style_by_device.get(device_id, "calling_card")
+    if style != "directions":
+        return
+    bot = get_bot_settings(device_id)
+    lat, lng = bot.get("maps_latitude"), bot.get("maps_longitude")
+    if lat is None or lng is None:
+        return
+    maps_key = (os.getenv("GOOGLE_MAPS_STATIC_API_KEY") or "").strip() or (
+        os.getenv("GOOGLE_MAPS_JS_API_KEY") or ""
+    ).strip()
+    if not maps_key:
+        return
+    try:
+        ok = await _send_static_map_jpeg_to_esp32(
+            device_id=device_id,
+            maps_sources=[],
+            api_key=maps_key,
+            fallback_lat=lat,
+            fallback_lng=lng,
+            location_override=loc,
+        )
+        if ok:
+            map_jpeg_sent_this_turn_by_device[device_id] = True
+    except Exception as e:
+        print(f"[Omnibot] Early directions map send failed: {e}")
 
 
 async def _send_map_jpeg_to_esp32_after_turn(
@@ -1630,6 +1744,17 @@ async def _send_map_jpeg_to_esp32_after_turn(
             fallback_lng=fallback_lng,
             location_override=location_override,
         )
+        # Pixel may reconnect just after stream end; one retry helps dropped links.
+        if not ok:
+            await asyncio.sleep(1.5)
+            ok = await _send_static_map_jpeg_to_esp32(
+                device_id=device_id,
+                maps_sources=maps_sources,
+                api_key=api_key,
+                fallback_lat=fallback_lat,
+                fallback_lng=fallback_lng,
+                location_override=location_override,
+            )
     if ok:
         map_jpeg_sent_this_turn_by_device[device_id] = True
 
@@ -2096,6 +2221,12 @@ async def esp32_stream_endpoint(websocket: WebSocket):
         if websocket in active_streams:
             dev_id = active_streams[websocket].get("device_id", "default_bot")
             del active_streams[websocket]
+            # Early map send may have ACK'd on the server while Pixel never decoded it.
+            # Clear so end-of-turn can push again after reconnect.
+            if not active_streams:
+                map_jpeg_sent_this_turn_by_device.clear()
+            else:
+                map_jpeg_sent_this_turn_by_device.pop(dev_id, None)
             await manager.broadcast(
                 {
                     "type": "esp32_disconnected",
@@ -2108,6 +2239,10 @@ async def esp32_stream_endpoint(websocket: WebSocket):
         if websocket in active_streams:
             dev_id = active_streams[websocket].get("device_id", "default_bot")
             del active_streams[websocket]
+            if not active_streams:
+                map_jpeg_sent_this_turn_by_device.clear()
+            else:
+                map_jpeg_sent_this_turn_by_device.pop(dev_id, None)
             await manager.broadcast(
                 {
                     "type": "esp32_disconnected",

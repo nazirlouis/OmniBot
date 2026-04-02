@@ -154,6 +154,11 @@ bool mapNeedsRedraw = false;
 bool suppressUploadThinkingAfterMap = false;
 static uint16_t *s_mapRgb565 = nullptr;
 static JPEGDEC s_jpegDec;
+// Directions overlay (JSON show_directions before binary 0x04 map)
+bool mapDirectionsHasMetrics = false;
+float mapRouteMiles = 0.0f;
+int mapRouteMinutes = 0;
+static bool s_mapDirectionsBackdropApplied = false;
 
 // Calling card from hub (JSON show_calling_card + binary 0x05 place photo JPEG)
 #define CALLING_CARD_TITLE_MAX 80
@@ -972,6 +977,37 @@ static void drawCallingCardOverlay() {
         if (a2[0]) {
             ccPrintCenteredShadow(a2, y, 1, 0xCE79);
         }
+    }
+}
+
+static void mapApplyDirectionsBackdropOnce() {
+    if (!mapDirectionsHasMetrics || s_mapDirectionsBackdropApplied || s_mapRgb565 == nullptr) {
+        return;
+    }
+    const int16_t y0 = 148;
+    const int16_t y1 = MAP_DISPLAY_PX - 1;
+    for (int16_t yy = y0; yy <= y1; yy++) {
+        uint16_t *row = s_mapRgb565 + (int32_t)yy * MAP_DISPLAY_PX;
+        for (int16_t xx = 0; xx < MAP_DISPLAY_PX; xx++) {
+            row[xx] = ccRgb565BlendBlack50(row[xx]);
+        }
+    }
+    s_mapDirectionsBackdropApplied = true;
+}
+
+static void drawMapOverlayFrame() {
+    if (!mapHasImage || s_mapRgb565 == nullptr) {
+        return;
+    }
+    mapApplyDirectionsBackdropOnce();
+    gfx->draw16bitRGBBitmap(0, 0, s_mapRgb565, MAP_DISPLAY_PX, MAP_DISPLAY_PX);
+    if (mapDirectionsHasMetrics) {
+        char line1[20];
+        char line2[24];
+        snprintf(line1, sizeof(line1), "%.1f mi", (double)mapRouteMiles);
+        snprintf(line2, sizeof(line2), "%d min", mapRouteMinutes);
+        ccPrintCenteredShadow(line1, 170, 2, WHITE);
+        ccPrintCenteredShadow(line2, 194, 2, 0xDEFB);
     }
 }
 
@@ -2214,6 +2250,16 @@ void setupWiFi() {
                                 syncRtcFromWifiNtp();
                                 lastRtcWifiSyncAttemptMs = millis();
                             }
+                        } else if (strcmp(msgType, "show_directions") == 0) {
+                            bool hasMi = doc.containsKey("distance_miles");
+                            bool hasMin = doc.containsKey("duration_minutes");
+                            mapDirectionsHasMetrics = hasMi || hasMin;
+                            mapRouteMiles = doc["distance_miles"] | 0.0f;
+                            mapRouteMinutes = (int)(doc["duration_minutes"] | 0);
+                            if (mapHasImage && mapOverlayActive) {
+                                s_mapDirectionsBackdropApplied = false;
+                                mapNeedsRedraw = true;
+                            }
                         } else if (strcmp(msgType, "face_animation") == 0) {
                             const char* anim = doc["animation"] | "speaking";
                             const char* w = doc["words"] | "";
@@ -2246,9 +2292,14 @@ void setupWiFi() {
                                 clearFaceAnimCaptionBox();
                                 mapHasImage = false;
                                 mapNeedsRedraw = false;
+                                mapDirectionsHasMetrics = false;
+                                mapRouteMiles = 0.0f;
+                                mapRouteMinutes = 0;
+                                s_mapDirectionsBackdropApplied = false;
                                 mapOverlayActive = true;
                                 mapOverlayUntilMs = millis() + (uint32_t)dur;
-                                gfx->fillScreen(0x1082);
+                                // Dark slate (readable "waiting"); 0x1082 looked black on the round panel.
+                                gfx->fillScreen(0x18E3);
                                 if (currentState == STATE_UPLOADING) {
                                     suppressUploadThinkingAfterMap = true;
                                 }
@@ -2370,6 +2421,7 @@ void setupWiFi() {
                             s_jpegDec.decode(0, 0, 0);
                             s_jpegDec.close();
                             mapHasImage = true;
+                            s_mapDirectionsBackdropApplied = false;
                             mapNeedsRedraw = true;
                             mapOverlayActive = true;
                             mapOverlayUntilMs = millis() + MAP_OVERLAY_EXTEND_MS;
@@ -2613,6 +2665,10 @@ void loop() {
         mapOverlayActive = false;
         mapHasImage = false;
         mapNeedsRedraw = false;
+        mapDirectionsHasMetrics = false;
+        mapRouteMiles = 0.0f;
+        mapRouteMinutes = 0;
+        s_mapDirectionsBackdropApplied = false;
         suppressUploadThinkingAfterMap = false;
         idleAnim.hasPrevFrame = false;
         if (!timeScreenActive && !faceAnimActive && !weatherOverlayActive && !callingCardOverlayActive) {
@@ -2884,7 +2940,7 @@ void loop() {
         }
     } else if (mapOverlayActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
         if (mapHasImage && mapNeedsRedraw && s_mapRgb565 != nullptr) {
-            gfx->draw16bitRGBBitmap(0, 0, s_mapRgb565, MAP_DISPLAY_PX, MAP_DISPLAY_PX);
+            drawMapOverlayFrame();
             mapNeedsRedraw = false;
         }
     } else if (faceAnimActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
