@@ -1,0 +1,4 @@
+1 validation error for GenerateContentConfig
+include_server_side_tool_invocations
+  Extra inputs are not permitted [type=extra_forbidden, input_value=True, input_type=bool]
+    For further information visit https://errors.pydantic.dev/2.10/v/extra_forbidden

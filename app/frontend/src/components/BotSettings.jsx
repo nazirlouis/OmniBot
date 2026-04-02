@@ -2,6 +2,7 @@ import React, { useMemo, useState, useEffect } from 'react';
 import './BotSettings.css';
 import { getBotSettings, updateBotSettings, resetBotSettingsToDefault } from './setupService';
 import { getCountryOptions, normalizeSavedCountryCode } from './countrySelectOptions';
+import { resolveMapsJsApiKey, loadMapsPlacesForContextual } from '../mapsContextualLoader';
 
 const TIMEZONE_OPTIONS = [
   { value: 'EST5EDT,M3.2.0/2,M11.1.0/2', label: 'US Eastern (EST/EDT)' },
@@ -18,6 +19,8 @@ const BotSettings = ({ setAppMode }) => {
   const [timezoneRule, setTimezoneRule] = useState('EST5EDT,M3.2.0/2,M11.1.0/2');
   const [visionEnabled, setVisionEnabled] = useState(false);
   const [mapsGroundingEnabled, setMapsGroundingEnabled] = useState(false);
+  const [mapsStreet, setMapsStreet] = useState('');
+  const [mapsState, setMapsState] = useState('');
   const [mapsPostalCode, setMapsPostalCode] = useState('');
   const [mapsCountry, setMapsCountry] = useState('');
   const [mapsLatitude, setMapsLatitude] = useState(null);
@@ -39,6 +42,8 @@ const BotSettings = ({ setAppMode }) => {
         setTimezoneRule(data.timezone_rule || 'EST5EDT,M3.2.0/2,M11.1.0/2');
         setVisionEnabled(Boolean(data.vision_enabled));
         setMapsGroundingEnabled(Boolean(data.maps_grounding_enabled));
+        setMapsStreet(data.maps_street || '');
+        setMapsState(data.maps_state || '');
         setMapsPostalCode(data.maps_postal_code || '');
         setMapsCountry(normalizeSavedCountryCode(data.maps_country) || '');
         setMapsLatitude(data.maps_latitude ?? null);
@@ -54,11 +59,58 @@ const BotSettings = ({ setAppMode }) => {
     fetchSettings();
   }, [deviceId]);
 
+  useEffect(() => {
+    let autocomplete = null;
+
+    const initAutocomplete = async () => {
+      try {
+        const apiKey = await resolveMapsJsApiKey();
+        if (!apiKey) return;
+        await loadMapsPlacesForContextual(apiKey);
+        
+        const inputElem = document.getElementById('mapsStreet');
+        if (!inputElem) return;
+        
+        if (window.google?.maps?.places) {
+          autocomplete = new window.google.maps.places.Autocomplete(inputElem, {
+            fields: ['formatted_address', 'name'],
+            types: ['address'],
+          });
+          
+          autocomplete.addListener('place_changed', () => {
+            const place = autocomplete.getPlace();
+            
+            if (place.formatted_address) {
+              setMapsStreet(place.formatted_address);
+              setMapsState('');
+              setMapsPostalCode('');
+              setMapsCountry('');
+            } else if (place.name) {
+              setMapsStreet(place.name);
+            }
+          });
+        }
+      } catch (err) {
+        console.warn('Maps Autocomplete disabled or unavailable:', err);
+      }
+    };
+    
+    if (!isLoading) {
+      // Small timeout to ensure DOM input renders after isLoading=false
+      setTimeout(initAutocomplete, 100);
+    }
+  }, [isLoading]);
+
   const handleSave = async (e) => {
     e.preventDefault();
     setIsSaving(true);
     setSaveStatus(null);
     setMapsGeocodeMessage(null);
+    
+    // Fallback: forcefully read the physical DOM value in case Google Autocomplete mutated the input without firing React state
+    const currentAddressInputDom = document.getElementById('mapsStreet')?.value;
+    const finalAddress = currentAddressInputDom || mapsStreet;
+    
     try {
       const res = await updateBotSettings(deviceId, {
         model,
@@ -66,6 +118,8 @@ const BotSettings = ({ setAppMode }) => {
         timezone_rule: timezoneRule,
         vision_enabled: visionEnabled,
         maps_grounding_enabled: mapsGroundingEnabled,
+        maps_street: finalAddress,
+        maps_state: mapsState,
         maps_postal_code: mapsPostalCode,
         maps_country: mapsCountry,
         maps_latitude: mapsLatitude,
@@ -94,6 +148,8 @@ const BotSettings = ({ setAppMode }) => {
     setTimezoneRule(saved.timezone_rule || 'EST5EDT,M3.2.0/2,M11.1.0/2');
     setVisionEnabled(Boolean(saved.vision_enabled));
     setMapsGroundingEnabled(Boolean(saved.maps_grounding_enabled));
+    setMapsStreet(saved.maps_street || '');
+    setMapsState(saved.maps_state || '');
     setMapsPostalCode(saved.maps_postal_code || '');
     setMapsCountry(normalizeSavedCountryCode(saved.maps_country) || '');
     setMapsLatitude(saved.maps_latitude ?? null);
@@ -205,44 +261,27 @@ const BotSettings = ({ setAppMode }) => {
           <p className="help-text">
             When on, Pixel uses your postal location for local {'"near me"'} answers via Google Maps grounding.
             The Gemini API does not allow Maps and Google Search in the same session, so{' '}
-            <strong>Search grounding is off</strong> while this is on. Enter postal/ZIP and country; geocoding uses
+            <strong>Search grounding is off</strong> while this is on. Enter your specific address or postal code; geocoding uses
             OpenStreetMap Nominatim (set <code>NOMINATIM_USER_AGENT</code> in backend .env). Countries from{' '}
             <code>i18n-iso-countries</code>.
           </p>
         </div>
 
         <div className="form-group">
-          <label htmlFor="mapsCountrySelect">Country</label>
-          <div className="select-wrapper">
-            <select
-              id="mapsCountrySelect"
-              value={mapsCountry}
-              onChange={(e) => setMapsCountry(e.target.value)}
-              className="holo-select"
-            >
-              <option value="">Select country</option>
-              {countryOptions.map(({ code, name }) => (
-                <option key={code} value={code}>
-                  {name}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-
-        <div className="form-group">
-          <label htmlFor="mapsPostal">Postal or ZIP code</label>
+          <label htmlFor="mapsStreet">Address</label>
           <input
-            id="mapsPostal"
+            id="mapsStreet"
             type="text"
             className="holo-input"
-            value={mapsPostalCode}
-            onChange={(e) => setMapsPostalCode(e.target.value)}
-            placeholder="e.g. 30309 or SW1A 1AA"
-            autoComplete="postal-code"
+            value={mapsStreet}
+            onChange={(e) => setMapsStreet(e.target.value)}
+            placeholder="e.g. 5423 Suffex Green Ln NW, Atlanta, GA 30339"
+            autoComplete="off"
           />
-          <p className="help-text">Nominatim uses this together with your country to pick a map center.</p>
+          <p className="help-text">Google Maps will automatically format your full address here for accurate geocoding.</p>
         </div>
+
+
 
         {(mapsLatitude != null && mapsLongitude != null) && (
           <div className="form-group maps-resolved-block">

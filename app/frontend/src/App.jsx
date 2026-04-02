@@ -130,6 +130,8 @@ function App() {
               );
             } else if (fnName.includes('face_animation') && String(args.animation ?? '').toLowerCase() === 'map') {
               addLog('tool', `${message.function_name}(${argsStr}) — map snapshot on Pixel`);
+            } else if (fnName.includes('show_map_animation')) {
+              addLog('tool', `${message.function_name}(${argsStr}) — map snapshot on Pixel`);
             } else {
               addLog('tool', `${message.function_name}(${argsStr})`);
             }

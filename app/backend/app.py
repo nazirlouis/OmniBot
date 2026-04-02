@@ -37,26 +37,22 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Settings Configuration
 SETTINGS_FILE = "bot_settings.json"
-DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
+DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_TIMEZONE_RULE = "EST5EDT,M3.2.0/2,M11.1.0/2"
 DEFAULT_VISION_ENABLED = False
 DEFAULT_SYSTEM_INSTRUCTION = (
-    "You are Pixel, a friendly small desktop robot.\n\n"
-    "Inputs: audio = my voice; text = OmniBot Hub; video = live camera (only mention it when relevant).\n"
-    "Be concise and conversational; do not greet me every turn.\n\n"
-    "For live or fast-changing facts, use Google Search when that tool is available; prefer grounded answers.\n\n"
-    "Every turn: call face_animation exactly once (never twice). Choose one mode:\n"
-    "- weather — If I ask about weather or current conditions: animation=weather. "
-    "words must be plain text \"<condition> <temperature_f>\" (two tokens), e.g. \"cloudy 74\". "
-    "condition is one of: sunny, cloudy, partially_cloudy, raining, snowing. "
-    "Use Search when available; if only Maps grounding exists, pick a plausible condition and °F for the display.\n"
-    "- map — If this reply uses Google Maps grounding at all (places, routes, \"near me\", navigation): "
-    "animation=map, words=\"\" (empty). Do not use speaking, happy, mad, or weather on that turn.\n"
-    "- speaking — Default for normal chat; at most two short words on the face.\n"
-    "- happy — Good or exciting news.\n"
-    "- mad — Bad or disappointing news, or if I am annoying you.\n\n"
-    "Weather turns must use weather (not speaking). Map-grounded turns must use map. "
-    "You may still answer in full in your text; map/weather may not show those words on the face."
+    "You control a small desktop robot named Pixel with a round face display.\n\n"
+    "Animation tools:\n"
+    "- Use the `show_face_animation` / `face_animation` tool for conversational or emotional states only "
+    "(animation = speaking, happy, or mad). For these, pass at most two short words that summarize your "
+    "overall reply (e.g. \"thanks\", \"nice one\").\n"
+    "- Use the `show_weather_animation` tool only when the user asks about weather or conditions. Represent "
+    "the weather as a condition plus numeric Fahrenheit temperature.\n"
+    "- Use the `show_map_animation` tool only when your response relies on Google Maps grounding such as "
+    "directions, navigation, or nearby places, so the hub can capture and send a contextual map to the display.\n\n"
+    "At most one animation tool should be used per turn. Do not call more than one of: "
+    "`face_animation`, `show_face_animation`, `show_weather_animation`, or `show_map_animation` in the same turn.\n\n"
+    "When asked about food, activities, or places near me, provide exactly ONE recommendation and do not list multiple options."
 )
 
 WEATHER_DISPLAY_MS = 5000
@@ -116,14 +112,15 @@ def _routing_text_from_message_content(message_content) -> str:
 # Event loop used to push WebSocket messages from sync Gemini tool invocations (worker threads).
 _main_async_loop: Optional[asyncio.AbstractEventLoop] = None
 
-# OpenAPI-style declaration matching Gemini function-calling docs
+# OpenAPI-style declarations matching Gemini function-calling docs
 # (https://ai.google.dev/gemini-api/docs/function-calling — combine with Google Search).
-# The executable implementation is `_make_show_weather_tool` (automatic function calling).
+# The executable implementations are `_make_show_weather_tool` and `_make_show_map_animation_tool`
+# (automatic function calling).
 SHOW_WEATHER_FUNCTION_DECLARATION = {
-    "name": "show_weather",
+    "name": "show_weather_animation",
     "description": (
         "Shows weather on the robot round display for several seconds. "
-        "Call when the user asks about weather or conditions; use available grounding (Search or Maps) or best judgment."
+        "You MUST call this function EVERY TIME after you use Google Search to retrieve the current weather. Do NOT answer a weather question without calling this function immediately after checking the search results."
     ),
     "parameters": {
         "type": "object",
@@ -142,31 +139,46 @@ SHOW_WEATHER_FUNCTION_DECLARATION = {
     },
 }
 
+SHOW_MAP_ANIMATION_FUNCTION_DECLARATION = {
+    "name": "show_map_animation",
+    "description": (
+        "Shows a map on the robot round display for several seconds. "
+        "You MUST call this function EVERY TIME after you use Google Maps to lookup locations, directions, or places. Do NOT answer a location or navigation question without calling this function immediately after checking the map results. "
+        "Always pass the specific address or place name in the 'location' parameter so the correct location is shown on the robot display."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "location": {
+                "type": "string",
+                "description": "The specific address or place name to show on the map (e.g. '2450 Cumberland Pkwy SE, Atlanta, GA' or 'Piedmont Park, Atlanta'). Use the most specific address available from the search results.",
+            },
+        },
+        "required": ["location"],
+    },
+}
+
 FACE_ANIMATION_FUNCTION_DECLARATION = {
     "name": "face_animation",
     "description": (
-        "Animates Pixel's face on the round display. "
-        "Pass words only when needed; display duration is fixed on the device."
+        "Animates Pixel's face on the round display for conversational or emotional states only. "
+        "For speaking/happy/mad, pass at most two short words that summarize the overall reply "
+        "(e.g. \"thanks\", \"nice one\")."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "animation": {
                 "type": "string",
-                "enum": ["speaking", "happy", "mad", "weather", "map"],
+                "enum": ["speaking", "happy", "mad"],
                 "description": (
-                    "Display mode: speaking, happy, mad, weather overlay, or map. "
-                    "Use map whenever this response used Google Maps grounding (directions, nearby places, "
-                    "navigation). Required on those turns so the hub can screenshot the grounded map and "
-                    "push it to the robot display."
+                    "Display mode: speaking, happy, or mad. Do not use this tool for weather or maps."
                 ),
             },
             "words": {
                 "type": "string",
                 "description": (
-                    "For speaking/happy/mad: at most two words (e.g. \"hello\", \"nice one\"). "
-                    "For weather: \"<condition> <temperature_f>\" (e.g. \"cloudy 74\"). "
-                    "For map: always \"\" (empty). The hub screenshots the contextual map and sends JPEG to Pixel."
+                    "For speaking/happy/mad: at most two words (e.g. \"hello\", \"nice one\")."
                 ),
             },
         },
@@ -181,6 +193,8 @@ turn_tool_state_by_device: dict[str, dict[str, bool]] = {}
 maps_widget_token_latest_by_device: dict[str, str] = {}
 # Avoid sending duplicate map JPEGs in the same turn (face_animation path vs end-of-turn fallback).
 map_jpeg_sent_this_turn_by_device: dict[str, bool] = {}
+# Store explicit location from show_map_animation tool call for end-of-turn map rendering.
+map_location_override_by_device: dict[str, str] = {}
 
 if not API_KEY:
     print("ERROR: API Key not found in .env file!")
@@ -212,6 +226,8 @@ def get_bot_settings(device_id: str):
         "timezone_rule": bot_conf.get("timezone_rule", DEFAULT_TIMEZONE_RULE),
         "vision_enabled": bool(bot_conf.get("vision_enabled", DEFAULT_VISION_ENABLED)),
         "maps_grounding_enabled": bool(bot_conf.get("maps_grounding_enabled", False)),
+        "maps_street": (bot_conf.get("maps_street") or "").strip(),
+        "maps_state": (bot_conf.get("maps_state") or "").strip(),
         "maps_postal_code": (bot_conf.get("maps_postal_code") or "").strip(),
         "maps_country": (bot_conf.get("maps_country") or "").strip(),
         "maps_latitude": bot_conf.get("maps_latitude"),
@@ -228,6 +244,8 @@ def _default_stored_bot_settings() -> dict:
         "timezone_rule": DEFAULT_TIMEZONE_RULE,
         "vision_enabled": DEFAULT_VISION_ENABLED,
         "maps_grounding_enabled": False,
+        "maps_street": "",
+        "maps_state": "",
         "maps_postal_code": "",
         "maps_country": "",
         "maps_latitude": None,
@@ -236,19 +254,50 @@ def _default_stored_bot_settings() -> dict:
     }
 
 
-def _nominatim_geocode_postal(postal: str, country: str) -> tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
-    """Resolve postal/ZIP + country via public Nominatim. Returns (lat, lon, display_name, error)."""
+def _geocode_address(street: str, state: str, postal: str, country: str) -> tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
+    """Resolve location via Google Maps Geocoding or fallback to public Nominatim. Returns (lat, lon, display_name, error)."""
+    st = (street or "").strip()
+    sa = (state or "").strip()
     pc = (postal or "").strip()
     cc = (country or "").strip()
-    if not pc:
-        return None, None, None, "Enter a postal or ZIP code."
-    if not cc:
-        return None, None, None, "Select a country."
-    # ISO 3166-1 alpha-2 (e.g. US) works well; longer strings treated as country name for Nominatim.
-    if len(cc) == 2 and cc.isalpha():
-        q = f"{pc}, {cc.upper()}"
-    else:
-        q = f"{pc}, {cc}"
+    
+    if not (st or pc):
+        return None, None, None, "Enter a postal code, ZIP, or full address."
+        
+    parts = []
+    if st:
+        parts.append(st)
+    if sa:
+        parts.append(sa)
+    if pc:
+        parts.append(pc)
+        
+    if cc:
+        if len(cc) == 2 and cc.isalpha():
+            parts.append(cc.upper())
+        else:
+            parts.append(cc)
+        
+    q = ", ".join(parts)
+    
+    # Try Google Geocoding first if key available
+    g_key = os.getenv("GOOGLE_MAPS_JS_API_KEY") or os.getenv("GOOGLE_MAPS_STATIC_API_KEY")
+    if g_key:
+        try:
+            params = urlencode({"address": q, "key": g_key.strip()})
+            url = f"https://maps.googleapis.com/maps/api/geocode/json?{params}"
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") == "OK" and data.get("results"):
+                hit = data["results"][0]
+                lat = float(hit["geometry"]["location"]["lat"])
+                lon = float(hit["geometry"]["location"]["lng"])
+                disp = hit.get("formatted_address") or q
+                return lat, lon, disp, None
+        except Exception as e:
+            print(f"Google Maps Geocoding fallback to Nominatim due to error: {e}")
+
     ua = _nominatim_user_agent_header()
     headers = {"User-Agent": ua, "Accept": "application/json"}
     try:
@@ -401,7 +450,13 @@ def _pixel_chat_generate_config(
     screenshot the grounded map and push JPEG to the ESP32.
     """
     bot = get_bot_settings(device_id)
-    face_animation_fn = _make_face_animation_tool(device_id)
+
+    custom_declarations = [
+        types.FunctionDeclaration(**FACE_ANIMATION_FUNCTION_DECLARATION),
+        types.FunctionDeclaration(**SHOW_WEATHER_FUNCTION_DECLARATION),
+        types.FunctionDeclaration(**SHOW_MAP_ANIMATION_FUNCTION_DECLARATION),
+    ]
+
     use_maps = bool(bot.get("maps_grounding_enabled"))
     lat, lng = bot.get("maps_latitude"), bot.get("maps_longitude")
     maps_tool_active = prefer_maps and use_maps and lat is not None and lng is not None
@@ -413,12 +468,12 @@ def _pixel_chat_generate_config(
     if maps_tool_active:
         tools = [
             types.Tool(google_maps=_google_maps_builtin()),
-            face_animation_fn,
+            types.Tool(function_declarations=custom_declarations)
         ]
     else:
         tools = [
             types.Tool(google_search=_google_search_builtin()),
-            face_animation_fn,
+            types.Tool(function_declarations=custom_declarations)
         ]
 
     tool_cfg_kwargs: dict = {"include_server_side_tool_invocations": True}
@@ -518,6 +573,8 @@ class BotSettingsSchema(BaseModel):
     timezone_rule: str = DEFAULT_TIMEZONE_RULE
     vision_enabled: bool = DEFAULT_VISION_ENABLED
     maps_grounding_enabled: bool = False
+    maps_street: str = ""
+    maps_state: str = ""
     maps_postal_code: str = ""
     maps_country: str = ""
     maps_latitude: Optional[float] = None
@@ -610,6 +667,8 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
     prev = settings.get(device_id, {})
 
     maps_geocode: dict = {"ok": True, "error": None}
+    street = (new_settings.maps_street or "").strip()
+    state = (new_settings.maps_state or "").strip()
     postal = (new_settings.maps_postal_code or "").strip()
     country = (new_settings.maps_country or "").strip()
     maps_enabled = bool(new_settings.maps_grounding_enabled)
@@ -620,12 +679,14 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
         "timezone_rule": new_settings.timezone_rule or DEFAULT_TIMEZONE_RULE,
         "vision_enabled": bool(new_settings.vision_enabled),
         "maps_grounding_enabled": maps_enabled,
+        "maps_street": street,
+        "maps_state": state,
         "maps_postal_code": postal,
         "maps_country": country,
     }
 
     if maps_enabled:
-        lat, lon, disp, err = _nominatim_geocode_postal(postal, country)
+        lat, lon, disp, err = _geocode_address(street, state, postal, country)
         if err:
             maps_geocode = {"ok": False, "error": err}
             row["maps_latitude"] = None
@@ -685,11 +746,11 @@ timezone_rule_by_device = {}
 
 
 def _make_show_weather_tool(device_id: str):
-    """Builder so show_weather is bound to the correct bot device."""
+    """Builder so show_weather_animation is bound to the correct bot device."""
 
     allowed = frozenset(SHOW_WEATHER_FUNCTION_DECLARATION["parameters"]["properties"]["condition"]["enum"])
 
-    def show_weather(condition: str, temperature: float) -> dict:
+    def show_weather_animation(condition: str, temperature: float) -> dict:
         """Pushes a weather graphic to Pixel's round display for several seconds.
 
         Same contract as SHOW_WEATHER_FUNCTION_DECLARATION (enum + Fahrenheit).
@@ -703,7 +764,7 @@ def _make_show_weather_tool(device_id: str):
         tool_state["show_weather"] = True
         _schedule_weather_to_esp32(device_id, c, float(temperature))
         _broadcast_tool_call_to_frontend(
-            "show_weather",
+            "show_weather_animation",
             {
                 "condition": c,
                 "temperature": float(temperature),
@@ -711,7 +772,37 @@ def _make_show_weather_tool(device_id: str):
         )
         return {"ok": True, "display": "weather queued on robot"}
 
-    return show_weather
+    return show_weather_animation
+
+
+def _make_show_map_animation_tool(device_id: str):
+    """Builder so show_map_animation is bound to the correct bot device."""
+
+    def show_map_animation(location: str = "") -> dict:
+        tool_state = turn_tool_state_by_device.setdefault(
+            device_id, {"show_weather": False, "face_animation": False, "show_map": False}
+        )
+        if tool_state.get("face_animation", False) or tool_state.get("show_weather", False) or tool_state.get("show_map", False):
+            return {
+                "ok": False,
+                "skipped": True,
+                "reason": "another animation tool was already called this turn",
+            }
+        tool_state["show_map"] = True
+
+        # Store the explicit location so the end-of-turn handler uses it
+        loc = (location or "").strip()
+        if loc:
+            map_location_override_by_device[device_id] = loc
+            print(f"[Omnibot] show_map_animation: location override stored: {loc!r}")
+
+        _schedule_face_animation_to_esp32(device_id, "map", "")
+        # NOTE: Do NOT send the map JPEG here. The end-of-turn handler will send it
+        # once grounding metadata is available, ensuring the correct location is shown.
+        _broadcast_tool_call_to_frontend("show_map_animation", {"location": loc})
+        return {"ok": True, "display": "map animation queued on robot"}
+
+    return show_map_animation
 
 
 def _clamp_face_animation_words(raw: str) -> str:
@@ -742,47 +833,59 @@ def _make_face_animation_tool(device_id: str):
         a = (animation or "").strip().lower()
         if a not in allowed:
             a = "speaking"
-        raw_words = words or ""
-
-        # Safety: if weather-like payload arrives while animation is speaking, reroute.
-        if a == "speaking":
-            weather_guess = _normalize_weather_words(raw_words)
-            if weather_guess != "cloudy 72" or any(
-                token in raw_words.lower() for token in ["condition", "temperature", "sunny", "cloudy", "raining", "snowing"]
-            ):
-                if any(t in raw_words.lower() for t in ["sunny", "cloudy", "partially", "raining", "snowing", "condition", "temperature"]):
-                    a = "weather"
-
-        if a == "map":
-            w = ""
-        else:
-            w = _normalize_weather_words(raw_words) if a == "weather" else _clamp_face_animation_words(raw_words)
-
-        tool_state = turn_tool_state_by_device.setdefault(device_id, {"show_weather": False, "face_animation": False})
-        if tool_state.get("face_animation", False):
-            return {"ok": False, "skipped": True, "reason": "face_animation already called this turn"}
+        w = _clamp_face_animation_words(words or "")
+        tool_state = turn_tool_state_by_device.setdefault(
+            device_id, {"show_weather": False, "face_animation": False, "show_map": False}
+        )
+        if tool_state.get("face_animation", False) or tool_state.get("show_weather", False) or tool_state.get("show_map", False):
+            return {
+                "ok": False,
+                "skipped": True,
+                "reason": "another animation tool was already called this turn",
+            }
         tool_state["face_animation"] = True
 
         _schedule_face_animation_to_esp32(device_id, a, w)
-        if a == "map":
-            _schedule_map_jpeg_after_face_animation_map(device_id)
-        if a == "weather":
-            anim_ms = WEATHER_DISPLAY_MS
-        elif a == "map":
-            anim_ms = MAP_DISPLAY_MS
-        else:
-            anim_ms = FACE_ANIMATION_DISPLAY_MS
-        _broadcast_tool_call_to_frontend(
-            "face_animation",
-            {
-                "animation": a,
-                "words": w,
-                "duration_ms": anim_ms,
-            },
-        )
+        anim_ms = FACE_ANIMATION_DISPLAY_MS
         return {"ok": True, "display": "face animation queued on robot"}
 
     return face_animation
+
+
+def show_face_animation(device_id: str, animation: str, words: str = "") -> dict:
+    """Convenience wrapper to trigger an expressive face animation (speaking/happy/mad).
+
+    Uses the same semantics, clamping, guardrails, and broadcast behavior
+    as the Gemini `face_animation` tool.
+    """
+    face_animation_fn = _make_face_animation_tool(device_id)
+    return face_animation_fn(animation=animation, words=words)
+
+
+def show_weather_animation(device_id: str, condition_text: str) -> dict:
+    """Convenience wrapper to trigger a weather overlay on the face display.
+
+    `condition_text` can be any free-form weather description (e.g. "cloudy 74",
+    "light rain and 65F"); it will be normalized to the canonical
+    "<condition> <temperature_f>" form used by the ESP32 firmware.
+    """
+    normalized = _normalize_weather_words(condition_text)
+    parts = normalized.split()
+    condition = parts[0] if parts else "cloudy"
+    temperature = float(parts[1]) if len(parts) > 1 else 72.0
+    show_weather_tool = _make_show_weather_tool(device_id)
+    return show_weather_tool(condition=condition, temperature=temperature)
+
+
+def show_map_animation(device_id: str) -> dict:
+    """Convenience wrapper to trigger map mode on the face display.
+
+    This uses the same behavior as the Gemini `show_map_animation` tool, which
+    schedules a map face animation and a static map JPEG to be captured and
+    pushed to the robot display.
+    """
+    map_tool = _make_show_map_animation_tool(device_id)
+    return map_tool()
 
 
 async def _send_weather_json_to_esp32(device_id: str, condition: str, temperature: float) -> None:
@@ -946,12 +1049,14 @@ def _capture_static_map_jpeg_sync(
     maps_sources: list[dict],
     fallback_lat: Optional[float],
     fallback_lng: Optional[float],
+    location_override: str = "",
     size: int = 240,
 ) -> Optional[bytes]:
     key = (api_key or "").strip()
     if not key:
         return None
-    location_query = _best_maps_location_query(maps_sources)
+    # Priority: explicit location from tool call > grounding title > fallback coords
+    location_query = (location_override or "").strip() or _best_maps_location_query(maps_sources)
     center = (
         f"{float(fallback_lat):.6f},{float(fallback_lng):.6f}"
         if (fallback_lat is not None and fallback_lng is not None)
@@ -982,18 +1087,50 @@ def _capture_static_map_jpeg_sync(
     ]
     for style in styles:
         params.setdefault("style", []).append(style)
+    
+    log_center = location_query or center
+    print(f"[Omnibot] Static map request: center={log_center!r}")
+    
     try:
         r = requests.get("https://maps.googleapis.com/maps/api/staticmap", params=params, timeout=20)
         r.raise_for_status()
     except Exception as e:
         print(f"[Omnibot] Static map request failed: {e}")
         return None
+    
+    # Google returns HTTP 200 even for error tiles — detect via warning header
+    api_warning = r.headers.get("X-Staticmap-API-Warning", "")
+    if api_warning:
+        print(f"[Omnibot] Static Maps API warning (likely error tile): {api_warning}")
+        return None
+    
     data = r.content or b""
     if len(data) < 256:
         return None
-    # Normalize to exactly 240x240 baseline JPEG for ESP32 decoder/display.
+    
+    # Detect error tiles: they are mostly uniform gray. A real map has color variance.
     try:
         im = Image.open(io.BytesIO(data)).convert("RGB")
+        # Sample a few pixels to check for uniformity (error tiles are ~(224,224,224) gray)
+        import numpy as np
+        arr = np.array(im)
+        std_dev = float(arr.std())
+        if std_dev < 15.0:
+            print(f"[Omnibot] Static map looks like an error tile (std_dev={std_dev:.1f}), skipping.")
+            return None
+    except ImportError:
+        # numpy not installed, skip variance check
+        try:
+            im = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception as e:
+            print(f"[Omnibot] Static map image open failed: {e}")
+            return None
+    except Exception as e:
+        print(f"[Omnibot] Static map image analysis failed: {e}")
+        return None
+    
+    # Normalize to exactly 240x240 baseline JPEG for ESP32 decoder/display.
+    try:
         if im.size != (240, 240):
             im = im.resize((240, 240), Image.Resampling.LANCZOS)
         out = io.BytesIO()
@@ -1011,6 +1148,7 @@ async def _send_static_map_jpeg_to_esp32(
     api_key: str,
     fallback_lat: Optional[float],
     fallback_lng: Optional[float],
+    location_override: str = "",
 ) -> bool:
     loop = asyncio.get_running_loop()
     try:
@@ -1021,6 +1159,7 @@ async def _send_static_map_jpeg_to_esp32(
                 maps_sources=maps_sources,
                 fallback_lat=fallback_lat,
                 fallback_lng=fallback_lng,
+                location_override=location_override,
             ),
         )
     except Exception as e:
@@ -1047,6 +1186,7 @@ async def _send_map_jpeg_to_esp32_after_turn(
     api_key: str,
     fallback_lat: Optional[float],
     fallback_lng: Optional[float],
+    location_override: str = "",
 ) -> None:
     """End-of-turn fallback: send map JPEG if not already sent (e.g. model omitted face_animation(map))."""
     if map_jpeg_sent_this_turn_by_device.get(device_id):
@@ -1057,6 +1197,7 @@ async def _send_map_jpeg_to_esp32_after_turn(
         api_key=api_key,
         fallback_lat=fallback_lat,
         fallback_lng=fallback_lng,
+        location_override=location_override,
     )
     if ok:
         map_jpeg_sent_this_turn_by_device[device_id] = True
@@ -1119,6 +1260,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
     async with lock:
         turn_tool_state_by_device[device_id] = {"show_weather": False, "face_animation": False}
         map_jpeg_sent_this_turn_by_device[device_id] = False
+        map_location_override_by_device.pop(device_id, None)
         maps_widget_token_latest_by_device[device_id] = ""
         bot_settings = get_bot_settings(device_id)
         model = bot_settings["model"]
@@ -1173,76 +1315,120 @@ async def stream_chat_turn_response(device_id: str, message_content):
             config=config,
             history=list(prior_history),
         )
-        response_stream = chat.send_message_stream(message_content)
+        
+        message_to_send = message_content
+        MAX_TURNS = 3
+        
         try:
-            while True:
-                chunk = await loop.run_in_executor(
-                    None,
-                    partial(next, response_stream, None)
-                )
-                if chunk is None:
-                    break
-
-                # Detect tool/function calls in this chunk and broadcast them
+            for turn in range(MAX_TURNS):
+                response_stream = chat.send_message_stream(message_to_send)
+                functions_to_execute = []
+                
                 try:
-                    if chunk.candidates:
-                        for candidate in chunk.candidates:
-                            gm = getattr(candidate, "grounding_metadata", None)
-                            src = _extract_maps_sources_from_grounding_metadata(gm)
-                            if src:
-                                last_maps_sources = src
-                            web_src, web_queries = _extract_search_sources_from_grounding_metadata(gm)
-                            if web_src:
-                                last_search_sources = web_src
-                            if web_queries:
-                                last_search_queries = web_queries
-                            wtok = _extract_maps_widget_token_from_grounding_metadata(gm)
-                            if wtok:
-                                last_maps_widget_token = wtok
-                                maps_widget_token_latest_by_device[device_id] = wtok
-                            if candidate.content and candidate.content.parts:
-                                for part in candidate.content.parts:
-                                    fc = getattr(part, "function_call", None)
-                                    if fc:
-                                        await manager.broadcast({
-                                            "type": "tool_call",
-                                            "stream_id": stream_id,
-                                            "function_name": fc.name,
-                                            "arguments": dict(fc.args) if fc.args else {}
-                                        })
+                    while True:
+                        chunk = await loop.run_in_executor(
+                            None,
+                            partial(next, response_stream, None)
+                        )
+                        if chunk is None:
+                            break
+
+                        # Detect tool/function calls in this chunk and broadcast them
+                        try:
+                            if getattr(chunk, "candidates", None):
+                                for candidate in chunk.candidates:
+                                    gm = getattr(candidate, "grounding_metadata", None)
+                                    src = _extract_maps_sources_from_grounding_metadata(gm)
+                                    if src:
+                                        last_maps_sources = src
+                                    web_src, web_queries = _extract_search_sources_from_grounding_metadata(gm)
+                                    if web_src:
+                                        last_search_sources = web_src
+                                    if web_queries:
+                                        last_search_queries = web_queries
+                                    wtok = _extract_maps_widget_token_from_grounding_metadata(gm)
+                                    if wtok:
+                                        last_maps_widget_token = wtok
+                                        maps_widget_token_latest_by_device[device_id] = wtok
+                                        
+                                    if candidate.content and getattr(candidate.content, "parts", None):
+                                        for part in candidate.content.parts:
+                                            fc = getattr(part, "function_call", None)
+                                            if fc:
+                                                functions_to_execute.append(fc)
+                        except Exception as e:
+                            print(f"Error inspecting chunk for tool calls: {e}")
+
+                        chunk_text = (chunk.text or "")
+                        if not chunk_text:
+                            continue
+
+                        if chunk_text.startswith(full_text):
+                            delta = chunk_text[len(full_text):]
+                        else:
+                            delta = chunk_text
+
+                        if delta:
+                            full_text += delta
+
+                            if not first_token_notified:
+                                esp32_ws = get_active_esp32_socket(device_id)
+                                if esp32_ws:
+                                    try:
+                                        await esp32_ws.send_text(json.dumps({
+                                            "type": "gemini_first_token"
+                                        }))
+                                    except Exception as e:
+                                        print(f"Failed to notify ESP32 first token: {e}")
+                                first_token_notified = True
+
+                            await manager.broadcast({
+                                "type": "ai_response_stream_delta",
+                                "stream_id": stream_id,
+                                "data": delta
+                            })
                 except Exception as e:
-                    print(f"Error inspecting chunk for tool calls: {e}")
-
-                chunk_text = (chunk.text or "")
-                if not chunk_text:
-                    continue
-
-                if chunk_text.startswith(full_text):
-                    delta = chunk_text[len(full_text):]
-                else:
-                    delta = chunk_text
-
-                if delta:
-                    full_text += delta
-
-                    if not first_token_notified:
-                        esp32_ws = get_active_esp32_socket(device_id)
-                        if esp32_ws:
-                            try:
-                                await esp32_ws.send_text(json.dumps({
-                                    "type": "gemini_first_token"
-                                }))
-                            except Exception as e:
-                                print(f"Failed to notify ESP32 first token: {e}")
-                        first_token_notified = True
-
+                    print(f"Stream interrupted: {e}")
+                    
+                if not functions_to_execute:
+                    break
+                    
+                # Execute manually
+                func_responses = []
+                for fc in functions_to_execute:
+                    args = dict(fc.args) if fc.args else {}
+                    fname = fc.name
+                    
                     await manager.broadcast({
-                        "type": "ai_response_stream_delta",
+                        "type": "tool_call",
                         "stream_id": stream_id,
-                        "data": delta
+                        "function_name": fname,
+                        "arguments": args
                     })
+                    
+                    result = {"error": "Unknown function"}
+                    
+                    if fname == "face_animation":
+                        result = _make_face_animation_tool(device_id)(**args)
+                    elif fname == "show_weather_animation":
+                        result = _make_show_weather_tool(device_id)(**args)
+                    elif fname == "show_map_animation":
+                        result = _make_show_map_animation_tool(device_id)(**args)
+                        
+                    func_responses.append(
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name=fname,
+                                response={"result": result},
+                                id=fc.id
+                            )
+                        )
+                    )
+                
+                message_to_send = func_responses
 
             history_by_device[device_id] = list(chat.get_history(curated=True))
+            
         finally:
             turn_tool_state_by_device.pop(device_id, None)
 
@@ -1280,6 +1466,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
         )
         if maps_key:
             bot = get_bot_settings(device_id)
+            loc_override = map_location_override_by_device.pop(device_id, "")
             asyncio.create_task(
                 _send_map_jpeg_to_esp32_after_turn(
                     device_id=device_id,
@@ -1287,6 +1474,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
                     api_key=maps_key,
                     fallback_lat=bot.get("maps_latitude"),
                     fallback_lng=bot.get("maps_longitude"),
+                    location_override=loc_override,
                 )
             )
         else:

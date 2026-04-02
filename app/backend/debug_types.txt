@@ -1,0 +1,3 @@
+(*, name: str, response: dict[str, typing.Any], parts: Optional[list[google.genai.types.FunctionResponsePart]] = None) -> 'Part'
+(*, willContinue: Optional[bool] = None, scheduling: Optional[google.genai.types.FunctionResponseScheduling] = None, parts: Optional[list[google.genai.types.FunctionResponsePart]] = None, id: Optional[str] = None, name: Optional[str] = None, response: Optional[dict[str, Any]] = None) -> None
+(self, /, **data: 'Any') -> 'None'

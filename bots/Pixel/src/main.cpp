@@ -73,7 +73,7 @@ const int backend_port = 8000;
 //            GLOBALS
 // ==========================================
 Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, TFT_MISO);
-Arduino_GFX *gfx = new Arduino_GC9A01(bus, TFT_RST, 0, true);
+Arduino_GFX *gfx = new Arduino_GC9A01(bus, TFT_RST, 3, true);
 Preferences preferences;
 RTC_PCF8563 rtc;
 
@@ -2301,6 +2301,12 @@ void loop() {
             Wire.read(); // Reserved ID
             int tempY = Wire.read(); 
             
+            // Map physical touch to visual coordinates (90 deg CCW rotation)
+            int mappedX = tempY;
+            int mappedY = 240 - tempX;
+            tempX = mappedX;
+            tempY = mappedY;
+            
             if (points > 0) {
                 if (!isTouching) {
                     isTouching = true;
@@ -2403,7 +2409,7 @@ void loop() {
         // Evaluate SWIPE
         else if (absX > minSwipeDist || absY > minSwipeDist) {
             if (absX > absY) {
-                if (deltaX > 0) {
+                if (deltaX < 0) {
                     Serial.println("SWIPE RIGHT");
                     if (timeScreenActive && currentState == STATE_IDLE) {
                         timeScreenActive = false;
@@ -2422,7 +2428,7 @@ void loop() {
                     }
                 }
             } else {
-                if (deltaY > 0) {
+                if (deltaY < 0) {
                     Serial.println("SWIPE DOWN");
                     if (currentState == STATE_IDLE) {
                         timeScreenActive = false;
