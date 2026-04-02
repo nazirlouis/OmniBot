@@ -39,17 +39,21 @@ echo ""
 echo "Dashboard:  $DASHBOARD_URL"
 echo "API:        $BACKEND_URL"
 echo ""
-echo "Opening the dashboard shortly after Vite starts. Press Ctrl+C to stop both processes."
-echo ""
-
-(
-  sleep 6
-  if command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$DASHBOARD_URL" >/dev/null 2>&1 || true
-  elif command -v open >/dev/null 2>&1; then
-    open "$DASHBOARD_URL" >/dev/null 2>&1 || true
-  fi
-) &
+if [[ -n "${OMNIBOT_NO_BROWSER:-}" ]]; then
+  echo "Skipping browser (OMNIBOT_NO_BROWSER is set). Open the URL above manually."
+  echo ""
+else
+  echo "Opening the dashboard shortly after Vite starts. Set OMNIBOT_NO_BROWSER=1 to skip. Press Ctrl+C to stop both processes."
+  echo ""
+  (
+    sleep 6
+    if command -v xdg-open >/dev/null 2>&1; then
+      xdg-open "$DASHBOARD_URL" >/dev/null 2>&1 || true
+    elif command -v open >/dev/null 2>&1; then
+      open "$DASHBOARD_URL" >/dev/null 2>&1 || true
+    fi
+  ) &
+fi
 
 cd "$REPO_ROOT/app/frontend"
 npm run dev

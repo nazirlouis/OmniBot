@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import './BotSettings.css';
 import './SettingsShell.css';
-import { getBotSettings, updateBotSettings, resetBotSettingsToDefault } from './setupService';
+import { getBotSettings, updateBotSettings, resetBotSettingsToDefault, deleteBot } from './setupService';
 
 const BotSettings = ({ setAppMode, embedded = false }) => {
   const [deviceId] = useState('default_bot');
@@ -46,6 +46,28 @@ const BotSettings = ({ setAppMode, embedded = false }) => {
       setTimeout(() => setSaveStatus(null), 3000);
     } catch (err) {
       console.error('Failed to save settings', err);
+      setSaveStatus('error');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleRemoveBot = async () => {
+    if (
+      !window.confirm(
+        `Remove "${deviceId}" from this hub?\n\n` +
+          'This deletes saved Pixel settings for this bot, clears chat history in memory, and disconnects the bot if it is online. The hub will reject reconnects until you save Pixel bot settings again (or reset to defaults). Hub-wide settings (API keys, Maps location) are not removed.'
+      )
+    ) {
+      return;
+    }
+    setIsSaving(true);
+    setSaveStatus(null);
+    try {
+      await deleteBot(deviceId);
+      setAppMode('dashboard');
+    } catch (err) {
+      console.error('Failed to remove bot', err);
       setSaveStatus('error');
     } finally {
       setIsSaving(false);
@@ -150,6 +172,21 @@ const BotSettings = ({ setAppMode, embedded = false }) => {
         <p className="help-text">Personality and behavior for this bot.</p>
       </div>
 
+      <div className="form-group danger-zone">
+        <label>Remove bot from hub</label>
+        <p className="help-text">
+          Disconnects this bot if connected and deletes its saved model, instructions, and vision preference. The hub will not accept this device until you save Pixel settings here again or use Reset to defaults. Wi‑Fi on the device is unchanged.
+        </p>
+        <button
+          type="button"
+          className="btn btn-remove-bot"
+          onClick={handleRemoveBot}
+          disabled={isSaving}
+        >
+          Remove bot from hub
+        </button>
+      </div>
+
       <div className="form-actions">
         <button
           type="button"
@@ -178,7 +215,7 @@ const BotSettings = ({ setAppMode, embedded = false }) => {
         <div className="status-message success slide-enter">Pixel settings saved.</div>
       )}
       {saveStatus === 'error' && (
-        <div className="status-message error slide-enter">Failed to save. Check connection to the hub.</div>
+        <div className="status-message error slide-enter">Something went wrong. Check connection to the hub.</div>
       )}
     </form>
   );

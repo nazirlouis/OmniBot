@@ -24,6 +24,7 @@ from wifi_scan import scan_wifi_ssids
 
 from hub_config import (
     DEFAULT_NOMINATIM_USER_AGENT,
+    REMOVED_DEVICE_IDS_FILE,
     SETTINGS_FILE,
     get_genai_client,
     get_gemini_api_key,
@@ -247,6 +248,60 @@ def save_all_settings(settings):
             json.dump(settings, f, indent=4)
     except Exception as e:
         print(f"Error saving settings: {e}")
+
+
+def load_removed_device_ids() -> set[str]:
+    """Device ids removed via the hub; streams are rejected until explicitly re-registered (e.g. Save Pixel settings)."""
+    if not os.path.exists(REMOVED_DEVICE_IDS_FILE):
+        return set()
+    try:
+        with open(REMOVED_DEVICE_IDS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return {str(x).strip() for x in data if str(x).strip()}
+        return set()
+    except Exception as e:
+        print(f"Error loading removed device ids: {e}")
+        return set()
+
+
+def save_removed_device_ids(ids: set[str]) -> None:
+    try:
+        parent = os.path.dirname(REMOVED_DEVICE_IDS_FILE) or "."
+        os.makedirs(parent, exist_ok=True)
+        with open(REMOVED_DEVICE_IDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(ids), f, indent=2)
+    except Exception as e:
+        print(f"Error saving removed device ids: {e}")
+
+
+def is_device_removed(device_id: str) -> bool:
+    did = (device_id or "").strip()
+    if not did:
+        return False
+    return did in load_removed_device_ids()
+
+
+def add_removed_device_id(device_id: str) -> None:
+    did = (device_id or "").strip()
+    if not did:
+        return
+    ids = load_removed_device_ids()
+    if did not in ids:
+        ids.add(did)
+        save_removed_device_ids(ids)
+
+
+def remove_removed_device_id(device_id: str) -> None:
+    """Call when the user explicitly registers this device again (saved settings, reset, or runtime vision row)."""
+    did = (device_id or "").strip()
+    if not did:
+        return
+    ids = load_removed_device_ids()
+    if did in ids:
+        ids.discard(did)
+        save_removed_device_ids(ids)
+
 
 def get_bot_settings(device_id: str):
     """Merge per-device Pixel fields from bot_settings.json with hub-wide location/clock from hub_app_settings.json."""
@@ -712,6 +767,7 @@ async def get_settings(device_id: str):
 @app.post("/api/settings/{device_id}")
 async def update_settings(device_id: str, new_settings: BotSettingsSchema):
     """Updates Pixel-only settings (model, system instruction, vision) for a bot."""
+    remove_removed_device_id(device_id)
     settings = get_all_settings()
     row = {
         "model": new_settings.model,
@@ -737,6 +793,7 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
 @app.post("/api/settings/{device_id}/reset")
 async def reset_settings_to_default(device_id: str):
     """Restore Pixel-only stored settings to defaults; hub clock/Maps are unchanged."""
+    remove_removed_device_id(device_id)
     row = _default_stored_bot_settings()
     settings = get_all_settings()
     settings[device_id] = row
@@ -745,6 +802,29 @@ async def reset_settings_to_default(device_id: str):
     vision_enabled_by_device[device_id] = row["vision_enabled"]
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
     return {"status": "success", "settings": get_bot_settings(device_id), "maps_geocode": {"ok": True, "error": None}}
+
+
+@app.delete("/api/settings/{device_id}")
+async def delete_bot_settings(device_id: str):
+    """Remove stored settings for a bot, clear in-memory runtime state, and close its ESP32 stream."""
+    did = (device_id or "").strip()
+    if not did:
+        raise HTTPException(status_code=400, detail="device_id required")
+    settings = get_all_settings()
+    if did in settings:
+        del settings[did]
+        save_all_settings(settings)
+    _purge_bot_runtime_state(did)
+    add_removed_device_id(did)
+    await _disconnect_websockets_for_device(did)
+    await manager.broadcast(
+        {
+            "type": "esp32_disconnected",
+            "device_id": did,
+            "data": "Bot removed from hub",
+        }
+    )
+    return {"status": "success", "device_id": did}
 
 
 # ==========================================
@@ -757,6 +837,30 @@ history_by_device: dict[str, list] = {}
 gemini_turn_locks: dict[str, asyncio.Lock] = {}
 vision_enabled_by_device = {}
 timezone_rule_by_device = {}
+
+
+def _purge_bot_runtime_state(device_id: str) -> None:
+    """Clear per-device in-memory hub state (chat history, locks, tool/Maps turn state)."""
+    history_by_device.pop(device_id, None)
+    vision_enabled_by_device.pop(device_id, None)
+    timezone_rule_by_device.pop(device_id, None)
+    gemini_turn_locks.pop(device_id, None)
+    turn_tool_state_by_device.pop(device_id, None)
+    maps_widget_token_latest_by_device.pop(device_id, None)
+    map_jpeg_sent_this_turn_by_device.pop(device_id, None)
+    map_location_override_by_device.pop(device_id, None)
+    map_display_style_by_device.pop(device_id, None)
+
+
+async def _disconnect_websockets_for_device(device_id: str) -> None:
+    """Close active ESP32 WebSocket streams for this device_id (e.g. after hub-side removal)."""
+    for ws, session in list(active_streams.items()):
+        if session.get("device_id") != device_id:
+            continue
+        try:
+            await ws.close(code=1001)
+        except Exception as e:
+            print(f"[Omnibot] Error closing stream for {device_id!r}: {e}")
 
 
 async def _push_timezone_to_all_streams(timezone_rule: str) -> None:
@@ -2056,10 +2160,28 @@ def get_active_esp32_socket(device_id: str):
 @app.websocket("/ws/stream")
 async def esp32_stream_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("ESP32 connected to streaming endpoint!")
-    
-    # Initialize session buffers
     stream_device_id = "default_bot"
+    if is_device_removed(stream_device_id):
+        print(f"ESP32 stream rejected (device {stream_device_id!r} removed from hub).")
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "hub_reject",
+                        "reason": "device_removed",
+                        "device_id": stream_device_id,
+                        "message": "This device was removed from the hub. Save Pixel bot settings to register again.",
+                    }
+                )
+            )
+        except Exception as e:
+            print(f"Could not send hub_reject to ESP32: {e}")
+        await websocket.close(code=1008, reason="Device removed from hub")
+        return
+
+    print("ESP32 connected to streaming endpoint!")
+
+    # Initialize session buffers
     active_streams[websocket] = {
         "audio_buffer": bytearray(),
         "video_frames": [],
@@ -2258,6 +2380,11 @@ async def text_command(req: TextCommandRequest):
     message = (req.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if is_device_removed(req.device_id):
+        raise HTTPException(
+            status_code=403,
+            detail="This device was removed from the hub. Save Pixel bot settings (or reset to defaults) to register it again.",
+        )
     if not get_gemini_api_key():
         raise HTTPException(
             status_code=503,
@@ -2301,6 +2428,7 @@ async def get_vision_setting(device_id: str):
 @app.post("/api/runtime/{device_id}/vision")
 async def set_vision_setting(device_id: str, payload: VisionToggleRequest):  # noqa: F811
     """Sets whether video frames are included in model requests."""
+    remove_removed_device_id(device_id)
     vision_enabled_by_device[device_id] = payload.enabled
     settings = get_all_settings()
     bot_conf = dict(settings.get(device_id) or {})

@@ -28,6 +28,7 @@ else:
     load_dotenv()
 
 SETTINGS_FILE = str(DATA_DIR / "bot_settings.json")
+REMOVED_DEVICE_IDS_FILE = str(DATA_DIR / "removed_device_ids.json")
 HUB_SECRETS_FILE = DATA_DIR / "hub_secrets.json"
 HUB_APP_SETTINGS_FILE = DATA_DIR / "hub_app_settings.json"
 

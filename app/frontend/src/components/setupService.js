@@ -77,6 +77,18 @@ export const resetBotSettingsToDefault = async (device_id) => {
   return await res.json();
 };
 
+/** Remove stored settings for this bot, clear hub runtime state, and disconnect its stream. */
+export const deleteBot = async (device_id) => {
+  const res = await fetch(hubUrl(`/api/settings/${encodeURIComponent(device_id)}`), {
+    method: 'DELETE',
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.detail || 'Failed to remove bot');
+  }
+  return data;
+};
+
 export const getHubStatus = async () => {
   const res = await fetch(hubUrl('/api/hub/status'));
   if (!res.ok) throw new Error('Hub status failed');

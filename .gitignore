@@ -5,6 +5,8 @@ app/backend/models/
 .env
 app/backend/hub_secrets.json
 app/backend/hub_app_settings.json
+app/backend/removed_device_ids.json
+app/backend/.venv/
 
 # Node
 node_modules/

@@ -194,6 +194,42 @@
   cursor: not-allowed;
 }
 
+.danger-zone {
+  margin-top: 1.5rem;
+  padding: 1.25rem;
+  border-radius: 12px;
+  border: 1px solid rgba(180, 60, 60, 0.35);
+  background: rgba(255, 240, 240, 0.35);
+}
+
+.danger-zone label {
+  font-weight: 600;
+  color: #8b1538;
+}
+
+.btn-remove-bot {
+  font-family: inherit;
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 0.75rem 1.25rem;
+  border-radius: 10px;
+  cursor: pointer;
+  margin-top: 0.75rem;
+  transition: background 0.2s ease, border-color 0.2s ease;
+  background: rgba(183, 28, 28, 0.12);
+  border: 1px solid rgba(183, 28, 28, 0.45);
+  color: #b71c1c;
+}
+
+.btn-remove-bot:hover:not(:disabled) {
+  background: rgba(183, 28, 28, 0.2);
+}
+
+.btn-remove-bot:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .status-message {
   display: flex;
   align-items: center;

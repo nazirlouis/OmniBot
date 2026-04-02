@@ -10,8 +10,9 @@ propcache>=0.3.0
 
 requests
 python-dotenv
-# fastembed (semantic-router[fastembed]) requires Pillow<11 on Python 3.12
-Pillow>=10.3.0,<11.0.0
+# Pillow + fastembed: 3.12 (Docker/CI) uses fastembed 0.3.x + Pillow 10.x. Python 3.13+ has no fastembed 0.3 wheels — use 0.5+ and Pillow 11+.
+Pillow>=10.3.0,<11.0.0; python_version < "3.13"
+Pillow>=11.0.0,<12.0.0; python_version >= "3.13"
 fastapi
 uvicorn[standard]
 google-genai>=1.50.0
@@ -20,5 +21,7 @@ python-multipart
 opencv-python-headless
 imageio
 imageio-ffmpeg
-# fastembed is installed via this extra; keep bounds aligned (0.1.x pins fastembed<0.4 on Python <3.13)
+# semantic-router[fastembed]: on Python <3.13 pulls fastembed 0.3.x; on 3.13+ the extra installs no fastembed — pin below.
 semantic-router[fastembed]>=0.1.12
+fastembed>=0.3.0,<0.4; python_version < "3.13"
+fastembed>=0.5.0,<0.9; python_version >= "3.13"
