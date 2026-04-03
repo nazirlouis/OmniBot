@@ -55,7 +55,7 @@ This creates `app/backend/.venv`, installs Python dependencies, and runs `npm ci
 .\scripts\start.ps1
 ```
 
-The backend runs in a **second** PowerShell window. The current window runs Vite and usually opens the UI.
+Backend and Vite run in the **same** PowerShell window (logs may interleave). **Ctrl+C** stops the dev server and then the script stops the backend.
 
 **macOS / Linux**
 

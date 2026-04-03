@@ -23,19 +23,17 @@ Write-Host ""
 Write-Host "Starting OmniBot ..." -ForegroundColor Cyan
 Write-Host ""
 
-# Backend in a separate window so logs stay visible
-$backendCmd = "Set-Location '$BackendRoot'; & '$Py' app.py"
-Start-Process powershell -WorkingDirectory $BackendRoot -ArgumentList @(
-    "-NoExit",
-    "-Command",
-    $backendCmd
-)
+# Same console as Vite; logs may interleave. Stopped in finally when npm exits (Ctrl+C).
+$backendProc = Start-Process -FilePath $Py -ArgumentList "app.py" -WorkingDirectory $BackendRoot -PassThru -NoNewWindow
+if (-not $backendProc) {
+    Write-Error "Failed to start backend."
+}
 
-Write-Host "Backend starting in a new window (FastAPI on port 8000)."
 Start-Sleep -Seconds 2
 
 Push-Location (Join-Path $RepoRoot "app\frontend")
 try {
+    Write-Host "Backend process started (FastAPI on port 8000)."
     Write-Host ""
     Write-Host "Dashboard:  $DASHBOARD_URL" -ForegroundColor Green
     Write-Host "API:        $BACKEND_URL"
@@ -43,11 +41,18 @@ try {
     if ($env:OMNIBOT_NO_BROWSER) {
         Write-Host "Skipping browser (OMNIBOT_NO_BROWSER is set). Open the URL above manually."
     } else {
-        Write-Host "Opening the dashboard in your browser shortly after Vite starts. Set OMNIBOT_NO_BROWSER=1 to skip. Press Ctrl+C here to stop the dev server (close the backend window separately)."
+        Write-Host "Opening the dashboard in your browser shortly after Vite starts. Set OMNIBOT_NO_BROWSER=1 to skip."
+        Write-Host "Press Ctrl+C here to stop the dev server; the backend will shut down too."
         Start-Job -ScriptBlock { Start-Sleep -Seconds 6; Start-Process "http://127.0.0.1:5173" } | Out-Null
     }
     Write-Host ""
     npm run dev
 } finally {
     Pop-Location
+    try { $backendProc.Refresh() } catch { }
+    if ($backendProc -and -not $backendProc.HasExited) {
+        Write-Host ""
+        Write-Host "Stopping backend..." -ForegroundColor Gray
+        Stop-Process -Id $backendProc.Id -Force -ErrorAction SilentlyContinue
+    }
 }
