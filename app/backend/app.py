@@ -703,8 +703,7 @@ class TimezoneRuleRequest(BaseModel):
 
 class HubSettingsUpdate(BaseModel):
     gemini_api_key: Optional[str] = None
-    google_maps_js_api_key: Optional[str] = None
-    google_maps_static_api_key: Optional[str] = None
+    google_maps_api_key: Optional[str] = None
     nominatim_user_agent: Optional[str] = None
 
     model_config = ConfigDict(extra="forbid")
@@ -959,13 +958,6 @@ def _make_show_weather_tool(device_id: str):
             return {"ok": False, "skipped": True, "reason": "face_animation already called this turn"}
         tool_state["show_weather"] = True
         _schedule_weather_to_esp32(device_id, c, float(temperature))
-        _broadcast_tool_call_to_frontend(
-            "show_weather_animation",
-            {
-                "condition": c,
-                "temperature": float(temperature),
-            },
-        )
         return {"ok": True, "display": "weather queued on robot"}
 
     return show_weather_animation
@@ -1008,7 +1000,6 @@ def _make_show_map_animation_tool(device_id: str):
             except RuntimeError:
                 pass
         # NOTE: Map JPEG / calling card payload is also sent in the end-of-turn handler if not early-sent.
-        _broadcast_tool_call_to_frontend("show_map_animation", {"location": loc, "display_style": style})
         return {"ok": True, "display": "map animation queued on robot", "display_style": style}
 
     return show_map_animation
@@ -1155,27 +1146,6 @@ def _schedule_face_animation_to_esp32(device_id: str, animation: str, words: str
         _send_face_animation_json_to_esp32(device_id, animation, words),
         loop,
     )
-
-def _broadcast_tool_call_to_frontend(function_name: str, arguments: dict) -> None:
-    """Broadcast tool-call telemetry to the dashboard websocket monitor.
-
-    This runs from Gemini tool execution threads, so we use the shared
-    `_main_async_loop` to schedule the async broadcast.
-    """
-    loop = _main_async_loop
-    if loop is None:
-        return
-    try:
-        asyncio.run_coroutine_threadsafe(
-            manager.broadcast({
-                "type": "tool_call",
-                "function_name": function_name,
-                "arguments": arguments,
-            }),
-            loop,
-        )
-    except Exception as e:
-        print(f"Failed to broadcast tool_call to frontend: {e}")
 
 
 def is_vision_enabled(device_id: str) -> bool:
@@ -1952,7 +1922,7 @@ def _schedule_map_jpeg_after_face_animation_map(device_id: str) -> None:
     maps_key = get_maps_key_js_for_screenshot()
     if not maps_key:
         print(
-            "[Omnibot] face_animation(map): GOOGLE_MAPS_JS_API_KEY missing; cannot screenshot map for ESP32."
+            "[Omnibot] face_animation(map): Google Maps API key missing; cannot screenshot map for ESP32."
         )
         return
     asyncio.run_coroutine_threadsafe(
@@ -2214,7 +2184,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
             )
         else:
             print(
-                "[Omnibot] Map animation called but no GOOGLE_MAPS_STATIC_API_KEY/GOOGLE_MAPS_JS_API_KEY found; "
+                "[Omnibot] Map animation called but no Google Maps API key found; "
                 "skipping ESP32 map image."
             )
 
@@ -2588,7 +2558,7 @@ async def post_hub_app_settings_endpoint(new_settings: HubAppSettingsSchema):
 async def hub_config():
     """Public values the dashboard needs (Maps JS key for contextual widget is browser-exposed)."""
     key = get_google_maps_js_api_key()
-    return {"maps_js_api_key": key}
+    return {"maps_api_key": key, "maps_js_api_key": key}
 
 
 @app.get("/api/hub/status")

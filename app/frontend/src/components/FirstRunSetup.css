@@ -197,3 +197,17 @@
 .first-run-geocode-msg {
   margin-bottom: 0.75rem;
 }
+
+.first-run-address-block--disabled .form-group label {
+  color: var(--text-muted, #5a6b7a);
+}
+
+.first-run-address-block__hint {
+  margin: 0 0 0.35rem;
+}
+
+.first-run-address-block--disabled .holo-input,
+.first-run-address-block--disabled .holo-select {
+  cursor: not-allowed;
+  opacity: 0.85;
+}

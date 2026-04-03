@@ -24,8 +24,7 @@ const HubSettings = () => {
   const [saveStatus, setSaveStatus] = useState(null);
   const [form, setForm] = useState({
     gemini_api_key: '',
-    google_maps_js_api_key: '',
-    google_maps_static_api_key: '',
+    google_maps_api_key: '',
     nominatim_user_agent: '',
   });
 
@@ -142,11 +141,8 @@ const HubSettings = () => {
     try {
       const payload = {};
       if (form.gemini_api_key.trim()) payload.gemini_api_key = form.gemini_api_key.trim();
-      if (form.google_maps_js_api_key.trim()) {
-        payload.google_maps_js_api_key = form.google_maps_js_api_key.trim();
-      }
-      if (form.google_maps_static_api_key.trim()) {
-        payload.google_maps_static_api_key = form.google_maps_static_api_key.trim();
+      if (form.google_maps_api_key.trim()) {
+        payload.google_maps_api_key = form.google_maps_api_key.trim();
       }
       if (!view?.nominatim_user_agent_from_env) {
         const nextN = form.nominatim_user_agent.trim();
@@ -165,8 +161,7 @@ const HubSettings = () => {
       setForm((f) => ({
         ...f,
         gemini_api_key: '',
-        google_maps_js_api_key: '',
-        google_maps_static_api_key: '',
+        google_maps_api_key: '',
       }));
       setSaveStatus('success');
     } catch (err) {
@@ -280,55 +275,28 @@ const HubSettings = () => {
         </div>
 
         <div className="form-group">
-          <label htmlFor="hubMapsJs">Google Maps JavaScript API key</label>
-          {view?.google_maps_js_api_key_configured && (
-            <p className="help-text">Stored: {view.google_maps_js_api_key_masked}</p>
+          <label htmlFor="hubMapsKey">Google Maps API key</label>
+          {view?.google_maps_api_key_configured && (
+            <p className="help-text">Stored: {view.google_maps_api_key_masked}</p>
           )}
           <input
-            id="hubMapsJs"
+            id="hubMapsKey"
             type="password"
             autoComplete="off"
             className="holo-input"
-            value={form.google_maps_js_api_key}
-            onChange={(e) => setForm((f) => ({ ...f, google_maps_js_api_key: e.target.value }))}
-            placeholder="Maps JS (browser widget + screenshots)"
+            value={form.google_maps_api_key}
+            onChange={(e) => setForm((f) => ({ ...f, google_maps_api_key: e.target.value }))}
+            placeholder="One key for JS, Static Maps, and server-side map use"
           />
-          {view?.google_maps_js_api_key_configured && (
+          {view?.google_maps_api_key_configured && (
             <button
               type="button"
               className="btn btn-secondary"
               style={{ alignSelf: 'flex-start', marginTop: '0.35rem' }}
               disabled={saving}
-              onClick={() => clearKey('google_maps_js_api_key')}
+              onClick={() => clearKey('google_maps_api_key')}
             >
-              Remove stored JS key
-            </button>
-          )}
-        </div>
-
-        <div className="form-group">
-          <label htmlFor="hubMapsStatic">Google Maps Static API key (optional)</label>
-          {view?.google_maps_static_api_key_configured && (
-            <p className="help-text">Stored: {view.google_maps_static_api_key_masked}</p>
-          )}
-          <input
-            id="hubMapsStatic"
-            type="password"
-            autoComplete="off"
-            className="holo-input"
-            value={form.google_maps_static_api_key}
-            onChange={(e) => setForm((f) => ({ ...f, google_maps_static_api_key: e.target.value }))}
-            placeholder="Optional; static map tiles / geocoding fallback"
-          />
-          {view?.google_maps_static_api_key_configured && (
-            <button
-              type="button"
-              className="btn btn-secondary"
-              style={{ alignSelf: 'flex-start', marginTop: '0.35rem' }}
-              disabled={saving}
-              onClick={() => clearKey('google_maps_static_api_key')}
-            >
-              Remove stored Static key
+              Remove stored Maps key
             </button>
           )}
         </div>

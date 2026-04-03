@@ -62,10 +62,12 @@ export async function loadMapsPlacesForContextual(apiKey) {
  * @returns {Promise<string>}
  */
 export async function resolveMapsJsApiKey() {
-  const fromEnv = import.meta.env.VITE_GOOGLE_MAPS_JS_API_KEY?.trim();
+  const fromEnv =
+    import.meta.env.VITE_GOOGLE_MAPS_API_KEY?.trim() ||
+    import.meta.env.VITE_GOOGLE_MAPS_JS_API_KEY?.trim();
   if (fromEnv) return fromEnv;
   const r = await fetch(hubUrl('/api/hub-config'));
   if (!r.ok) throw new Error('hub-config failed');
   const cfg = await r.json();
-  return (cfg.maps_js_api_key || '').trim();
+  return (cfg.maps_api_key || cfg.maps_js_api_key || '').trim();
 }

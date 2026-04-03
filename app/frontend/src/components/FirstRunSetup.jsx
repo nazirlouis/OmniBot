@@ -16,18 +16,17 @@ const TIMEZONE_OPTIONS = [
   { value: 'UTC0', label: 'UTC' },
 ];
 
-const STEP_LABELS = ['Gemini', 'Maps keys', 'Clock & location'];
+const STEP_LABELS = ['Gemini', 'Maps key', 'Clock & location'];
 
 /**
- * First-time hub setup: Gemini (required), optional Maps API keys, then clock / Maps address.
+ * First-time hub setup: Gemini (required), optional Google Maps API key, then clock / Maps address.
  */
 export default function FirstRunSetup({ onConfigured }) {
   const [step, setStep] = useState(0);
   const [geminiSaved, setGeminiSaved] = useState(false);
 
   const [geminiKey, setGeminiKey] = useState('');
-  const [mapsJsKey, setMapsJsKey] = useState('');
-  const [mapsStaticKey, setMapsStaticKey] = useState('');
+  const [mapsKey, setMapsKey] = useState('');
 
   const [locForm, setLocForm] = useState({
     timezone_rule: TIMEZONE_OPTIONS[0].value,
@@ -44,6 +43,8 @@ export default function FirstRunSetup({ onConfigured }) {
 
   const countryOptions = useMemo(() => getCountryOptions(), []);
   const hasTimezoneOption = TIMEZONE_OPTIONS.some((tz) => tz.value === locForm.timezone_rule);
+  /** From Maps step; if no key was provided, address fields are unavailable. */
+  const hasMapsApiKey = useMemo(() => Boolean(mapsKey.trim()), [mapsKey]);
 
   const goNextFromGemini = async (e) => {
     e.preventDefault();
@@ -74,8 +75,7 @@ export default function FirstRunSetup({ onConfigured }) {
     setError(null);
     try {
       const payload = {};
-      if (mapsJsKey.trim()) payload.google_maps_js_api_key = mapsJsKey.trim();
-      if (mapsStaticKey.trim()) payload.google_maps_static_api_key = mapsStaticKey.trim();
+      if (mapsKey.trim()) payload.google_maps_api_key = mapsKey.trim();
       if (Object.keys(payload).length > 0) {
         await postHubSettings(payload);
       }
@@ -104,10 +104,10 @@ export default function FirstRunSetup({ onConfigured }) {
       const res = await postHubAppSettings({
         timezone_rule: locForm.timezone_rule,
         maps_grounding_enabled: locForm.maps_grounding_enabled,
-        maps_street: locForm.maps_street.trim(),
-        maps_state: locForm.maps_state.trim(),
-        maps_postal_code: locForm.maps_postal_code.trim(),
-        maps_country: (locForm.maps_country || '').trim(),
+        maps_street: hasMapsApiKey ? locForm.maps_street.trim() : '',
+        maps_state: hasMapsApiKey ? locForm.maps_state.trim() : '',
+        maps_postal_code: hasMapsApiKey ? locForm.maps_postal_code.trim() : '',
+        maps_country: hasMapsApiKey ? (locForm.maps_country || '').trim() : '',
       });
       const geo = res.maps_geocode;
       if (geo && geo.ok === false && geo.error) {
@@ -184,43 +184,30 @@ export default function FirstRunSetup({ onConfigured }) {
 
         {step === 1 && (
           <>
-            <h1 className="first-run-title">Google Maps API keys</h1>
+            <h1 className="first-run-title">Google Maps API key</h1>
             <p className="first-run-lead">
-              Optional: add keys for Maps in the dashboard and for Gemini Maps grounding. You can skip and set these
-              later under <strong>Hub settings</strong>.
+              Optional: one key for the in-dashboard map widget, static map images, and Gemini Maps grounding. You can
+              skip and set it later under <strong>Hub settings</strong>.
             </p>
             <p className="first-run-hint">
-              Create keys in{' '}
+              Create a key in{' '}
               <a href={MAPS_PLATFORM_URL} target="_blank" rel="noreferrer">
                 Google Maps Platform
-              </a>
-              .
+              </a>{' '}
+              (enable the APIs you need: Maps JavaScript, Maps Static, Places, etc.).
             </p>
 
             <form className="first-run-form first-run-form--stack" onSubmit={goNextFromMaps}>
               <div className="form-group">
-                <label htmlFor="first-run-maps-js">Maps JavaScript API key</label>
+                <label htmlFor="first-run-maps-key">Google Maps API key</label>
                 <input
-                  id="first-run-maps-js"
+                  id="first-run-maps-key"
                   type="password"
                   autoComplete="off"
                   className="holo-input"
-                  value={mapsJsKey}
-                  onChange={(e) => setMapsJsKey(e.target.value)}
-                  placeholder="Browser widget & map features"
-                  disabled={saving}
-                />
-              </div>
-              <div className="form-group">
-                <label htmlFor="first-run-maps-static">Maps Static API key (optional)</label>
-                <input
-                  id="first-run-maps-static"
-                  type="password"
-                  autoComplete="off"
-                  className="holo-input"
-                  value={mapsStaticKey}
-                  onChange={(e) => setMapsStaticKey(e.target.value)}
-                  placeholder="Static tiles / optional fallback"
+                  value={mapsKey}
+                  onChange={(e) => setMapsKey(e.target.value)}
+                  placeholder="Same key for JS, static maps, and related APIs"
                   disabled={saving}
                 />
               </div>
@@ -289,61 +276,72 @@ export default function FirstRunSetup({ onConfigured }) {
                 </p>
               </div>
 
-              <div className="form-group">
-                <label htmlFor="first-run-street">Address</label>
-                <input
-                  id="first-run-street"
-                  type="text"
-                  className="holo-input"
-                  value={locForm.maps_street}
-                  onChange={(e) => setLocForm((f) => ({ ...f, maps_street: e.target.value }))}
-                  placeholder="Street, or postal + region"
-                  autoComplete="off"
-                  disabled={saving}
-                />
-              </div>
+              <div
+                className={
+                  hasMapsApiKey ? 'first-run-address-block' : 'first-run-address-block first-run-address-block--disabled'
+                }
+              >
+                <div className="form-group">
+                  <label htmlFor="first-run-street">Address</label>
+                  {!hasMapsApiKey && (
+                    <p className="help-text first-run-address-block__hint">
+                      Add a Google Maps API key in the previous step to enter your address.
+                    </p>
+                  )}
+                  <input
+                    id="first-run-street"
+                    type="text"
+                    className="holo-input"
+                    value={locForm.maps_street}
+                    onChange={(e) => setLocForm((f) => ({ ...f, maps_street: e.target.value }))}
+                    placeholder="Street, or postal + region"
+                    autoComplete="off"
+                    disabled={saving || !hasMapsApiKey}
+                  />
+                </div>
 
-              <div className="form-group">
-                <label htmlFor="first-run-state">State / region (optional)</label>
-                <input
-                  id="first-run-state"
-                  type="text"
-                  className="holo-input"
-                  value={locForm.maps_state}
-                  onChange={(e) => setLocForm((f) => ({ ...f, maps_state: e.target.value }))}
-                  disabled={saving}
-                />
-              </div>
+                <div className="form-group">
+                  <label htmlFor="first-run-state">State / region (optional)</label>
+                  <input
+                    id="first-run-state"
+                    type="text"
+                    className="holo-input"
+                    value={locForm.maps_state}
+                    onChange={(e) => setLocForm((f) => ({ ...f, maps_state: e.target.value }))}
+                    disabled={saving || !hasMapsApiKey}
+                  />
+                </div>
 
-              <div className="form-group">
-                <label htmlFor="first-run-postal">Postal / ZIP (optional)</label>
-                <input
-                  id="first-run-postal"
-                  type="text"
-                  className="holo-input"
-                  value={locForm.maps_postal_code}
-                  onChange={(e) => setLocForm((f) => ({ ...f, maps_postal_code: e.target.value }))}
-                  disabled={saving}
-                />
-              </div>
+                <div className="form-group">
+                  <label htmlFor="first-run-postal">Postal / ZIP (optional)</label>
+                  <input
+                    id="first-run-postal"
+                    type="text"
+                    className="holo-input"
+                    value={locForm.maps_postal_code}
+                    onChange={(e) => setLocForm((f) => ({ ...f, maps_postal_code: e.target.value }))}
+                    disabled={saving || !hasMapsApiKey}
+                  />
+                </div>
 
-              <div className="form-group">
-                <label htmlFor="first-run-country">Country</label>
-                <div className="select-wrapper">
-                  <select
-                    id="first-run-country"
-                    value={locForm.maps_country}
-                    onChange={(e) => setLocForm((f) => ({ ...f, maps_country: e.target.value }))}
-                    className="holo-select"
-                    disabled={saving}
-                  >
+                <div className="form-group">
+                  <label htmlFor="first-run-country">Country</label>
+                  <div className="select-wrapper">
+                    <select
+                      id="first-run-country"
+                      value={locForm.maps_country}
+                      onChange={(e) => setLocForm((f) => ({ ...f, maps_country: e.target.value }))}
+                      className="holo-select"
+                      disabled={saving || !hasMapsApiKey}
+                    >
                     <option value="">Select country</option>
                     {countryOptions.map((c) => (
                       <option key={c.code} value={c.code}>
                         {c.name}
                       </option>
                     ))}
-                  </select>
+                    </select>
+                  </div>
                 </div>
               </div>
 

@@ -125,8 +125,8 @@ const MapsContextualWidget = ({ contextToken }) => {
       )}
       {phase === 'no_key' && (
         <p className="maps-widget-hint maps-widget-hint-warn">
-          Set <code>GOOGLE_MAPS_JS_API_KEY</code> in the hub backend environment (or{' '}
-          <code>VITE_GOOGLE_MAPS_JS_API_KEY</code> in the dashboard) to show the contextual Google Maps
+          Set <code>GOOGLE_MAPS_API_KEY</code> in the hub backend environment (or{' '}
+          <code>VITE_GOOGLE_MAPS_API_KEY</code> in the dashboard build) to show the contextual Google Maps
           widget. Use a key with the Maps JavaScript API enabled.
         </p>
       )}
