@@ -17,11 +17,22 @@ Licensed under the [MIT License](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md
 
 ## Quick setup
 
-### 1. Install (once)
+### 1. Download the repository
+
+```bash
+git clone https://github.com/nazirlouis/OmniBot.git
+cd OmniBot
+```
+
+### 2. Install (once)
 
 From the **repository root**:
 
-**Windows (PowerShell)** — if scripts are blocked the first time: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+**Windows (PowerShell)** — if scripts are blocked the first time:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
 
 ```powershell
 .\scripts\install.ps1
@@ -36,7 +47,7 @@ chmod +x scripts/install.sh scripts/start.sh
 
 This creates `app/backend/.venv`, installs Python dependencies, and runs `npm ci` in `app/frontend`.
 
-### 2. Start the hub and dashboard
+### 3. Start the hub and dashboard
 
 **Windows**
 
@@ -57,9 +68,21 @@ Backend and Vite run in the same terminal; **Ctrl+C** stops both.
 - **Dashboard:** [http://127.0.0.1:5173](http://127.0.0.1:5173) (dev; Vite proxies API/WebSocket to the backend)
 - **API:** [http://127.0.0.1:8000](http://127.0.0.1:8000)
 
-To **skip auto-opening the browser**, set `OMNIBOT_NO_BROWSER=1` (PowerShell: `$env:OMNIBOT_NO_BROWSER="1"`) before `start.ps1` / `start.sh`.
+To **skip auto-opening the browser**, set `OMNIBOT_NO_BROWSER` before `start.ps1` / `start.sh`:
 
-### 3. First launch
+**PowerShell**
+
+```powershell
+$env:OMNIBOT_NO_BROWSER = "1"
+```
+
+**macOS / Linux**
+
+```bash
+export OMNIBOT_NO_BROWSER=1
+```
+
+### 4. First launch
 
 You do **not** need a `.env` file to begin. When the UI loads, paste your **Gemini API key** on the welcome screen; it is stored in the hub data directory.
 
@@ -107,7 +130,12 @@ docker compose up --build
 
 Open **[http://localhost:8080](http://localhost:8080)** (host **8080** maps to container **8000**). Paste your Gemini key in the UI if you did not set `GEMINI_API_KEY`.
 
-- **Persisted data:** A Docker volume stores hub JSON (`bot_settings.json`, secrets, etc.). To wipe: `docker compose down -v` (destructive).
+- **Persisted data:** A Docker volume stores hub JSON (`bot_settings.json`, secrets, etc.). To wipe the volume (destructive):
+
+  ```bash
+  docker compose down -v
+  ```
+
 - **Bots on the LAN:** Point firmware at your **PC’s LAN IP** and the **mapped port** (e.g. **8080**), not `127.0.0.1` from the device.
 
 More detail: [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml).
@@ -126,8 +154,48 @@ Extra environment variables (Nominatim user-agent, Maps keys, data directory, de
 
 ## Manual start (no scripts)
 
-**Backend:** `cd app/backend` → create/activate venv → `pip install -r requirements.txt` → `python app.py`  
-**Frontend:** `cd app/frontend` → `npm install` → `npm run dev` → open [http://127.0.0.1:5173](http://127.0.0.1:5173)
+**Backend**
+
+```bash
+cd app/backend
+python -m venv .venv
+```
+
+Activate the venv, then install and run:
+
+**Windows (PowerShell)**
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python app.py
+```
+
+**Windows (Command Prompt)**
+
+```bat
+.venv\Scripts\activate.bat
+pip install -r requirements.txt
+python app.py
+```
+
+**macOS / Linux**
+
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+**Frontend** (separate terminal)
+
+```bash
+cd app/frontend
+npm install
+npm run dev
+```
+
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173).
 
 ---
 
