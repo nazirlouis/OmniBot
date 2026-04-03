@@ -1,117 +1,135 @@
 # OmniBot
 
-A **hub + dashboard** for ESP32-based AI robots that talk to **Google Gemini** over Wi‑Fi. Run the backend and web UI on your PC, connect a bot (e.g. **Pixel**), and use the browser to chat, watch the feed, provision Wi‑Fi over Bluetooth, and tune behavior.
+Run the **hub** (API + dashboard) on your PC and connect **ESP32** robots such as **Pixel** over Wi‑Fi. You chat with **Google Gemini** from the browser, provision Wi‑Fi over Bluetooth, and tune hub and bot behavior from the UI.
 
 Licensed under the [MIT License](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
-## What you can do
-
-- **Talk to Gemini from the dashboard** — Send text commands, see streamed replies, and follow connection status on the main **Dashboard**.
-- **Pair a Pixel bot** — Use **Setup** to scan for the device over **Bluetooth**, pick a Wi‑Fi network, and push credentials so the bot can reach your hub on the LAN.
-- **Watch the pipeline** — Live logs, streamed AI text, and optional audio/video previews when a bot is connected.
-- **Tune the bot** — Open **Pixel bot settings** (from the Pixel card) for model, system instructions, and vision. Use **Hub settings** for API keys, timezone, and optional Maps-related location (postal + country) when you want local/geo answers.
-- **Run without hardware** — Configure the hub and use text chat from the UI; connect a physical bot when you are ready.
-- **Deploy with Docker** — Single-container run with the built UI and API on one port (see [Docker](#docker) below).
+---
 
 ## Prerequisites
 
-- **Python 3** and **pip**
-- **Node.js** (for the local dev dashboard)
-- **Google AI API key** for Gemini ([Google AI Studio](https://aistudio.google.com/))
-- **Bluetooth** on the PC (for provisioning real hardware over BLE)
-- **Wi‑Fi scan (optional):** automatic SSID lists work on **Windows** (`netsh`), **Linux** with NetworkManager (`nmcli`), or **macOS** (`airport` when available). Otherwise use **Join Other Network** and type the SSID manually.
+- **Python 3.10+** and **Node.js** (LTS recommended)
+- A **Google AI (Gemini) API key** from [Google AI Studio](https://aistudio.google.com/)
+- **Bluetooth** on the PC if you will use **Setup** to provision real hardware over BLE
+- **Wi‑Fi list during setup:** SSID scan works on **Windows** (`netsh`), **Linux** with NetworkManager (`nmcli`), or **macOS** (`airport` when available). Otherwise choose **Join Other Network** and type the SSID manually
 
-## Quick start
+---
 
-1. **Clone** the repo and open a terminal at the **repository root**.
-2. **Install** dependencies once:
-   - **Windows (PowerShell):**  
-     `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` may be required the first time. Then:
-     ```powershell
-     .\scripts\install.ps1
-     ```
-   - **macOS / Linux:**
-     ```bash
-     chmod +x scripts/install.sh scripts/start.sh
-     ./scripts/install.sh
-     ```
-3. **Start** the hub and dashboard:
-   - **Windows:** `.\scripts\start.ps1` — backend opens in a **second** window; Vite runs in the current window and (by default) opens **http://127.0.0.1:5173**. To skip the browser: `$env:OMNIBOT_NO_BROWSER="1"; .\scripts\start.ps1`
-   - **macOS / Linux:** `./scripts/start.sh` — same URL unless **`OMNIBOT_NO_BROWSER=1`**. **Ctrl+C** stops the dev server; stop the backend process separately if needed.
-4. **First visit** — You do **not** need a `.env` file to begin. On first load, paste your **Gemini API key** on the welcome screen; it is saved under the hub data directory. (Optional: set `GEMINI_API_KEY` in `app/backend/.env` instead — see [`app/backend/.env.example`](app/backend/.env.example).)
+## Quick setup
 
-**Local dashboard:** **http://127.0.0.1:5173** — Vite proxies API and WebSocket paths to the backend on port **8000**.
+### 1. Install (once)
 
-### Manual start (without scripts)
+From the **repository root**:
 
-**Backend**
+**Windows (PowerShell)** — if scripts are blocked the first time: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
 
-```bash
-cd app/backend
-python -m venv .venv
-.venv\Scripts\activate          # Windows; on macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
+```powershell
+.\scripts\install.ps1
 ```
 
-**Frontend**
+**macOS / Linux**
 
 ```bash
-cd app/frontend
-npm install
-npm run dev
+chmod +x scripts/install.sh scripts/start.sh
+./scripts/install.sh
 ```
 
-Then open **http://127.0.0.1:5173**. For production-style single-port serving (built UI + API), use **Docker** below or set `OMNIBOT_STATIC_ROOT` as in `app/backend/app.py`.
+This creates `app/backend/.venv`, installs Python dependencies, and runs `npm ci` in `app/frontend`.
 
-### Pixel firmware
+### 2. Start the hub and dashboard
 
-Open `bots/Pixel` in **PlatformIO**, set `backend_ip` / `backend_port` in `src/main.cpp`, build, and upload. Full hardware notes: [`bots/Pixel/README.md`](bots/Pixel/README.md).
+**Windows**
 
-## Docker
+```powershell
+.\scripts\start.ps1
+```
 
-Prerequisites: [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows/macOS) or Docker Engine (Linux).
+The backend runs in a **second** PowerShell window. The current window runs Vite and usually opens the UI.
 
-From the repository root:
+**macOS / Linux**
+
+```bash
+./scripts/start.sh
+```
+
+Backend and Vite run in the same terminal; **Ctrl+C** stops both.
+
+- **Dashboard:** [http://127.0.0.1:5173](http://127.0.0.1:5173) (dev; Vite proxies API/WebSocket to the backend)
+- **API:** [http://127.0.0.1:8000](http://127.0.0.1:8000)
+
+To **skip auto-opening the browser**, set `OMNIBOT_NO_BROWSER=1` (PowerShell: `$env:OMNIBOT_NO_BROWSER="1"`) before `start.ps1` / `start.sh`.
+
+### 3. First launch
+
+You do **not** need a `.env` file to begin. When the UI loads, paste your **Gemini API key** on the welcome screen; it is stored in the hub data directory.
+
+Optional: set `GEMINI_API_KEY` in [`app/backend/.env`](app/backend/.env.example) instead of using the welcome screen.
+
+---
+
+## Using the application
+
+### Sidebar
+
+- **Bots** — Each connected or configured bot appears as a card. **Click a card** to open the **Dashboard** (Intelligence Feed) for that bot. **Offline** / **Ready** / **Processing** reflect connection and activity.
+- **Gear on a bot card** — Opens **Settings** with the **Pixel bot** tab selected for that device (model, instructions, vision, etc.).
+- **Hub settings** — API keys, timezone, and optional location (postal + country) for local/geo answers when you use those features.
+- **Add New Bot** — Opens **Setup**: scan for a device over **Bluetooth**, pick a Wi‑Fi network, and send credentials so the bot can join your LAN and reach the hub.
+
+### Dashboard (Intelligence Feed)
+
+After you select a bot, the main view shows **live activity**: connection status, streamed Gemini replies, logs, and optional previews when a bot is connected. Use the **text box** to send messages to Gemini through the hub (works even without hardware once the key is configured).
+
+### Settings
+
+Two tabs:
+
+| Tab | Purpose |
+|-----|--------|
+| **Pixel bot** | Per-bot options: model, system instructions, vision, and related behavior for the selected bot. |
+| **Hub / application** | Hub-wide secrets and preferences (Gemini key, timezone, optional Maps-related settings). |
+
+Open **Hub settings** from the sidebar, or **Pixel bot** via the gear on a bot card.
+
+### Setup (Wi‑Fi provisioning)
+
+Use **Add New Bot** when the device shows **BLE SETUP** (first boot or after clearing Wi‑Fi). On the PC, allow Bluetooth when prompted, pick your **Pixel** (or supported device), choose the network, and send the password. After the bot joins Wi‑Fi and connects to the hub, it appears under **Bots**.
+
+For provisioning, prefer running the hub **on the host** (not only inside Docker) if Bluetooth is unreliable in containers.
+
+### Docker (single URL)
+
+With [Docker](https://www.docker.com/products/docker-desktop/), from the repo root:
 
 ```bash
 docker compose up --build
 ```
 
-Open **http://localhost:8080** (host **8080** → container **8000**). Paste your Gemini key on the welcome screen if you did not set `GEMINI_API_KEY`.
+Open **[http://localhost:8080](http://localhost:8080)** (host **8080** maps to container **8000**). Paste your Gemini key in the UI if you did not set `GEMINI_API_KEY`.
 
-- **Data:** A named volume keeps hub JSON (`bot_settings.json`, `hub_secrets.json`, etc.) across restarts. To wipe hub data: `docker compose down -v` (destructive).
-- **Secrets:** Prefer environment variables (e.g. in `.env` next to `docker-compose.yml`) over committing keys.
-- **Ports:** Edit the left side of `ports` in [`docker-compose.yml`](docker-compose.yml) if **8080** is in use. Point Pixel’s firmware at your **host LAN IP** and the mapped port (not `localhost` from the device).
-- **BLE from Docker:** Bluetooth/Wi‑Fi setup from inside desktop containers is often limited; use the **host** install for provisioning if the UI cannot see adapters, then return to Docker for day-to-day use if you prefer.
+- **Persisted data:** A Docker volume stores hub JSON (`bot_settings.json`, secrets, etc.). To wipe: `docker compose down -v` (destructive).
+- **Bots on the LAN:** Point firmware at your **PC’s LAN IP** and the **mapped port** (e.g. **8080**), not `127.0.0.1` from the device.
 
-Details: [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml).
+More detail: [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml).
+
+### Pixel firmware (optional)
+
+Build and flash from [`bots/Pixel`](bots/Pixel) with **PlatformIO**. Set `backend_ip` and `backend_port` in firmware to match your hub (LAN IP; port **8000** for local dev, **8080** for default Docker). Full device usage (gestures, on-screen menus, Wi‑Fi recovery): [`bots/Pixel/README.md`](bots/Pixel/README.md).
+
+---
 
 ## Optional configuration
 
-Advanced environment variables (Nominatim user-agent, Maps API keys, debug flags, data directory) are documented in [`app/backend/.env.example`](app/backend/.env.example). Hub secrets can also be set from **Hub settings** in the UI; environment variables override file-based values at runtime.
+Extra environment variables (Nominatim user-agent, Maps keys, data directory, debug) are listed in [`app/backend/.env.example`](app/backend/.env.example). Values set in the environment override file-based settings at runtime where applicable.
 
-## Repository layout
+---
 
-```
-OmniBot/
-├── app/
-│   ├── backend/          # FastAPI hub (Gemini, provisioning, WebSockets)
-│   └── frontend/         # React + Vite dashboard
-├── scripts/              # install.ps1 / install.sh, start.ps1 / start.sh
-├── Dockerfile
-├── docker-compose.yml
-└── bots/
-    └── Pixel/            # Seeed XIAO ESP32S3 Sense (PlatformIO)
-```
+## Manual start (no scripts)
 
-## For developers
+**Backend:** `cd app/backend` → create/activate venv → `pip install -r requirements.txt` → `python app.py`  
+**Frontend:** `cd app/frontend` → `npm install` → `npm run dev` → open [http://127.0.0.1:5173](http://127.0.0.1:5173)
 
-The hub exposes REST routes under `/api` and `/setup`, WebSockets for bot streams (`/ws/stream`) and the dashboard monitor (`/ws/monitor`), and serves the built UI when configured. Internals (conversation memory, Search vs Maps tooling, semantic routing, binary frame types) are implemented in `app/backend/app.py` and dependencies listed in `app/backend/requirements.txt`.
-
-| Bot | Board | Doc |
-|-----|-------|-----|
-| **Pixel** | Seeed XIAO ESP32S3 Sense + round display | [`bots/Pixel/README.md`](bots/Pixel/README.md) |
+---
 
 ## License
 

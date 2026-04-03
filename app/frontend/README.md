@@ -1,16 +1,37 @@
-# React + Vite
+# OmniBot dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This folder is the **web UI** for OmniBot: React + Vite. In development it talks to the FastAPI hub on port **8000** via the Vite dev proxy.
 
-Currently, two official plugins are available:
+## Quick setup
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+From the **repository root** (recommended):
 
-## React Compiler
+1. Run `.\scripts\install.ps1` (Windows) or `./scripts/install.sh` (macOS/Linux) once.
+2. Run `.\scripts\start.ps1` or `./scripts/start.sh` — this starts the backend and `npm run dev` here.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+Then open **[http://127.0.0.1:5173](http://127.0.0.1:5173)**.
 
-## Expanding the ESLint configuration
+## Using the app
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+- **First visit:** Paste your Gemini API key if prompted.
+- **Sidebar:** Pick a **bot**, open **Hub settings**, or **Add New Bot** for Bluetooth Wi‑Fi setup.
+- **Main area:** **Intelligence Feed** (chat and live activity) or **Setup** / **Settings** depending on what you chose.
+
+See the [root README](../../README.md) for full usage.
+
+## Development without the repo scripts
+
+1. Start the backend: `cd ../backend`, activate the venv, `python app.py`.
+2. In this folder: `npm ci` (or `npm install`), then `npm run dev`.
+
+Same URL: **http://127.0.0.1:5173**.
+
+## Production build
+
+The Docker image runs `npm run build` and serves the static files from the backend. Locally:
+
+```bash
+npm run build
+```
+
+Output is in `dist/`. The backend serves it when `OMNIBOT_STATIC_ROOT` points at that folder (see root README and `Dockerfile`).
