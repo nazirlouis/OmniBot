@@ -215,20 +215,16 @@ function App() {
                   live === undefined ? 'online' : live ? 'online' : 'offline',
               }));
             }
-            const hasMapsSources = message.maps_sources && message.maps_sources.length > 0;
             const hasSearchSources = message.search_sources && message.search_sources.length > 0;
             const hasSearchQueries = message.search_queries && message.search_queries.length > 0;
-            const mapsToken = message.maps_widget_context_token;
-            if (hasMapsSources || mapsToken || hasSearchSources || hasSearchQueries) {
+            if (hasSearchSources || hasSearchQueries) {
               setLogs((prev) =>
                 prev.map((log) =>
                   log.sender === 'ai' && log.streamId === message.stream_id
                     ? {
                         ...log,
-                        ...(hasMapsSources ? { mapsSources: message.maps_sources } : {}),
                         ...(hasSearchSources ? { searchSources: message.search_sources } : {}),
                         ...(hasSearchQueries ? { searchQueries: message.search_queries } : {}),
-                        ...(mapsToken ? { mapsWidgetContextToken: mapsToken } : {}),
                       }
                     : log
                 )
@@ -247,25 +243,7 @@ function App() {
           } else if (message.type === 'tool_call') {
             const args = message.arguments || {};
             const argsStr = Object.entries(args).map(([k, v]) => `${k}: ${v}`).join(', ');
-            const fnName = String(message.function_name ?? '').toLowerCase();
-            if (fnName.includes('show_weather')) {
-              const condition = String(args.condition ?? args.sky_condition ?? args.cond ?? '');
-              const temperatureRaw = args.temperature ?? args.temp ?? 0;
-              const temperature = Number(temperatureRaw);
-              addLog('tool', `${message.function_name}(${argsStr})`, {
-                toolType: 'show_weather',
-                weatherCondition: condition,
-                weatherTemperature: Number.isFinite(temperature) ? temperature : 0,
-                durationMs: 5000,
-              });
-            } else if (fnName.includes('face_animation') && String(args.animation ?? '').toLowerCase() === 'map') {
-              addLog('tool', `${message.function_name}(${argsStr}) — map snapshot on Pixel`);
-            } else if (fnName.includes('show_map_animation')) {
-              const mapStyle = String(args.display_style ?? 'calling_card');
-              addLog('tool', `${message.function_name}(${argsStr}) — ${mapStyle} map on Pixel`);
-            } else {
-              addLog('tool', `${message.function_name}(${argsStr})`);
-            }
+            addLog('tool', `${message.function_name}(${argsStr})`);
           }
         } catch {
           console.error('Failed to parse message:', event.data);

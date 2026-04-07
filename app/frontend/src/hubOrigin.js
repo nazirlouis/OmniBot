@@ -16,7 +16,7 @@ export function getHubHttpOrigin() {
 }
 
 /**
- * @param {string} path e.g. /api/hub-config
+ * @param {string} path e.g. /api/hub/status
  */
 export function hubUrl(path) {
   const p = path.startsWith('/') ? path : `/${path}`;

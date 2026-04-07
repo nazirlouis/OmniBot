@@ -1,182 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
 import './IntelligenceFeed.css';
-import {
-  loadMapsPlacesForContextual,
-  resolveMapsJsApiKey
-} from '../mapsContextualLoader';
-
-const normalizeWeatherCondition = (condition) => {
-  return String(condition ?? '')
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, '_')
-    .replace(/-/g, '_');
-};
-
-const prettyWeatherCondition = (condition) => {
-  const c = normalizeWeatherCondition(condition);
-  switch (c) {
-    case 'sunny':
-      return 'Sunny';
-    case 'cloudy':
-      return 'Cloudy';
-    case 'partially_cloudy':
-      return 'Partly Cloudy';
-    case 'raining':
-      return 'Raining';
-    case 'snowing':
-      return 'Snowing';
-    default:
-      return c ? c.replace(/_/g, ' ') : 'Weather';
-  }
-};
-
-const parseShowWeatherFromText = (text) => {
-  // Expected tool-call text shape from App.jsx:
-  // show_weather(condition: cloudy, temperature: 72)
-  const raw = String(text ?? '');
-  if (!/show_weather/i.test(raw)) return null;
-
-  const conditionMatch = raw.match(/condition\s*:\s*([^,)]+)/i);
-  const temperatureMatch = raw.match(/temperature\s*:\s*([-+]?\d*\.?\d+)/i);
-
-  const condition = conditionMatch ? conditionMatch[1].trim() : '';
-  const temperature = temperatureMatch ? Number(temperatureMatch[1]) : 0;
-
-  if (!condition && !Number.isFinite(temperature)) return null;
-  return { condition, temperature };
-};
-
-const MapsGroundingSources = ({ sources }) => {
-  if (!sources || sources.length === 0) return null;
-  const uniqueSources = [];
-  const seen = new Set();
-  for (const s of sources) {
-    const key = `${String(s?.title || '').trim()}|${String(s?.uri || '').trim()}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      uniqueSources.push(s);
-    }
-  }
-  const visible = uniqueSources.slice(0, 6);
-  const hiddenCount = Math.max(0, uniqueSources.length - visible.length);
-  return (
-    <div className="maps-grounding-sources">
-      <p className="maps-grounding-line">
-        {visible.map((s, i) => (
-          <span key={`${s.uri || 'source'}-${i}`}>
-            {i > 0 && <span>, </span>}
-            <a href={s.uri} target="_blank" rel="noopener noreferrer">
-              {s.title || 'Place'}
-            </a>
-          </span>
-        ))}
-        {hiddenCount > 0 && <span>{` (+${hiddenCount} more)`}</span>}
-      </p>
-      <p className="gmp-attribution" translate="no">
-        Google Maps
-      </p>
-    </div>
-  );
-};
-
-const MapsContextualWidget = ({ contextToken }) => {
-  const hostRef = useRef(null);
-  const [phase, setPhase] = useState('loading');
-
-  useEffect(() => {
-    const token = String(contextToken || '').trim();
-    if (!token) return undefined;
-
-    let cancelled = false;
-    const hostEl = hostRef.current;
-
-    (async () => {
-      try {
-        const apiKey = await resolveMapsJsApiKey();
-        if (!apiKey) {
-          if (!cancelled) setPhase('no_key');
-          return;
-        }
-        await loadMapsPlacesForContextual(apiKey);
-        if (cancelled || !hostEl) return;
-        hostEl.replaceChildren();
-        const el = document.createElement('gmp-place-contextual');
-        el.contextToken = token;
-        hostEl.appendChild(el);
-        if (!cancelled) setPhase('ready');
-      } catch {
-        if (!cancelled) setPhase('error');
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      hostEl?.replaceChildren();
-    };
-  }, [contextToken]);
-
-  if (!String(contextToken || '').trim()) return null;
-
-  return (
-    <div className="maps-contextual-wrap">
-      {phase === 'loading' && (
-        <p className="maps-widget-hint">Loading map widget…</p>
-      )}
-      {phase === 'no_key' && (
-        <p className="maps-widget-hint maps-widget-hint-warn">
-          Set <code>GOOGLE_MAPS_API_KEY</code> in the hub backend environment (or{' '}
-          <code>VITE_GOOGLE_MAPS_API_KEY</code> in the dashboard build) to show the contextual Google Maps
-          widget. Use a key with the Maps JavaScript API enabled.
-        </p>
-      )}
-      {phase === 'error' && (
-        <p className="maps-widget-hint maps-widget-hint-warn">
-          Could not load the Google Maps contextual widget.
-        </p>
-      )}
-      <div ref={hostRef} className="maps-contextual-host" />
-    </div>
-  );
-};
-
-const MapsStableEmbed = ({ sources }) => {
-  if (!sources || sources.length === 0) return null;
-  const first = sources.find((s) => String(s?.title || '').trim() || String(s?.uri || '').trim());
-  if (!first) return null;
-  const query = String(first.title || first.uri || '').trim();
-  if (!query) return null;
-  const src = `https://www.google.com/maps?output=embed&q=${encodeURIComponent(query)}`;
-  return (
-    <div className="maps-embed-wrap">
-      <iframe
-        className="maps-embed-iframe"
-        title="Google Maps results"
-        src={src}
-        loading="lazy"
-        referrerPolicy="no-referrer-when-downgrade"
-      />
-    </div>
-  );
-};
-
-const MapsGroundingBlock = ({ sources, widgetContextToken }) => {
-  const hasSources = sources && sources.length > 0;
-  const token = String(widgetContextToken || '').trim();
-  if (!hasSources && !token) return null;
-  return (
-    <div className="maps-grounding-block">
-      {hasSources && <MapsStableEmbed sources={sources} />}
-      {hasSources && <MapsGroundingSources sources={sources} />}
-      {!hasSources && token && <MapsContextualWidget key={token} contextToken={token} />}
-      {token && !hasSources && (
-        <p className="gmp-attribution" translate="no">
-          Google Maps
-        </p>
-      )}
-    </div>
-  );
-};
 
 const SearchGroundingBlock = ({ sources, queries }) => {
   const hasSources = sources && sources.length > 0;
@@ -206,91 +29,6 @@ const SearchGroundingBlock = ({ sources, queries }) => {
           Search queries: {queries.join(' | ')}
         </p>
       )}
-    </div>
-  );
-};
-
-const WeatherOverlay = ({ condition, temperature, durationMs = 5000 }) => {
-  const [animating, setAnimating] = useState(true);
-
-  useEffect(() => {
-    setAnimating(true);
-    const t = setTimeout(() => setAnimating(false), durationMs);
-    return () => clearTimeout(t);
-  }, [condition, temperature, durationMs]);
-
-  const kind = normalizeWeatherCondition(condition);
-  const tempF = Number.isFinite(Number(temperature)) ? Number(temperature) : 0;
-  const tempRounded = Math.round(tempF);
-
-  const showSun = kind === 'sunny' || kind === 'partially_cloudy';
-  const showCloud =
-    kind === 'cloudy' || kind === 'partially_cloudy' || kind === 'raining' || kind === 'snowing';
-  const showRain = kind === 'raining';
-  const showSnow = kind === 'snowing';
-
-  return (
-    <div className={`weather-overlay ${animating ? 'animating' : 'stopped'}`}>
-      <svg
-        className="weather-svg"
-        viewBox="0 0 200 120"
-        aria-label={`Weather: ${prettyWeatherCondition(kind)}`}
-        role="img"
-      >
-        <g className="weather-ring">
-          <circle cx="100" cy="60" r="46" fill="none" stroke="rgba(88, 166, 255, 0.35)" strokeWidth="4" />
-        </g>
-
-        <g className={`sun ${showSun ? '' : 'is-hidden'} ${animating ? '' : 'is-stopped'}`}>
-          <circle cx="78" cy="48" r="20" fill="rgba(248, 186, 73, 0.95)" />
-          <g className="sun-rays">
-            <line x1="78" y1="18" x2="78" y2="30" stroke="rgba(248, 186, 73, 0.95)" strokeWidth="5" strokeLinecap="round" />
-            <line x1="78" y1="66" x2="78" y2="78" stroke="rgba(248, 186, 73, 0.95)" strokeWidth="5" strokeLinecap="round" />
-            <line x1="48" y1="48" x2="60" y2="48" stroke="rgba(248, 186, 73, 0.95)" strokeWidth="5" strokeLinecap="round" />
-            <line x1="96" y1="48" x2="108" y2="48" stroke="rgba(248, 186, 73, 0.95)" strokeWidth="5" strokeLinecap="round" />
-            <line x1="55" y1="28" x2="63" y2="36" stroke="rgba(248, 186, 73, 0.95)" strokeWidth="5" strokeLinecap="round" />
-            <line x1="93" y1="60" x2="101" y2="68" stroke="rgba(248, 186, 73, 0.95)" strokeWidth="5" strokeLinecap="round" />
-            <line x1="55" y1="68" x2="63" y2="60" stroke="rgba(248, 186, 73, 0.95)" strokeWidth="5" strokeLinecap="round" />
-            <line x1="93" y1="36" x2="101" y2="28" stroke="rgba(248, 186, 73, 0.95)" strokeWidth="5" strokeLinecap="round" />
-          </g>
-        </g>
-
-        <g className={`cloud ${showCloud ? '' : 'is-hidden'} ${kind === 'partially_cloudy' ? 'partially' : ''}`}>
-          <g className="cloud-bob">
-            <ellipse cx="112" cy="62" rx="40" ry="22" fill="rgba(160, 200, 255, 0.85)" />
-            <ellipse cx="90" cy="58" rx="26" ry="18" fill="rgba(160, 200, 255, 0.85)" />
-            <ellipse cx="136" cy="54" rx="24" ry="16" fill="rgba(160, 200, 255, 0.85)" />
-            <path
-              d="M62,76 C64,58 82,50 98,56 C104,40 125,38 135,52 C154,52 168,63 168,78 L62,78 Z"
-              fill="rgba(132, 182, 255, 0.88)"
-            />
-          </g>
-        </g>
-
-        <g className={`rain ${showRain ? '' : 'is-hidden'}`}>
-          <g className="rain-group">
-            <line className="rain-drop d1" x1="110" y1="82" x2="100" y2="110" stroke="rgba(90, 160, 255, 0.9)" strokeWidth="4" strokeLinecap="round" />
-            <line className="rain-drop d2" x1="130" y1="82" x2="120" y2="110" stroke="rgba(90, 160, 255, 0.9)" strokeWidth="4" strokeLinecap="round" />
-            <line className="rain-drop d3" x1="150" y1="82" x2="140" y2="110" stroke="rgba(90, 160, 255, 0.9)" strokeWidth="4" strokeLinecap="round" />
-            <line className="rain-drop d4" x1="90" y1="82" x2="80" y2="110" stroke="rgba(90, 160, 255, 0.9)" strokeWidth="4" strokeLinecap="round" />
-          </g>
-        </g>
-
-        <g className={`snow ${showSnow ? '' : 'is-hidden'}`}>
-          <g className="snow-group">
-            <circle className="snowflake f1" cx="115" cy="86" r="5" fill="rgba(240, 245, 255, 0.95)" />
-            <circle className="snowflake f2" cx="135" cy="82" r="4" fill="rgba(240, 245, 255, 0.95)" />
-            <circle className="snowflake f3" cx="153" cy="90" r="4.5" fill="rgba(240, 245, 255, 0.95)" />
-            <circle className="snowflake f4" cx="95" cy="90" r="4" fill="rgba(240, 245, 255, 0.95)" />
-            <circle className="snowflake f5" cx="75" cy="84" r="3.5" fill="rgba(240, 245, 255, 0.95)" />
-          </g>
-        </g>
-      </svg>
-
-      <div className="weather-overlay-meta">
-        <div className="weather-temp">{tempRounded}°F</div>
-        <div className="weather-condition">{prettyWeatherCondition(kind)}</div>
-      </div>
     </div>
   );
 };
@@ -337,13 +75,10 @@ const IntelligenceFeed = ({
         ) : (
           <div className="messages-area">
             {logs.map((log) => {
-              const hasMapContent =
-                Boolean(log.mapsWidgetContextToken) ||
-                (Array.isArray(log.mapsSources) && log.mapsSources.length > 0);
               return (
               <div
                 key={log.id}
-                className={`message-bubble ${log.sender}${hasMapContent ? ' has-map-widget' : ''}`}
+                className={`message-bubble ${log.sender}`}
               >
                 <div className="message-meta">
                   <span className="message-sender">
@@ -375,19 +110,6 @@ const IntelligenceFeed = ({
                       src={log.text}
                       controls
                     />
-                  ) : /show_weather/i.test(log.text) ? (
-                    (() => {
-                      const parsed = log.toolType === 'show_weather' ? null : parseShowWeatherFromText(log.text);
-                      const condition = log.toolType === 'show_weather' ? log.weatherCondition : parsed?.condition;
-                      const temperature = log.toolType === 'show_weather' ? log.weatherTemperature : parsed?.temperature;
-                      return (
-                        <WeatherOverlay
-                          condition={condition}
-                          temperature={temperature ?? 0}
-                          durationMs={log.durationMs ?? 5000}
-                        />
-                      );
-                    })()
                   ) : log.sender === 'tool' ? (
                     <code className="tool-call-code">{log.text}</code>
                   ) : (
@@ -395,10 +117,6 @@ const IntelligenceFeed = ({
                       {log.text}
                       {log.sender === 'ai' && (
                         <>
-                          <MapsGroundingBlock
-                            sources={log.mapsSources}
-                            widgetContextToken={log.mapsWidgetContextToken}
-                          />
                           <SearchGroundingBlock
                             sources={log.searchSources}
                             queries={log.searchQueries}

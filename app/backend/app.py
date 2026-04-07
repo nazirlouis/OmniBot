@@ -15,14 +15,12 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from google.genai import types
 import json
-import re
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
 
-from semantic_pixel_router import classify_retrieval_with_reason
 from wifi_scan import scan_wifi_ssids
 
 from hub_config import (
@@ -31,9 +29,6 @@ from hub_config import (
     SETTINGS_FILE,
     get_genai_client,
     get_gemini_api_key,
-    get_google_maps_js_api_key,
-    get_maps_key_js_for_screenshot,
-    get_maps_key_static_then_js,
     get_nominatim_user_agent_raw,
     hub_public_status,
     hub_settings_public_view,
@@ -61,33 +56,20 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "- Use the `show_face_animation` / `face_animation` tool for conversational or emotional states only "
     "(animation = speaking, happy, or mad). For these, pass at most two short words that summarize your "
     "overall reply (e.g. \"thanks\", \"nice one\").\n"
-    "- Use the `show_weather_animation` tool only when the user asks about weather or conditions. Represent "
-    "the weather as a condition plus numeric Fahrenheit temperature.\n"
-    "- ALWAYS call `show_map_animation` whenever you answer any question about directions, navigation, "
-    "nearby places, or specific businesses — regardless of whether you used Google Maps grounding.\n"
-    "  * Use display_style='directions' when the user asks how to get somewhere or needs navigation. "
-    "Pass the destination street address in the location field.\n"
-    "  * Use display_style='calling_card' when the user asks about a specific place or business. "
-    "Pass the BUSINESS NAME and city (e.g. '[BUSINESS_NAME], [CITY]') NOT a street address.\n\n"
     "At most one animation tool should be used per turn. Do not call more than one of: "
-    "`face_animation`, `show_face_animation`, `show_weather_animation`, or `show_map_animation` in the same turn.\n\n"
+    "`face_animation` or `show_face_animation` in the same turn.\n\n"
     "When asked about food, activities, or places near me, provide exactly ONE recommendation and do not list multiple options."
 )
 
-WEATHER_DISPLAY_MS = 5000
 FACE_ANIMATION_DISPLAY_MS = 2500
 MAP_DISPLAY_MS = 9000
-
-# Calling card full-bleed square for round display (must match Pixel defaults / decode size)
+# Legacy calling-card constants retained to keep residual helper code import-safe.
 CALLING_CARD_PHOTO_W = 240
 CALLING_CARD_PHOTO_H = 240
 CALLING_CARD_NAME_MAX = 80
 CALLING_CARD_ADDRESS_MAX = 120
 CALLING_CARD_CATEGORY_MAX = 48
-
-# links2004/WebSockets defaults to WEBSOCKETS_MAX_DATA_SIZE = 15KB on ESP32; binary frames must fit.
 CALLING_CARD_JPEG_MAX_BYTES = 14 * 1024
-
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 
 
@@ -99,7 +81,7 @@ def _nominatim_user_agent_header() -> str:
 
 
 def _maps_debug_enabled() -> bool:
-    return os.getenv("OMNIBOT_MAPS_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+    return False
 
 
 def _maps_debug(msg: str) -> None:
@@ -108,12 +90,7 @@ def _maps_debug(msg: str) -> None:
 
 
 def _route_debug_enabled() -> bool:
-    return os.getenv("OMNIBOT_ROUTE_DEBUG", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ) or _maps_debug_enabled()
+    return os.getenv("OMNIBOT_ROUTE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _route_debug(msg: str) -> None:
@@ -121,80 +98,13 @@ def _route_debug(msg: str) -> None:
         print(f"[Omnibot/route-debug] {msg}")
 
 
-def _routing_text_from_message_content(message_content) -> str:
-    """Text used only for semantic Maps vs Search routing (not sent to the model)."""
-    if isinstance(message_content, str):
-        return message_content.strip()
-    if isinstance(message_content, list):
-        parts: list[str] = []
-        for item in message_content:
-            if isinstance(item, str):
-                s = item.strip()
-                if s:
-                    parts.append(s)
-        return " ".join(parts).strip()
-    return ""
-
 # Event loop used to push WebSocket messages from sync Gemini tool invocations (worker threads).
 _main_async_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # OpenAPI-style declarations matching Gemini function-calling docs
 # (https://ai.google.dev/gemini-api/docs/function-calling — combine with Google Search).
-# The executable implementations are `_make_show_weather_tool` and `_make_show_map_animation_tool`
+# The executable implementations are `_make_face_animation_tool`
 # (automatic function calling).
-SHOW_WEATHER_FUNCTION_DECLARATION = {
-    "name": "show_weather_animation",
-    "description": (
-        "Shows weather on the robot round display for several seconds. "
-        "You MUST call this function EVERY TIME after you use Google Search to retrieve the current weather. Do NOT answer a weather question without calling this function immediately after checking the search results."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "condition": {
-                "type": "string",
-                "enum": ["sunny", "cloudy", "partially_cloudy", "raining", "snowing"],
-                "description": "Sky / precipitation style for the on-device icon.",
-            },
-            "temperature": {
-                "type": "number",
-                "description": "Air temperature in degrees Fahrenheit (numeric only, e.g. 72).",
-            },
-        },
-        "required": ["condition", "temperature"],
-    },
-}
-
-SHOW_MAP_ANIMATION_FUNCTION_DECLARATION = {
-    "name": "show_map_animation",
-    "description": (
-        "Shows a map on the robot round display for several seconds. "
-        "You MUST call this function EVERY TIME after you use Google Maps to lookup locations, directions, or places. "
-        "Do NOT answer a location or navigation question without calling this function immediately after checking the map results. "
-        "Always pass the specific address or place name in the 'location' parameter so the correct location is shown on the robot display. "
-        "Choose display_style='directions' for navigation/routing questions, or display_style='calling_card' for general place/business lookups."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "location": {
-                "type": "string",
-                "description": "For display_style='calling_card': pass the BUSINESS NAME and city (e.g. '[BUSINESS_NAME], [CITY]'), NOT a raw street address — the business name allows the photo to be fetched correctly. For display_style='directions': a street address or place name is fine (e.g. '[STREET_ADDRESS], [CITY], [STATE]').",
-            },
-            "display_style": {
-                "type": "string",
-                "enum": ["calling_card", "directions"],
-                "description": (
-                    "How to render the map on the robot display. "
-                    "Use 'directions' when the user asks how to get somewhere or needs turn-by-turn navigation — shows a route from their home to the destination. "
-                    "Use 'calling_card' when the user asks generally about a place, business, or landmark — shows the place name, address, photo, and review score."
-                ),
-            },
-        },
-        "required": ["location", "display_style"],
-    },
-}
-
 FACE_ANIMATION_FUNCTION_DECLARATION = {
     "name": "face_animation",
     "description": (
@@ -208,9 +118,7 @@ FACE_ANIMATION_FUNCTION_DECLARATION = {
             "animation": {
                 "type": "string",
                 "enum": ["speaking", "happy", "mad"],
-                "description": (
-                    "Display mode: speaking, happy, or mad. Do not use this tool for weather or maps."
-                ),
+                "description": ("Display mode: speaking, happy, or mad."),
             },
             "words": {
                 "type": "string",
@@ -225,14 +133,8 @@ FACE_ANIMATION_FUNCTION_DECLARATION = {
 
 # Per-device, per-turn tool usage guardrails.
 turn_tool_state_by_device: dict[str, dict[str, bool]] = {}
-
-# Latest Maps widget context token seen while streaming (for face_animation(map) -> screenshot).
-maps_widget_token_latest_by_device: dict[str, str] = {}
-# Avoid sending duplicate map JPEGs in the same turn (face_animation path vs end-of-turn fallback).
 map_jpeg_sent_this_turn_by_device: dict[str, bool] = {}
-# Store explicit location from show_map_animation tool call for end-of-turn map rendering.
 map_location_override_by_device: dict[str, str] = {}
-# Store display_style from show_map_animation tool call for end-of-turn rendering.
 map_display_style_by_device: dict[str, str] = {}
 
 def get_all_settings():
@@ -315,7 +217,7 @@ def list_registered_bots() -> list[dict[str, Any]]:
 
 
 def get_bot_settings(device_id: str):
-    """Merge per-device Pixel fields from bot_settings.json with hub-wide location/clock from hub_app_settings.json."""
+    """Merge per-device Pixel fields from bot_settings.json with hub-wide clock settings."""
     settings = get_all_settings()
     bot_conf = settings.get(device_id, {})
     hub = load_hub_app_settings()
@@ -324,14 +226,6 @@ def get_bot_settings(device_id: str):
         "system_instruction": bot_conf.get("system_instruction", DEFAULT_SYSTEM_INSTRUCTION),
         "vision_enabled": bool(bot_conf.get("vision_enabled", DEFAULT_VISION_ENABLED)),
         "timezone_rule": hub.get("timezone_rule", DEFAULT_TIMEZONE_RULE),
-        "maps_grounding_enabled": bool(hub.get("maps_grounding_enabled", False)),
-        "maps_street": (hub.get("maps_street") or "").strip(),
-        "maps_state": (hub.get("maps_state") or "").strip(),
-        "maps_postal_code": (hub.get("maps_postal_code") or "").strip(),
-        "maps_country": (hub.get("maps_country") or "").strip(),
-        "maps_latitude": hub.get("maps_latitude"),
-        "maps_longitude": hub.get("maps_longitude"),
-        "maps_display_name": hub.get("maps_display_name"),
     }
 
 
@@ -342,98 +236,6 @@ def _default_stored_bot_settings() -> dict:
         "system_instruction": DEFAULT_SYSTEM_INSTRUCTION,
         "vision_enabled": DEFAULT_VISION_ENABLED,
     }
-
-
-def _geocode_address(street: str, state: str, postal: str, country: str) -> tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
-    """Resolve location via Google Maps Geocoding or fallback to public Nominatim. Returns (lat, lon, display_name, error)."""
-    st = (street or "").strip()
-    sa = (state or "").strip()
-    pc = (postal or "").strip()
-    cc = (country or "").strip()
-    
-    if not (st or pc):
-        return None, None, None, "Enter a postal code, ZIP, or full address."
-        
-    parts = []
-    if st:
-        parts.append(st)
-    if sa:
-        parts.append(sa)
-    if pc:
-        parts.append(pc)
-        
-    if cc:
-        if len(cc) == 2 and cc.isalpha():
-            parts.append(cc.upper())
-        else:
-            parts.append(cc)
-        
-    q = ", ".join(parts)
-    
-    # Try Google Geocoding first if key available
-    g_key = get_maps_key_static_then_js()
-    if g_key:
-        try:
-            params = urlencode({"address": q, "key": g_key.strip()})
-            url = f"https://maps.googleapis.com/maps/api/geocode/json?{params}"
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            if data.get("status") == "OK" and data.get("results"):
-                hit = data["results"][0]
-                lat = float(hit["geometry"]["location"]["lat"])
-                lon = float(hit["geometry"]["location"]["lng"])
-                disp = hit.get("formatted_address") or q
-                return lat, lon, disp, None
-        except Exception as e:
-            print(f"Google Maps Geocoding fallback to Nominatim due to error: {e}")
-
-    ua = _nominatim_user_agent_header()
-    headers = {"User-Agent": ua, "Accept": "application/json"}
-    try:
-        params = urlencode({"q": q, "format": "json", "limit": "1"})
-        url = f"{NOMINATIM_SEARCH_URL}?{params}"
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None, None, None, f'No results found for "{q}".'
-        hit = data[0]
-        lat = float(hit["lat"])
-        lon = float(hit["lon"])
-        disp = (hit.get("display_name") or "").strip() or q
-        return lat, lon, disp, None
-    except Exception as e:
-        return None, None, None, str(e)
-
-
-def _extract_maps_sources_from_grounding_metadata(gm) -> list[dict]:
-    """Build link list for hub UI (Google Maps grounding attribution)."""
-    if gm is None:
-        return []
-    chunks = getattr(gm, "grounding_chunks", None) or []
-    by_uri: dict[str, dict] = {}
-    for ch in chunks:
-        maps = getattr(ch, "maps", None)
-        if maps is None:
-            continue
-        uri = getattr(maps, "uri", None) or getattr(maps, "google_maps_uri", None)
-        if not uri:
-            continue
-        title = (getattr(maps, "title", None) or "").strip() or "Place"
-        by_uri[str(uri)] = {"title": title, "uri": str(uri)}
-    return list(by_uri.values())
-
-
-def _extract_maps_widget_token_from_grounding_metadata(gm) -> Optional[str]:
-    """Context token for the Maps JavaScript contextual Places widget (Gemini Maps grounding)."""
-    if gm is None:
-        return None
-    tok = getattr(gm, "google_maps_widget_context_token", None)
-    if tok is None:
-        return None
-    s = str(tok).strip()
-    return s or None
 
 
 def _extract_search_sources_from_grounding_metadata(gm) -> tuple[list[dict], list[str]]:
@@ -521,98 +323,28 @@ def _google_search_builtin():
     return types.GoogleSearch()
 
 
-def _google_maps_builtin():
-    """Built-in Google Maps grounding tool (Gemini API)."""
-    ctor = getattr(types, "ToolGoogleMaps", None)
-    if ctor is not None:
-        return ctor(enable_widget=True)
-    return types.GoogleMaps(enable_widget=True)
-
-
 def _pixel_chat_generate_config(
     *,
     system_instruction,
     device_id: str,
-    prefer_maps: bool = False,
 ) -> types.GenerateContentConfig:
     """Tools + server-side tool flag per Gemini 3 multi-tool docs.
 
-    The Gemini API does not allow ``google_maps`` and ``google_search`` in the same
-    request (400 INVALID_ARGUMENT).     When ``prefer_maps`` is true and Maps grounding
-    is enabled with stored coordinates, we attach only ``google_maps`` +
-    ``face_animation``; otherwise ``google_search`` + ``face_animation``.
-    On maps turns the model should call ``face_animation(animation=map)`` so the hub can
-    screenshot the grounded map and push JPEG to the ESP32.
+    Maps functionality is removed; use Search + local function tools.
     """
-    bot = get_bot_settings(device_id)
-
     custom_declarations = [
         types.FunctionDeclaration(**FACE_ANIMATION_FUNCTION_DECLARATION),
-        types.FunctionDeclaration(**SHOW_WEATHER_FUNCTION_DECLARATION),
-        types.FunctionDeclaration(**SHOW_MAP_ANIMATION_FUNCTION_DECLARATION),
     ]
-
-    use_maps = bool(bot.get("maps_grounding_enabled"))
-    lat, lng = bot.get("maps_latitude"), bot.get("maps_longitude")
-    maps_tool_active = prefer_maps and use_maps and lat is not None and lng is not None
-    if prefer_maps and use_maps and (lat is None or lng is None) and _maps_debug_enabled():
-        _maps_debug(
-            "Semantic router chose Maps for this turn, but lat/lng are missing — using Google Search instead."
-        )
-
-    if maps_tool_active:
-        tools = [
-            types.Tool(google_maps=_google_maps_builtin()),
-            types.Tool(function_declarations=custom_declarations)
-        ]
-    else:
-        tools = [
-            types.Tool(google_search=_google_search_builtin()),
-            types.Tool(function_declarations=custom_declarations)
-        ]
-
-    tool_cfg_kwargs: dict = {"include_server_side_tool_invocations": True}
-    if maps_tool_active:
-        tool_cfg_kwargs["retrieval_config"] = types.RetrievalConfig(
-            lat_lng=types.LatLng(latitude=float(lat), longitude=float(lng)),
-        )
-    if _maps_debug_enabled():
-        tool_slots = []
-        for i, t in enumerate(tools):
-            if getattr(t, "google_maps", None) is not None:
-                tool_slots.append(f"{i}:google_maps")
-            elif getattr(t, "google_search", None) is not None:
-                tool_slots.append(f"{i}:google_search")
-            else:
-                tool_slots.append(f"{i}:function_or_other")
-        ll_info = "none"
-        rc = tool_cfg_kwargs.get("retrieval_config")
-        if rc is not None:
-            ll = getattr(rc, "lat_lng", None)
-            if ll is not None:
-                ll_info = f"lat={getattr(ll, 'latitude', None)!r} lng={getattr(ll, 'longitude', None)!r}"
-        _maps_debug(
-            f"GenerateContentConfig device_id={device_id!r} "
-            f"prefer_maps={prefer_maps} maps_grounding_enabled={use_maps} "
-            f"postal={bot.get('maps_postal_code')!r} country={bot.get('maps_country')!r} "
-            f"stored_lat={lat!r} stored_lng={lng!r} maps_tool_and_retrieval_active={maps_tool_active} "
-            f"tools=[{', '.join(tool_slots)}] retrieval_lat_lng={ll_info}"
-        )
-        if use_maps and (lat is None or lng is None):
-            _maps_debug(
-                "Maps is ON in settings but lat/lng are missing — geocode may have failed on last save, "
-                "or settings file has no coordinates. Fix postal/country and save, or check hub geocode error."
-            )
-        if maps_tool_active:
-            _maps_debug("Built-in retrieval: google_maps only (google_search omitted — API forbids both).")
-        else:
-            _maps_debug("Built-in retrieval: google_search only (Maps off or no coordinates).")
+    tools = [
+        types.Tool(google_search=_google_search_builtin()),
+        types.Tool(function_declarations=custom_declarations),
+    ]
 
     return types.GenerateContentConfig(
         system_instruction=system_instruction,
         thinking_config=types.ThinkingConfig(thinking_level="minimal"),
         tools=tools,
-        tool_config=types.ToolConfig(**tool_cfg_kwargs),
+        tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
     )
 
 
@@ -697,17 +429,9 @@ class BotSettingsSchema(BaseModel):
 
 
 class HubAppSettingsSchema(BaseModel):
-    """Hub-wide clock and Maps grounding location (hub_app_settings.json)."""
+    """Hub-wide clock settings (hub_app_settings.json)."""
 
     timezone_rule: str = DEFAULT_TIMEZONE_RULE
-    maps_grounding_enabled: bool = False
-    maps_street: str = ""
-    maps_state: str = ""
-    maps_postal_code: str = ""
-    maps_country: str = ""
-    maps_latitude: Optional[float] = None
-    maps_longitude: Optional[float] = None
-    maps_display_name: Optional[str] = None
 
 class TextCommandRequest(BaseModel):
     message: str
@@ -723,7 +447,6 @@ class TimezoneRuleRequest(BaseModel):
 
 class HubSettingsUpdate(BaseModel):
     gemini_api_key: Optional[str] = None
-    google_maps_api_key: Optional[str] = None
     nominatim_user_agent: Optional[str] = None
 
     model_config = ConfigDict(extra="forbid")
@@ -904,7 +627,7 @@ async def reset_settings_to_default(device_id: str):
     history_by_device.pop(device_id, None)
     vision_enabled_by_device[device_id] = row["vision_enabled"]
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
-    return {"status": "success", "settings": get_bot_settings(device_id), "maps_geocode": {"ok": True, "error": None}}
+    return {"status": "success", "settings": get_bot_settings(device_id)}
 
 
 # ==========================================
@@ -920,16 +643,12 @@ timezone_rule_by_device = {}
 
 
 def _purge_bot_runtime_state(device_id: str) -> None:
-    """Clear per-device in-memory hub state (chat history, locks, tool/Maps turn state)."""
+    """Clear per-device in-memory hub state (chat history, locks, tool turn state)."""
     history_by_device.pop(device_id, None)
     vision_enabled_by_device.pop(device_id, None)
     timezone_rule_by_device.pop(device_id, None)
     gemini_turn_locks.pop(device_id, None)
     turn_tool_state_by_device.pop(device_id, None)
-    maps_widget_token_latest_by_device.pop(device_id, None)
-    map_jpeg_sent_this_turn_by_device.pop(device_id, None)
-    map_location_override_by_device.pop(device_id, None)
-    map_display_style_by_device.pop(device_id, None)
 
 
 async def _disconnect_websockets_for_device(device_id: str) -> None:
@@ -954,86 +673,9 @@ async def _push_timezone_to_all_streams(timezone_rule: str) -> None:
             print(f"Failed to push timezone to stream: {e}")
 
 
-def _make_show_weather_tool(device_id: str):
-    """Builder so show_weather_animation is bound to the correct bot device."""
-
-    allowed = frozenset(SHOW_WEATHER_FUNCTION_DECLARATION["parameters"]["properties"]["condition"]["enum"])
-
-    def show_weather_animation(condition: str, temperature: float) -> dict:
-        """Pushes a weather graphic to Pixel's round display for several seconds.
-
-        Same contract as SHOW_WEATHER_FUNCTION_DECLARATION (enum + Fahrenheit).
-        """
-        c = (condition or "").strip().lower().replace(" ", "_").replace("-", "_")
-        if c not in allowed:
-            c = "cloudy"
-        tool_state = turn_tool_state_by_device.setdefault(device_id, {"show_weather": False, "face_animation": False})
-        if tool_state.get("face_animation", False):
-            return {"ok": False, "skipped": True, "reason": "face_animation already called this turn"}
-        tool_state["show_weather"] = True
-        _schedule_weather_to_esp32(device_id, c, float(temperature))
-        return {"ok": True, "display": "weather queued on robot"}
-
-    return show_weather_animation
-
-
-def _make_show_map_animation_tool(device_id: str):
-    """Builder so show_map_animation is bound to the correct bot device."""
-
-    def show_map_animation(location: str = "", display_style: str = "calling_card") -> dict:
-        tool_state = turn_tool_state_by_device.setdefault(
-            device_id, {"show_weather": False, "face_animation": False, "show_map": False}
-        )
-        if tool_state.get("face_animation", False) or tool_state.get("show_weather", False) or tool_state.get("show_map", False):
-            return {
-                "ok": False,
-                "skipped": True,
-                "reason": "another animation tool was already called this turn",
-            }
-        tool_state["show_map"] = True
-
-        # Validate and store display_style
-        style = (display_style or "calling_card").strip().lower()
-        if style not in ("calling_card", "directions"):
-            style = "calling_card"
-        map_display_style_by_device[device_id] = style
-
-        # Store the explicit location so the end-of-turn handler uses it
-        loc = (location or "").strip()
-        if loc:
-            map_location_override_by_device[device_id] = loc
-            print(f"[Omnibot] show_map_animation: location={loc!r} display_style={style!r}")
-
-        # Teal "map mode" placeholder only for directions; calling card is drawn on-device when data arrives.
-        if style == "directions":
-            _schedule_face_animation_to_esp32(device_id, "map", "")
-            # Start Directions + Static Map now while the model is still streaming (see _try_send_directions_map_early).
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(_try_send_directions_map_early(device_id))
-            except RuntimeError:
-                pass
-        # NOTE: Map JPEG / calling card payload is also sent in the end-of-turn handler if not early-sent.
-        return {"ok": True, "display": "map animation queued on robot", "display_style": style}
-
-    return show_map_animation
-
-
 def _clamp_face_animation_words(raw: str) -> str:
     parts = (raw or "").strip().split()
     return " ".join(parts[:2])
-
-
-def _normalize_weather_words(raw: str) -> str:
-    allowed = frozenset(SHOW_WEATHER_FUNCTION_DECLARATION["parameters"]["properties"]["condition"]["enum"])
-    text = (raw or "").strip().lower().replace("-", "_")
-    condition_match = re.search(r"\b(sunny|cloudy|partially_cloudy|raining|snowing)\b", text)
-    temp_match = re.search(r"(-?\d+(?:\.\d+)?)", text)
-    condition = condition_match.group(1) if condition_match else "cloudy"
-    if condition not in allowed:
-        condition = "cloudy"
-    temp = int(float(temp_match.group(1))) if temp_match else 72
-    return f"{condition} {temp}"
 
 
 def _make_face_animation_tool(device_id: str):
@@ -1049,9 +691,9 @@ def _make_face_animation_tool(device_id: str):
             a = "speaking"
         w = _clamp_face_animation_words(words or "")
         tool_state = turn_tool_state_by_device.setdefault(
-            device_id, {"show_weather": False, "face_animation": False, "show_map": False}
+            device_id, {"face_animation": False}
         )
-        if tool_state.get("face_animation", False) or tool_state.get("show_weather", False) or tool_state.get("show_map", False):
+        if tool_state.get("face_animation", False):
             return {
                 "ok": False,
                 "skipped": True,
@@ -1076,69 +718,11 @@ def show_face_animation(device_id: str, animation: str, words: str = "") -> dict
     return face_animation_fn(animation=animation, words=words)
 
 
-def show_weather_animation(device_id: str, condition_text: str) -> dict:
-    """Convenience wrapper to trigger a weather overlay on the face display.
-
-    `condition_text` can be any free-form weather description (e.g. "cloudy 74",
-    "light rain and 65F"); it will be normalized to the canonical
-    "<condition> <temperature_f>" form used by the ESP32 firmware.
-    """
-    normalized = _normalize_weather_words(condition_text)
-    parts = normalized.split()
-    condition = parts[0] if parts else "cloudy"
-    temperature = float(parts[1]) if len(parts) > 1 else 72.0
-    show_weather_tool = _make_show_weather_tool(device_id)
-    return show_weather_tool(condition=condition, temperature=temperature)
-
-
-def show_map_animation(device_id: str) -> dict:
-    """Convenience wrapper to trigger map mode on the face display.
-
-    This uses the same behavior as the Gemini `show_map_animation` tool, which
-    schedules a map face animation and a static map JPEG to be captured and
-    pushed to the robot display.
-    """
-    map_tool = _make_show_map_animation_tool(device_id)
-    return map_tool()
-
-
-async def _send_weather_json_to_esp32(device_id: str, condition: str, temperature: float) -> None:
-    ws = get_active_esp32_socket(device_id)
-    if not ws:
-        return
-    payload = {
-        "type": "show_weather",
-        "condition": condition,
-        "temperature": temperature,
-        "duration_ms": WEATHER_DISPLAY_MS,
-    }
-    try:
-        await ws.send_text(json.dumps(payload))
-    except Exception as e:
-        print(f"Failed to send show_weather to ESP32: {e}")
-
-
-def _schedule_weather_to_esp32(device_id: str, condition: str, temperature: float) -> None:
-    loop = _main_async_loop
-    if loop is None:
-        print("show_weather: no async loop yet; skipping robot display")
-        return
-    asyncio.run_coroutine_threadsafe(
-        _send_weather_json_to_esp32(device_id, condition, temperature),
-        loop,
-    )
-
-
 async def _send_face_animation_json_to_esp32(device_id: str, animation: str, words: str) -> None:
     ws = get_active_esp32_socket(device_id)
     if not ws:
         return
-    if animation == "weather":
-        dur = WEATHER_DISPLAY_MS
-    elif animation == "map":
-        dur = MAP_DISPLAY_MS
-    else:
-        dur = FACE_ANIMATION_DISPLAY_MS
+    dur = FACE_ANIMATION_DISPLAY_MS
     payload = {
         "type": "face_animation",
         "animation": animation,
@@ -1844,7 +1428,7 @@ async def _try_send_directions_map_early(device_id: str) -> None:
     lat, lng = bot.get("maps_latitude"), bot.get("maps_longitude")
     if lat is None or lng is None:
         return
-    maps_key = get_maps_key_static_then_js()
+    maps_key = ""
     if not maps_key:
         return
     try:
@@ -1933,7 +1517,7 @@ def _schedule_map_jpeg_after_face_animation_map(device_id: str) -> None:
     if loop is None:
         print("face_animation(map): no async loop yet; skipping map screenshot")
         return
-    maps_key = get_maps_key_js_for_screenshot()
+    maps_key = ""
     if not maps_key:
         print(
             "[Omnibot] face_animation(map): Google Maps API key missing; cannot screenshot map for ESP32."
@@ -1954,8 +1538,6 @@ async def stream_chat_turn_response(device_id: str, message_content):
     full_text = ""
     loop = asyncio.get_running_loop()
     first_token_notified = False
-    last_maps_sources: list[dict] = []
-    last_maps_widget_token: Optional[str] = None
     last_search_sources: list[dict] = []
     last_search_queries: list[str] = []
 
@@ -1967,10 +1549,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
 
     lock = gemini_turn_locks.setdefault(device_id, asyncio.Lock())
     async with lock:
-        turn_tool_state_by_device[device_id] = {"show_weather": False, "face_animation": False}
-        map_jpeg_sent_this_turn_by_device[device_id] = False
-        map_location_override_by_device.pop(device_id, None)
-        maps_widget_token_latest_by_device[device_id] = ""
+        turn_tool_state_by_device[device_id] = {"face_animation": False}
         bot_settings = get_bot_settings(device_id)
         model = bot_settings["model"]
         system_instruction = bot_settings["system_instruction"]
@@ -1991,33 +1570,11 @@ async def stream_chat_turn_response(device_id: str, message_content):
                 "If Maps is on but replies ignore location, POST "
                 f"/api/text-command/reset/{device_id} clears in-memory history."
             )
-        routing_text = _routing_text_from_message_content(message_content)
-        prefer_maps = False
-        route_reason = "fallback_search"
-        if routing_text:
-            retrieval, route_reason = await asyncio.to_thread(
-                classify_retrieval_with_reason, routing_text
-            )
-            prefer_maps = retrieval == "maps"
         if _route_debug_enabled():
-            snippet = routing_text if len(routing_text) <= 200 else routing_text[:200] + "..."
-            bot = bot_settings
-            lat_ok = bot.get("maps_latitude") is not None and bot.get("maps_longitude") is not None
-            will_maps = (
-                prefer_maps
-                and bool(bot.get("maps_grounding_enabled"))
-                and lat_ok
-            )
-            _route_debug(
-                f"device_id={device_id!r} routing_text={snippet!r} "
-                f"classified_prefer_maps={prefer_maps} effective_builtin_retrieval="
-                f"{'google_maps' if will_maps else 'google_search'} "
-                f"route_reason={route_reason}"
-            )
+            _route_debug(f"device_id={device_id!r} effective_builtin_retrieval=google_search route_reason=maps_removed")
         config = _pixel_chat_generate_config(
             system_instruction=system_instruction,
             device_id=device_id,
-            prefer_maps=prefer_maps,
         )
         gc = get_genai_client()
         if gc is None:
@@ -2052,18 +1609,11 @@ async def stream_chat_turn_response(device_id: str, message_content):
                             if getattr(chunk, "candidates", None):
                                 for candidate in chunk.candidates:
                                     gm = getattr(candidate, "grounding_metadata", None)
-                                    src = _extract_maps_sources_from_grounding_metadata(gm)
-                                    if src:
-                                        last_maps_sources = src
                                     web_src, web_queries = _extract_search_sources_from_grounding_metadata(gm)
                                     if web_src:
                                         last_search_sources = web_src
                                     if web_queries:
                                         last_search_queries = web_queries
-                                    wtok = _extract_maps_widget_token_from_grounding_metadata(gm)
-                                    if wtok:
-                                        last_maps_widget_token = wtok
-                                        maps_widget_token_latest_by_device[device_id] = wtok
                                         
                                     if candidate.content and getattr(candidate.content, "parts", None):
                                         for part in candidate.content.parts:
@@ -2124,11 +1674,6 @@ async def stream_chat_turn_response(device_id: str, message_content):
                     
                     if fname == "face_animation":
                         result = _make_face_animation_tool(device_id)(**args)
-                    elif fname == "show_weather_animation":
-                        result = _make_show_weather_tool(device_id)(**args)
-                    elif fname == "show_map_animation":
-                        result = _make_show_map_animation_tool(device_id)(**args)
-                        
                     func_responses.append(
                         types.Part(
                             function_response=types.FunctionResponse(
@@ -2147,15 +1692,7 @@ async def stream_chat_turn_response(device_id: str, message_content):
             turn_tool_state_by_device.pop(device_id, None)
 
     if _maps_debug_enabled():
-        _maps_debug(
-            f"turn_end stream_id={stream_id!r} maps_grounding_chunks={len(last_maps_sources)} "
-            f"(0 = model did not return Maps sources this turn; it may skip the tool for non-local prompts)"
-        )
-        if last_maps_sources:
-            _maps_debug(f"maps source titles: {[s.get('title') for s in last_maps_sources[:5]]}")
-        _maps_debug(
-            f"search_grounding_chunks={len(last_search_sources)} search_queries={len(last_search_queries)}"
-        )
+        _maps_debug(f"turn_end stream_id={stream_id!r} search_grounding_chunks={len(last_search_sources)} search_queries={len(last_search_queries)}")
 
     end_msg = {
         "type": "ai_response_stream_end",
@@ -2163,44 +1700,12 @@ async def stream_chat_turn_response(device_id: str, message_content):
         "device_id": device_id,
         "data": full_text,
     }
-    if last_maps_sources:
-        end_msg["maps_sources"] = last_maps_sources
     if last_search_sources:
         end_msg["search_sources"] = last_search_sources
     if last_search_queries:
         end_msg["search_queries"] = last_search_queries
-    if last_maps_widget_token:
-        end_msg["maps_widget_context_token"] = last_maps_widget_token
     end_msg["device_stream_connected"] = device_stream_is_live(device_id)
     await manager.broadcast(end_msg)
-
-    tok = (last_maps_widget_token or "").strip()
-    # Pop the tool-call overrides regardless of grounding path, so they are
-    # always consumed even when the model skips the built-in Maps tool.
-    loc_override = map_location_override_by_device.pop(device_id, "")
-    disp_style   = map_display_style_by_device.pop(device_id, "calling_card")
-    # Trigger map rendering if the model used grounding OR explicitly called
-    # show_map_animation with a location (no grounding needed in that case).
-    if last_maps_sources or tok or loc_override:
-        maps_key = get_maps_key_static_then_js()
-        if maps_key:
-            bot = get_bot_settings(device_id)
-            asyncio.create_task(
-                _send_map_jpeg_to_esp32_after_turn(
-                    device_id=device_id,
-                    maps_sources=last_maps_sources,
-                    api_key=maps_key,
-                    fallback_lat=bot.get("maps_latitude"),
-                    fallback_lng=bot.get("maps_longitude"),
-                    location_override=loc_override,
-                    display_style=disp_style,
-                )
-            )
-        else:
-            print(
-                "[Omnibot] Map animation called but no Google Maps API key found; "
-                "skipping ESP32 map image."
-            )
 
     return full_text
 
@@ -2519,60 +2024,16 @@ async def get_hub_app_settings_endpoint():
 
 @app.post("/api/hub/app-settings")
 async def post_hub_app_settings_endpoint(new_settings: HubAppSettingsSchema):
-    """Save hub clock and Maps location; clears all in-memory Gemini histories."""
-    hub_prev = load_hub_app_settings()
-    maps_geocode: dict = {"ok": True, "error": None}
-    street = (new_settings.maps_street or "").strip()
-    state = (new_settings.maps_state or "").strip()
-    postal = (new_settings.maps_postal_code or "").strip()
-    country = (new_settings.maps_country or "").strip()
-    maps_enabled = bool(new_settings.maps_grounding_enabled)
+    """Save hub clock settings; clears all in-memory Gemini histories."""
     tz = str(new_settings.timezone_rule or DEFAULT_TIMEZONE_RULE)
-
-    row = {
-        "timezone_rule": tz,
-        "maps_grounding_enabled": maps_enabled,
-        "maps_street": street,
-        "maps_state": state,
-        "maps_postal_code": postal,
-        "maps_country": country,
-    }
-
-    if maps_enabled:
-        lat, lon, disp, err = _geocode_address(street, state, postal, country)
-        if err:
-            maps_geocode = {"ok": False, "error": err}
-            row["maps_latitude"] = None
-            row["maps_longitude"] = None
-            row["maps_display_name"] = None
-        else:
-            row["maps_latitude"] = lat
-            row["maps_longitude"] = lon
-            row["maps_display_name"] = disp
-    else:
-        row["maps_latitude"] = hub_prev.get("maps_latitude")
-        row["maps_longitude"] = hub_prev.get("maps_longitude")
-        row["maps_display_name"] = hub_prev.get("maps_display_name")
+    row = {"timezone_rule": tz}
 
     save_hub_app_settings(row)
     history_by_device.clear()
     for did in list(get_all_settings().keys()):
         timezone_rule_by_device[did] = row["timezone_rule"]
     await _push_timezone_to_all_streams(row["timezone_rule"])
-    if _maps_debug_enabled():
-        _maps_debug(
-            f"hub_app_settings_saved maps_enabled={maps_enabled} maps_geocode={maps_geocode!r} "
-            f"stored lat/lng=({row.get('maps_latitude')!r}, {row.get('maps_longitude')!r}) "
-            f"all_device_history_cleared=True"
-        )
-    return {"status": "success", "settings": row, "maps_geocode": maps_geocode}
-
-
-@app.get("/api/hub-config")
-async def hub_config():
-    """Public values the dashboard needs (Maps JS key for contextual widget is browser-exposed)."""
-    key = get_google_maps_js_api_key()
-    return {"maps_api_key": key, "maps_js_api_key": key}
+    return {"status": "success", "settings": row}
 
 
 @app.get("/api/hub/status")

@@ -81,13 +81,6 @@ def _write_secrets_file(data: dict[str, Any]) -> None:
     invalidate_secrets_cache()
 
 
-def _pop_all_maps_secret_keys(current: dict[str, Any]) -> None:
-    """Remove unified and legacy Maps keys from persisted secrets."""
-    current.pop("google_maps_api_key", None)
-    current.pop("google_maps_js_api_key", None)
-    current.pop("google_maps_static_api_key", None)
-
-
 def merge_hub_secrets(updates: dict[str, Any]) -> dict[str, Any]:
     """Apply updates to hub_secrets.json. None = skip key. Empty string = remove key."""
     if not updates:
@@ -98,20 +91,11 @@ def merge_hub_secrets(updates: dict[str, Any]) -> dict[str, Any]:
             continue
         if isinstance(v, str) and v.strip() == "" and k in {
             "gemini_api_key",
-            "google_maps_api_key",
-            "google_maps_js_api_key",
-            "google_maps_static_api_key",
             "nominatim_user_agent",
         }:
-            if k in ("google_maps_api_key", "google_maps_js_api_key", "google_maps_static_api_key"):
-                _pop_all_maps_secret_keys(current)
-            else:
-                current.pop(k, None)
+            current.pop(k, None)
         else:
             current[k] = v
-    if (current.get("google_maps_api_key") or "").strip():
-        current.pop("google_maps_js_api_key", None)
-        current.pop("google_maps_static_api_key", None)
     _write_secrets_file(current)
     invalidate_genai_client()
     return current
@@ -126,48 +110,6 @@ def _env_first(env_name: str, file_key: str) -> str:
 
 def get_gemini_api_key() -> str:
     return _env_first("GEMINI_API_KEY", "gemini_api_key")
-
-
-def get_google_maps_api_key() -> str:
-    """Single Maps key for JS API, Static API, and server-side map features.
-
-    Order: ``GOOGLE_MAPS_API_KEY`` env, file ``google_maps_api_key``, then legacy
-    env/file split keys (``GOOGLE_MAPS_JS_API_KEY`` / ``GOOGLE_MAPS_STATIC_API_KEY``).
-    """
-    v = (os.getenv("GOOGLE_MAPS_API_KEY") or "").strip()
-    if v:
-        return v
-    data = _secrets_from_file()
-    v = (str(data.get("google_maps_api_key") or "")).strip()
-    if v:
-        return v
-    v = (os.getenv("GOOGLE_MAPS_JS_API_KEY") or "").strip()
-    if v:
-        return v
-    v = (str(data.get("google_maps_js_api_key") or "")).strip()
-    if v:
-        return v
-    v = (os.getenv("GOOGLE_MAPS_STATIC_API_KEY") or "").strip()
-    if v:
-        return v
-    return (str(data.get("google_maps_static_api_key") or "")).strip()
-
-
-def get_google_maps_js_api_key() -> str:
-    return get_google_maps_api_key()
-
-
-def get_google_maps_static_api_key() -> str:
-    return get_google_maps_api_key()
-
-
-def get_maps_key_static_then_js() -> str:
-    return get_google_maps_api_key()
-
-
-def get_maps_key_js_for_screenshot() -> str:
-    """Maps widget / screenshot path uses the unified Maps key."""
-    return get_google_maps_api_key()
 
 
 def get_nominatim_user_agent_raw() -> str:
@@ -211,14 +153,6 @@ def get_genai_client():
 def _default_hub_app_settings_dict() -> dict[str, Any]:
     return {
         "timezone_rule": DEFAULT_HUB_TIMEZONE_RULE,
-        "maps_grounding_enabled": False,
-        "maps_street": "",
-        "maps_state": "",
-        "maps_postal_code": "",
-        "maps_country": "",
-        "maps_latitude": None,
-        "maps_longitude": None,
-        "maps_display_name": None,
     }
 
 
@@ -277,14 +211,11 @@ def hub_public_status() -> dict[str, Any]:
 def hub_settings_public_view() -> dict[str, Any]:
     """Non-secret hub settings for GET /api/hub/settings (keys are masked)."""
     gk = get_gemini_api_key()
-    mk = get_google_maps_api_key()
     env_nomi = bool((os.getenv("NOMINATIM_USER_AGENT") or "").strip())
     stored_nomi = (str(_secrets_from_file().get("nominatim_user_agent") or "")).strip()
     return {
         "gemini_api_key_configured": bool(gk),
         "gemini_api_key_masked": mask_secret(gk) if gk else None,
-        "google_maps_api_key_configured": bool(mk),
-        "google_maps_api_key_masked": mask_secret(mk) if mk else None,
         "nominatim_user_agent": stored_nomi,
         "nominatim_user_agent_from_env": env_nomi,
         "data_dir": str(DATA_DIR),

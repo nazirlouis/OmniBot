@@ -133,21 +133,6 @@ bool deviceVisionCaptureEnabled = true;
 // Settings screen
 bool settingsScreenNeedsRedraw = true;
 
-// Weather overlay (from backend show_weather tool)
-#define WEATHER_KIND_SUNNY 0
-#define WEATHER_KIND_CLOUDY 1
-#define WEATHER_KIND_PARTIALLY_CLOUDY 2
-#define WEATHER_KIND_RAINING 3
-#define WEATHER_KIND_SNOWING 4
-
-bool weatherOverlayActive = false;
-uint32_t weatherOverlayUntilMs = 0;
-uint8_t weatherKind = WEATHER_KIND_CLOUDY;
-int weatherTempDisplay = 0;
-bool weatherNeedsRedraw = true;
-// After show_weather during upload, do not resume thinking when the overlay ends.
-bool suppressUploadThinkingAfterWeather = false;
-
 // Map snapshot from hub (face_animation map + binary 0x04 JPEG)
 #define MAP_DISPLAY_PX 240
 #define MAP_OVERLAY_EXTEND_MS 9000
@@ -260,26 +245,6 @@ static void setFaceAnimWordsFromPayload(const char* src) {
     }
 }
 
-static bool parseWeatherWords(const char* src, uint8_t* outKind, int* outTempF) {
-    if (!src || !outKind || !outTempF) return false;
-    char buf[80];
-    memset(buf, 0, sizeof(buf));
-    strncpy(buf, src, sizeof(buf) - 1);
-    char* p1 = strtok(buf, " \t\r\n");
-    char* p2 = strtok(NULL, " \t\r\n");
-    if (!p1 || !p2) return false;
-
-    if (strcmp(p1, "sunny") == 0) *outKind = WEATHER_KIND_SUNNY;
-    else if (strcmp(p1, "cloudy") == 0) *outKind = WEATHER_KIND_CLOUDY;
-    else if (strcmp(p1, "partially_cloudy") == 0) *outKind = WEATHER_KIND_PARTIALLY_CLOUDY;
-    else if (strcmp(p1, "raining") == 0) *outKind = WEATHER_KIND_RAINING;
-    else if (strcmp(p1, "snowing") == 0) *outKind = WEATHER_KIND_SNOWING;
-    else return false;
-
-    *outTempF = atoi(p2);
-    return true;
-}
-
 // Caption is static for the whole speaking animation: draw once, skip until words change or end.
 static char s_faceCaptionLastText[64] = "";
 static int16_t s_faceCaptionBoxX = 0;
@@ -336,21 +301,6 @@ static void drawFaceAnimWordsLine() {
     s_faceCaptionVisible = true;
 }
 
-// Weather overlay motion (delta-friendly: avoid full-screen clears on each tick).
-struct WeatherAnimState {
-    uint32_t lastTickMs = 0;
-    bool sunnyHasPrevSeg = false;
-    int16_t su_ix[8], su_iy[8], su_ox[8], su_oy[8];
-    int16_t cloudDx = 0;
-    int16_t cloudDy = 0;
-    float cloudPhase = 0.0f;
-    float sunnyPhase = 0.0f;
-    struct RainDrop {
-        int16_t x0;
-        int16_t y0;
-    } rain[9];
-};
-static WeatherAnimState wAnim;
 const uint8_t WIFI_CONNECT_ATTEMPTS = 2;
 /** Per-attempt association window (boot only; keep short). */
 const uint16_t WIFI_CONNECT_TIMEOUT_MS = 2000;
@@ -458,298 +408,6 @@ static void fillOval(int16_t xc, int16_t yc, int16_t rx, int16_t ry, uint16_t co
 
         gfx->drawFastHLine(xc - (int16_t)x, yc + dy, (int16_t)(2 * x + 1), color);
     }
-}
-
-// Scale s roughly 1.0 = previous look; >1 enlarges clouds (round display).
-static void drawWeatherCloud(int16_t x, int16_t y, uint16_t cloudGray, uint16_t cloudHi, float s) {
-    int16_t a = (int16_t)(28 * s), b = (int16_t)(18 * s);
-    int16_t ox = (int16_t)(22 * s), oy = (int16_t)(6 * s);
-    fillOval(x, y, a, b, cloudGray);
-    fillOval(x - ox, y + oy, (int16_t)(24 * s), (int16_t)(16 * s), cloudGray);
-    fillOval(x + (int16_t)(20 * s), y + oy, (int16_t)(26 * s), (int16_t)(18 * s), cloudGray);
-    // Soft highlight on main puff
-    fillOval(x - (int16_t)(8 * s), y - (int16_t)(5 * s), (int16_t)(10 * s), (int16_t)(7 * s), cloudHi);
-}
-
-// ---- Weather layout (shared: full paint + delta animation ticks) ----
-static const uint16_t kWxBg = 0x10A2;
-static const uint16_t kWxRing = 0x2124;
-static const uint16_t kWxCloud = 0xB5B6;
-static const uint16_t kWxCloudHi = 0xDEFB;
-static const uint16_t kWxTemp = 0xEF9D;
-static const uint16_t kWxAccent = 0x5D9B;
-static const int16_t kWxCx = 120;
-static const int16_t kWxIconY = 92;
-static const float kWxIconScale = 1.65f;
-static const int16_t kWxTempCyTop = 142;
-static const uint16_t kWxAnimIntervalMs = 72;
-// Large decorative snowflake (no cloud) for WEATHER_KIND_SNOWING.
-static const int16_t kWxFlakeCx = 120;
-static const int16_t kWxFlakeCy = 86;
-static const int16_t kWxFlakeArm = 54;
-
-static void drawGiantSnowflake(int16_t cx, int16_t cy, int16_t armLen, uint16_t col) {
-    const float pi = 3.1415926f;
-    const int16_t hubR = 5;
-    fillOval(cx, cy, hubR, hubR, col);
-
-    for (int arm = 0; arm < 6; arm++) {
-        float a = (float)arm * pi / 3.0f;
-        int16_t xe = cx + (int16_t)(cosf(a) * (float)armLen);
-        int16_t ye = cy + (int16_t)(sinf(a) * (float)armLen);
-        gfx->drawLine(cx, cy, xe, ye, col);
-
-        float mx = cosf(a) * (float)armLen * 0.52f;
-        float my = sinf(a) * (float)armLen * 0.52f;
-        int16_t mx_i = cx + (int16_t)mx;
-        int16_t my_i = cy + (int16_t)my;
-        const int16_t br = (int16_t)(armLen / 4);
-        gfx->drawLine(mx_i, my_i, mx_i + (int16_t)(cosf(a + 0.65f) * (float)br), my_i + (int16_t)(sinf(a + 0.65f) * (float)br), col);
-        gfx->drawLine(mx_i, my_i, mx_i + (int16_t)(cosf(a - 0.65f) * (float)br), my_i + (int16_t)(sinf(a - 0.65f) * (float)br), col);
-
-        float tx = cosf(a) * (float)armLen * 0.78f;
-        float ty = sinf(a) * (float)armLen * 0.78f;
-        int16_t tx_i = cx + (int16_t)tx;
-        int16_t ty_i = cy + (int16_t)ty;
-        const int16_t tip = (int16_t)(armLen / 5);
-        gfx->drawLine(tx_i, ty_i, tx_i + (int16_t)(cosf(a + 0.5f) * (float)tip), ty_i + (int16_t)(sinf(a + 0.5f) * (float)tip), col);
-        gfx->drawLine(tx_i, ty_i, tx_i + (int16_t)(cosf(a - 0.5f) * (float)tip), ty_i + (int16_t)(sinf(a - 0.5f) * (float)tip), col);
-    }
-}
-
-static void drawTemperatureLineF(int16_t cyTop, uint8_t textSize, uint16_t textColor) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%dF", weatherTempDisplay);
-
-    gfx->setTextSize(textSize);
-    // Match weather panel bg so glyphs are not outlined in default black.
-    gfx->setTextColor(textColor, kWxBg);
-
-    const int16_t charW = (int16_t)(6 * textSize);
-    const int16_t lineH = (int16_t)(8 * textSize);
-    const int16_t totalW = (int16_t)strlen(buf) * charW;
-    int16_t startX = (240 - totalW) / 2;
-    if (startX < 4) startX = 4;
-
-    const int16_t baselineY = cyTop + lineH - (int16_t)(textSize > 3 ? 3 : 2);
-
-    gfx->setCursor(startX, baselineY);
-    gfx->print(buf);
-}
-
-// Cloud / sun art only — icon band stays below temperature.
-static void wxClearIconBand() {
-    gfx->fillRect(12, 22, 216, 112, kWxBg);
-    gfx->drawCircle(120, 120, 118, kWxRing);
-}
-
-static void wxRedrawTemperatureOnly() {
-    gfx->fillRect(8, kWxTempCyTop, 224, 48, kWxBg);
-    drawTemperatureLineF(kWxTempCyTop, 5, kWxTemp);
-}
-
-static void wxInitAnimAfterFullPaint() {
-    wAnim.lastTickMs = millis();
-    wAnim.cloudDx = 0;
-    wAnim.cloudDy = 0;
-    wAnim.cloudPhase = (float)((millis() & 2047u)) * 0.002f;
-    wAnim.sunnyPhase = 0.0f;
-
-    if (weatherKind == WEATHER_KIND_SUNNY) {
-        const int16_t cx = kWxCx;
-        const int16_t iconY = kWxIconY;
-        const float sc = kWxIconScale;
-        for (int i = 0; i < 8; i++) {
-            float a = (float)i * 3.1415926f / 4.0f;
-            wAnim.su_ix[i] = cx + (int16_t)(cosf(a) * (38.0f * sc));
-            wAnim.su_iy[i] = iconY + (int16_t)(sinf(a) * (38.0f * sc));
-            wAnim.su_ox[i] = cx + (int16_t)(cosf(a) * (52.0f * sc));
-            wAnim.su_oy[i] = iconY + (int16_t)(sinf(a) * (52.0f * sc));
-        }
-        wAnim.sunnyHasPrevSeg = true;
-    } else {
-        wAnim.sunnyHasPrevSeg = false;
-    }
-
-    if (weatherKind == WEATHER_KIND_RAINING) {
-        int n = 0;
-        for (int i = -1; i <= 1; i++) {
-            int16_t rx = kWxCx + (int16_t)(i * 22 * kWxIconScale);
-            for (int j = 0; j < 3; j++) {
-                wAnim.rain[n].x0 = rx + (int16_t)(j * 5 * kWxIconScale);
-                wAnim.rain[n].y0 = kWxIconY + (int16_t)(28 * kWxIconScale) + (int16_t)((n * 5) % 18);
-                n++;
-            }
-        }
-    }
-}
-
-static void updateWxSunnyAnim() {
-    const int16_t cx = kWxCx;
-    const int16_t iconY = kWxIconY;
-    const float sc = kWxIconScale;
-    wAnim.sunnyPhase += 0.10f;
-
-    for (int i = 0; i < 8; i++) {
-        float a = (float)i * 3.1415926f / 4.0f;
-        int16_t ix = cx + (int16_t)(cosf(a) * (38.0f * sc));
-        int16_t iy = iconY + (int16_t)(sinf(a) * (38.0f * sc));
-        float omul = 52.0f + sinf(wAnim.sunnyPhase + (float)i * 0.55f) * 6.5f;
-        int16_t ox = cx + (int16_t)(cosf(a) * (omul * sc));
-        int16_t oy = iconY + (int16_t)(sinf(a) * (omul * sc));
-
-        if (wAnim.sunnyHasPrevSeg) {
-            gfx->drawLine(wAnim.su_ix[i], wAnim.su_iy[i], wAnim.su_ox[i], wAnim.su_oy[i], kWxBg);
-        }
-        gfx->drawLine(ix, iy, ox, oy, 0xFF80);
-        wAnim.su_ix[i] = ix;
-        wAnim.su_iy[i] = iy;
-        wAnim.su_ox[i] = ox;
-        wAnim.su_oy[i] = oy;
-    }
-    wAnim.sunnyHasPrevSeg = true;
-}
-
-static void updateWxCloudyAnim() {
-    wAnim.cloudPhase += 0.085f;
-    int16_t ndx = (int16_t)(sinf(wAnim.cloudPhase) * 2.0f);
-    int16_t ndy = (int16_t)(cosf(wAnim.cloudPhase * 0.82f) * 1.5f);
-    if (ndx == wAnim.cloudDx && ndy == wAnim.cloudDy) {
-        return;
-    }
-
-    wxClearIconBand();
-    drawWeatherCloud(kWxCx + ndx, kWxIconY + ndy, kWxCloud, kWxCloudHi, kWxIconScale);
-    wAnim.cloudDx = ndx;
-    wAnim.cloudDy = ndy;
-}
-
-static void updateWxPartlyAnim() {
-    wAnim.cloudPhase += 0.085f;
-    int16_t ndx = (int16_t)(sinf(wAnim.cloudPhase) * 2.0f);
-    int16_t ndy = (int16_t)(cosf(wAnim.cloudPhase * 0.82f) * 1.5f);
-    if (ndx == wAnim.cloudDx && ndy == wAnim.cloudDy) {
-        return;
-    }
-
-    wxClearIconBand();
-    fillOval(kWxCx - (int16_t)(18 * kWxIconScale), kWxIconY - (int16_t)(14 * kWxIconScale),
-             (int16_t)(20 * kWxIconScale), (int16_t)(20 * kWxIconScale), 0xFEA0);
-    fillOval(kWxCx - (int16_t)(18 * kWxIconScale), kWxIconY - (int16_t)(14 * kWxIconScale),
-             (int16_t)(12 * kWxIconScale), (int16_t)(12 * kWxIconScale), YELLOW);
-    drawWeatherCloud(
-        kWxCx + ndx + (int16_t)(8 * kWxIconScale),
-        kWxIconY + ndy + (int16_t)(8 * kWxIconScale),
-        kWxCloud, kWxCloudHi, kWxIconScale * 0.95f
-    );
-    wAnim.cloudDx = ndx;
-    wAnim.cloudDy = ndy;
-}
-
-static void updateWxRainAnim() {
-    const float sc = kWxIconScale;
-    const int16_t dropLen = (int16_t)(26 * sc);
-    const int16_t dx = (int16_t)(4 * sc);
-    const int16_t yTopMin = kWxIconY + (int16_t)(26 * sc);
-    const int16_t yTopMax = kWxIconY + (int16_t)(56 * sc);
-
-    for (int i = 0; i < 9; i++) {
-        int16_t x0 = wAnim.rain[i].x0;
-        int16_t y0 = wAnim.rain[i].y0;
-        gfx->drawLine(x0, y0, (int16_t)(x0 - dx), (int16_t)(y0 + dropLen), kWxBg);
-        y0 += 5;
-        if (y0 > yTopMax) {
-            y0 = (int16_t)(yTopMin + (i * 4) % 14);
-        }
-        wAnim.rain[i].y0 = y0;
-        gfx->drawLine(x0, y0, (int16_t)(x0 - dx), (int16_t)(y0 + dropLen), kWxAccent);
-    }
-}
-
-static void updateWeatherOverlayAnimation(uint32_t now) {
-    if (now - wAnim.lastTickMs < kWxAnimIntervalMs) {
-        return;
-    }
-    wAnim.lastTickMs = now;
-
-    switch (weatherKind) {
-        case WEATHER_KIND_SUNNY:
-            updateWxSunnyAnim();
-            break;
-        case WEATHER_KIND_CLOUDY:
-            updateWxCloudyAnim();
-            break;
-        case WEATHER_KIND_PARTIALLY_CLOUDY:
-            updateWxPartlyAnim();
-            break;
-        case WEATHER_KIND_RAINING:
-            updateWxRainAnim();
-            wxRedrawTemperatureOnly();
-            break;
-        case WEATHER_KIND_SNOWING:
-            // Static giant snowflake; full overlay handles paint.
-            break;
-        default:
-            updateWxCloudyAnim();
-            break;
-    }
-}
-
-static void drawWeatherOverlay() {
-    gfx->fillScreen(kWxBg);
-    gfx->drawCircle(120, 120, 118, kWxRing);
-    wxInitAnimAfterFullPaint();
-
-    switch (weatherKind) {
-        case WEATHER_KIND_SUNNY: {
-            int16_t r = (int16_t)(28 * kWxIconScale);
-            fillOval(kWxCx, kWxIconY, r, r, 0xFEA0);
-            fillOval(kWxCx, kWxIconY, (int16_t)(r * 0.55f), (int16_t)(r * 0.55f), YELLOW);
-            for (int i = 0; i < 8; i++) {
-                float a = (float)i * 3.1415926f / 4.0f;
-                int16_t x1 = kWxCx + (int16_t)(cosf(a) * (38.0f * kWxIconScale));
-                int16_t y1 = kWxIconY + (int16_t)(sinf(a) * (38.0f * kWxIconScale));
-                int16_t x2 = kWxCx + (int16_t)(cosf(a) * (52.0f * kWxIconScale));
-                int16_t y2 = kWxIconY + (int16_t)(sinf(a) * (52.0f * kWxIconScale));
-                gfx->drawLine(x1, y1, x2, y2, 0xFF80);
-            }
-            break;
-        }
-        case WEATHER_KIND_CLOUDY:
-            drawWeatherCloud(kWxCx, kWxIconY, kWxCloud, kWxCloudHi, kWxIconScale);
-            break;
-        case WEATHER_KIND_PARTIALLY_CLOUDY:
-            fillOval(kWxCx - (int16_t)(18 * kWxIconScale), kWxIconY - (int16_t)(14 * kWxIconScale),
-                     (int16_t)(20 * kWxIconScale), (int16_t)(20 * kWxIconScale), 0xFEA0);
-            fillOval(kWxCx - (int16_t)(18 * kWxIconScale), kWxIconY - (int16_t)(14 * kWxIconScale),
-                     (int16_t)(12 * kWxIconScale), (int16_t)(12 * kWxIconScale), YELLOW);
-            drawWeatherCloud(
-                kWxCx + (int16_t)(8 * kWxIconScale),
-                kWxIconY + (int16_t)(8 * kWxIconScale),
-                kWxCloud, kWxCloudHi, kWxIconScale * 0.95f
-            );
-            break;
-        case WEATHER_KIND_RAINING:
-            drawWeatherCloud(kWxCx, kWxIconY - (int16_t)(6 * kWxIconScale), kWxCloud, kWxCloudHi, kWxIconScale);
-            for (int i = -1; i <= 1; i++) {
-                int16_t rx = kWxCx + (int16_t)(i * 22 * kWxIconScale);
-                for (int j = 0; j < 3; j++) {
-                    int16_t x0 = rx + (int16_t)(j * 5 * kWxIconScale);
-                    gfx->drawLine(x0, kWxIconY + (int16_t)(28 * kWxIconScale),
-                                  (int16_t)(x0 - (int16_t)(4 * kWxIconScale)),
-                                  kWxIconY + (int16_t)(54 * kWxIconScale), kWxAccent);
-                }
-            }
-            break;
-        case WEATHER_KIND_SNOWING:
-            drawGiantSnowflake(kWxFlakeCx, kWxFlakeCy, kWxFlakeArm, 0xEFBF);
-            break;
-        default:
-            drawWeatherCloud(kWxCx, kWxIconY, kWxCloud, kWxCloudHi, kWxIconScale);
-            break;
-    }
-
-    drawTemperatureLineF(kWxTempCyTop, 5, kWxTemp);
 }
 
 static int16_t ccApproxTextWidthPx(const char *s, int textSize) {
@@ -903,9 +561,8 @@ static void drawCallingCardOverlay() {
     int16_t ratingH = callingCardHasRating ? 22 : 0;
     int16_t revH = (callingCardHasRating && callingCardHasReviewCount) ? 12 : 0;
     int16_t catH = (callingCardCategory[0] != '\0') ? 12 : 0;
-    int16_t addrH = (callingCardAddress[0] != '\0') ? 22 : 0;
     int16_t gap = 6;
-    int16_t blockH = (int16_t)(titleH + gap + ratingH + revH + gap + catH + addrH + 4);
+    int16_t blockH = (int16_t)(titleH + gap + ratingH + revH + gap + catH + 4);
     const int16_t cy = MAP_DISPLAY_PX / 2;
     int16_t y = (int16_t)(cy - blockH / 2);
     if (y < 28) {
@@ -982,18 +639,6 @@ static void drawCallingCardOverlay() {
         y += catH;
     }
 
-    if (callingCardAddress[0]) {
-        char a1[44];
-        char a2[CALLING_CARD_ADDR_MAX + 1];
-        ccSplitTwoLinesMax(callingCardAddress, 24, a1, sizeof(a1), a2, sizeof(a2));
-        if (a1[0]) {
-            ccPrintCenteredShadow(a1, y, 1, 0xCE79);
-            y += 10;
-        }
-        if (a2[0]) {
-            ccPrintCenteredShadow(a2, y, 1, 0xCE79);
-        }
-    }
 }
 
 static void mapApplyDirectionsBackdropOnce() {
@@ -2435,16 +2080,6 @@ void setupWiFi() {
                                 syncRtcFromWifiNtp();
                                 lastRtcWifiSyncAttemptMs = millis();
                             }
-                        } else if (strcmp(msgType, "show_directions") == 0) {
-                            bool hasMi = doc.containsKey("distance_miles");
-                            bool hasMin = doc.containsKey("duration_minutes");
-                            mapDirectionsHasMetrics = hasMi || hasMin;
-                            mapRouteMiles = doc["distance_miles"] | 0.0f;
-                            mapRouteMinutes = (int)(doc["duration_minutes"] | 0);
-                            if (mapHasImage && mapOverlayActive) {
-                                s_mapDirectionsBackdropApplied = false;
-                                mapNeedsRedraw = true;
-                            }
                         } else if (strcmp(msgType, "face_animation") == 0) {
                             const char* anim = doc["animation"] | "speaking";
                             const char* w = doc["words"] | "";
@@ -2452,43 +2087,7 @@ void setupWiFi() {
                             if (dur < 800) dur = 800;
                             if (dur > 10000) dur = 10000;
 
-                            if (strcmp(anim, "weather") == 0) {
-                                uint8_t kind = WEATHER_KIND_CLOUDY;
-                                int tempF = 72;
-                                if (parseWeatherWords(w, &kind, &tempF)) {
-                                    weatherKind = kind;
-                                    weatherTempDisplay = tempF;
-                                } else {
-                                    weatherKind = WEATHER_KIND_CLOUDY;
-                                    weatherTempDisplay = 72;
-                                }
-                                weatherOverlayActive = true;
-                                weatherNeedsRedraw = true;
-                                weatherOverlayUntilMs = millis() + (uint32_t)dur;
-                                faceAnimActive = false;
-                                faceAnimWords[0] = '\0';
-                                if (currentState == STATE_UPLOADING) {
-                                    suppressUploadThinkingAfterWeather = true;
-                                }
-                            } else if (strcmp(anim, "map") == 0) {
-                                // Hub sends a JPEG (WS binary 0x04) after this; avoid showing the word "Map".
-                                faceAnimActive = false;
-                                faceAnimWords[0] = '\0';
-                                clearFaceAnimCaptionBox();
-                                mapHasImage = false;
-                                mapNeedsRedraw = false;
-                                mapDirectionsHasMetrics = false;
-                                mapRouteMiles = 0.0f;
-                                mapRouteMinutes = 0;
-                                s_mapDirectionsBackdropApplied = false;
-                                mapOverlayActive = true;
-                                mapOverlayUntilMs = millis() + (uint32_t)dur;
-                                // Dark slate (readable "waiting"); 0x1082 looked black on the round panel.
-                                gfx->fillScreen(0x18E3);
-                                if (currentState == STATE_UPLOADING) {
-                                    suppressUploadThinkingAfterMap = true;
-                                }
-                            } else {
+                            {
                                 setFaceAnimWordsFromPayload(w);
                                 gfx->fillScreen(BLACK);
                                 // Force caption redraw; screen was cleared even if words match last animation.
@@ -2512,76 +2111,9 @@ void setupWiFi() {
                                 faceAnimStartMs = millis();
                                 faceAnimUntilMs = millis() + (uint32_t)FACE_ANIM_DURATION_MS;
                                 idleAnim.hasPrevFrame = false;
-                                if (!timeScreenActive && !weatherOverlayActive && !idleAnim.hasPrevFrame) {
+                                if (!timeScreenActive && !idleAnim.hasPrevFrame) {
                                     idleAnim.hasPrevFrame = false;
                                 }
-                            }
-                        } else if (strcmp(msgType, "show_calling_card") == 0) {
-                            const char *nm = doc["name"] | "";
-                            const char *addr = doc["address"] | "";
-                            const char *cat = doc["category"] | "";
-                            strncpy(callingCardTitle, nm, sizeof(callingCardTitle) - 1);
-                            callingCardTitle[sizeof(callingCardTitle) - 1] = '\0';
-                            strncpy(callingCardAddress, addr, sizeof(callingCardAddress) - 1);
-                            callingCardAddress[sizeof(callingCardAddress) - 1] = '\0';
-                            strncpy(callingCardCategory, cat, sizeof(callingCardCategory) - 1);
-                            callingCardCategory[sizeof(callingCardCategory) - 1] = '\0';
-                            callingCardHasRating = doc.containsKey("rating");
-                            callingCardRating = doc["rating"] | 0.0f;
-                            callingCardHasReviewCount = doc.containsKey("review_count");
-                            callingCardReviewCount = (int32_t)(doc["review_count"] | 0);
-                            int dur = doc["duration_ms"] | (int)MAP_OVERLAY_EXTEND_MS;
-                            if (dur < 800) {
-                                dur = 800;
-                            }
-                            if (dur > 60000) {
-                                dur = 60000;
-                            }
-                            int pwi = doc["photo_w"] | CALLING_CARD_DEFAULT_PHOTO_W;
-                            int phi = doc["photo_h"] | CALLING_CARD_DEFAULT_PHOTO_H;
-                            if (pwi > 0 && pwi <= MAP_DISPLAY_PX) {
-                                callingCardPhotoW = (int16_t)pwi;
-                            } else {
-                                callingCardPhotoW = CALLING_CARD_DEFAULT_PHOTO_W;
-                            }
-                            if (phi > 0 && phi < MAP_DISPLAY_PX) {
-                                callingCardPhotoH = (int16_t)phi;
-                            } else {
-                                callingCardPhotoH = CALLING_CARD_DEFAULT_PHOTO_H;
-                            }
-                            callingCardHasPhoto = false;
-                            callingCardOverlayActive = true;
-                            callingCardNeedsRedraw = true;
-                            callingCardOverlayUntilMs = millis() + (uint32_t)dur;
-                            faceAnimActive = false;
-                            faceAnimWords[0] = '\0';
-                            clearFaceAnimCaptionBox();
-                            if (currentState == STATE_UPLOADING) {
-                                suppressUploadThinkingAfterCallingCard = true;
-                            }
-                        } else if (strcmp(msgType, "show_weather") == 0) {
-                            float tRaw = doc["temperature"] | 0.0f;
-                            weatherTempDisplay = (int)(tRaw >= 0.0f ? (tRaw + 0.5f) : (tRaw - 0.5f));
-                            int dur = doc["duration_ms"] | 5000;
-                            const char* cond = doc["condition"] | "cloudy";
-                            if (strcmp(cond, "sunny") == 0) {
-                                weatherKind = WEATHER_KIND_SUNNY;
-                            } else if (strcmp(cond, "cloudy") == 0) {
-                                weatherKind = WEATHER_KIND_CLOUDY;
-                            } else if (strcmp(cond, "partially_cloudy") == 0) {
-                                weatherKind = WEATHER_KIND_PARTIALLY_CLOUDY;
-                            } else if (strcmp(cond, "raining") == 0) {
-                                weatherKind = WEATHER_KIND_RAINING;
-                            } else if (strcmp(cond, "snowing") == 0) {
-                                weatherKind = WEATHER_KIND_SNOWING;
-                            } else {
-                                weatherKind = WEATHER_KIND_CLOUDY;
-                            }
-                            weatherOverlayActive = true;
-                            weatherNeedsRedraw = true;
-                            weatherOverlayUntilMs = millis() + (uint32_t)dur;
-                            if (currentState == STATE_UPLOADING) {
-                                suppressUploadThinkingAfterWeather = true;
                             }
                         } else if (strcmp(status, "error") == 0) {
                             // Don't leave user stuck in thinking animation on backend errors.
@@ -2591,69 +2123,7 @@ void setupWiFi() {
                 }
                 break;
             case WStype_BIN:
-                if (payload && length > 1 && payload[0] == 0x04) {
-                    const uint8_t *jpg = payload + 1;
-                    size_t jpgLen = length - 1;
-                    if (s_mapRgb565 == nullptr) {
-                        s_mapRgb565 = (uint16_t *)heap_caps_malloc(
-                            MAP_DISPLAY_PX * MAP_DISPLAY_PX * sizeof(uint16_t),
-                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                    }
-                    if (s_mapRgb565 != nullptr && jpgLen > 0) {
-                        if (s_jpegDec.openRAM((uint8_t *)jpg, (int32_t)jpgLen, mapJpegDrawCallback)) {
-                            // draw16bitRGBBitmap consumes native RGB565 in this buffer path.
-                            s_jpegDec.setPixelType(RGB565_LITTLE_ENDIAN);
-                            s_jpegDec.decode(0, 0, 0);
-                            s_jpegDec.close();
-                            mapHasImage = true;
-                            s_mapDirectionsBackdropApplied = false;
-                            mapNeedsRedraw = true;
-                            mapOverlayActive = true;
-                            mapOverlayUntilMs = millis() + MAP_OVERLAY_EXTEND_MS;
-                            if (currentState == STATE_UPLOADING) {
-                                suppressUploadThinkingAfterMap = true;
-                            }
-                        } else {
-                            Serial.printf("[map] JPEG decode failed (%u bytes)\n", (unsigned)jpgLen);
-                        }
-                    }
-                } else if (payload && length > 1 && payload[0] == 0x05) {
-                    const uint8_t *jpg = payload + 1;
-                    size_t jpgLen = length - 1;
-                    if (jpgLen > 32 && s_jpegDecCallingCard.openRAM((uint8_t *)jpg, (int32_t)jpgLen, callingCardJpegDrawCallback)) {
-                        s_jpegDecCallingCard.setPixelType(RGB565_LITTLE_ENDIAN);
-                        int iw = s_jpegDecCallingCard.getWidth();
-                        int ih = s_jpegDecCallingCard.getHeight();
-                        if (iw > 0 && ih > 0 && iw <= MAP_DISPLAY_PX && ih <= MAP_DISPLAY_PX) {
-                            callingCardPhotoW = (int16_t)iw;
-                            callingCardPhotoH = (int16_t)ih;
-                            size_t need = (size_t)iw * (size_t)ih * sizeof(uint16_t);
-                            if (need > s_callingCardPhotoCapacity || s_callingCardPhoto565 == nullptr) {
-                                if (s_callingCardPhoto565) {
-                                    heap_caps_free(s_callingCardPhoto565);
-                                    s_callingCardPhoto565 = nullptr;
-                                }
-                                s_callingCardPhoto565 = (uint16_t *)heap_caps_malloc(
-                                    need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                                s_callingCardPhotoCapacity = s_callingCardPhoto565 ? need : 0;
-                            }
-                            if (s_callingCardPhoto565 != nullptr && need <= s_callingCardPhotoCapacity) {
-                                memset(s_callingCardPhoto565, 0, need);
-                                s_jpegDecCallingCard.decode(0, 0, 0);
-                                callingCardHasPhoto = true;
-                                callingCardNeedsRedraw = true;
-                                callingCardOverlayActive = true;
-                                callingCardOverlayUntilMs = millis() + MAP_OVERLAY_EXTEND_MS;
-                                if (currentState == STATE_UPLOADING) {
-                                    suppressUploadThinkingAfterCallingCard = true;
-                                }
-                            }
-                        }
-                        s_jpegDecCallingCard.close();
-                    } else if (jpgLen > 0) {
-                        Serial.printf("[calling_card] JPEG decode failed (%u bytes)\n", (unsigned)jpgLen);
-                    }
-                }
+                // Map/calling-card binary packets (0x04/0x05) removed.
                 break;
             case WStype_ERROR:          
             case WStype_FRAGMENT_TEXT_START:
@@ -2737,7 +2207,6 @@ void uploadDataTask(void * pvParameters) {
             triggerUpload = false;
             if (!isWsConnected) {
                 currentState = STATE_IDLE;
-                suppressUploadThinkingAfterWeather = false;
                 showIdleEyes();
             }
         }
@@ -2809,7 +2278,7 @@ void loop() {
 
     // Force a full refresh on transitions to/from the thinking animation.
     if (currentState != previousVisualState) {
-        if ((currentState == STATE_UPLOADING || previousVisualState == STATE_UPLOADING) && !weatherOverlayActive && !mapOverlayActive
+        if ((currentState == STATE_UPLOADING || previousVisualState == STATE_UPLOADING) && !mapOverlayActive
             && !callingCardOverlayActive) {
             gfx->fillScreen(BLACK);
             idleAnim.hasPrevFrame = false;
@@ -2822,24 +2291,13 @@ void loop() {
         previousVisualState = currentState;
     }
 
-    if (weatherOverlayActive && millis() >= weatherOverlayUntilMs) {
-        weatherOverlayActive = false;
-        idleAnim.hasPrevFrame = false;
-        if (!timeScreenActive && !faceAnimActive && !mapOverlayActive && !callingCardOverlayActive) {
-            showIdleEyes();
-            lastIdleEyesUpdate = 0;
-        } else {
-            gfx->fillScreen(BLACK);
-        }
-    }
-
     if (callingCardOverlayActive && millis() >= callingCardOverlayUntilMs) {
         callingCardOverlayActive = false;
         callingCardHasPhoto = false;
         callingCardNeedsRedraw = false;
         suppressUploadThinkingAfterCallingCard = false;
         idleAnim.hasPrevFrame = false;
-        if (!timeScreenActive && !faceAnimActive && !weatherOverlayActive && !mapOverlayActive) {
+        if (!timeScreenActive && !faceAnimActive && !mapOverlayActive) {
             showIdleEyes();
             lastIdleEyesUpdate = 0;
         } else {
@@ -2857,7 +2315,7 @@ void loop() {
         s_mapDirectionsBackdropApplied = false;
         suppressUploadThinkingAfterMap = false;
         idleAnim.hasPrevFrame = false;
-        if (!timeScreenActive && !faceAnimActive && !weatherOverlayActive && !callingCardOverlayActive) {
+        if (!timeScreenActive && !faceAnimActive && !callingCardOverlayActive) {
             showIdleEyes();
             lastIdleEyesUpdate = 0;
         } else {
@@ -2874,7 +2332,7 @@ void loop() {
         idleAnim.hasPrevFrame = false;
         uploadAnim.hasPrevFrame = false;
         recordingAnim.hasPrevFrame = false;
-        if (!timeScreenActive && !weatherOverlayActive && !mapOverlayActive && !callingCardOverlayActive
+        if (!timeScreenActive && !mapOverlayActive && !callingCardOverlayActive
             && currentState == STATE_IDLE) {
             lastIdleEyesUpdate = 0;
         }
@@ -3029,7 +2487,6 @@ void loop() {
                 }
                 else if (currentState == STATE_IDLE) {
                     Serial.println("\n*** TAP DETECTED: STARTING RECORD ***\n");
-                    weatherOverlayActive = false;
                     callingCardOverlayActive = false;
                     currentState = STATE_RECORDING;
                     timeScreenActive = false;
@@ -3044,7 +2501,6 @@ void loop() {
                 else if (currentState == STATE_RECORDING) {
                     Serial.println("\n*** TAP DETECTED: STOPPING RECORD ***\n");
                     currentState = STATE_UPLOADING;
-                    suppressUploadThinkingAfterWeather = false;
                     timeScreenActive = false;
                     resetTimeScreenCache();
                     lastUploadingEyesUpdate = 0; // force immediate redraw
@@ -3114,12 +2570,9 @@ void loop() {
     if (geminiFirstTokenReceived && currentState == STATE_UPLOADING) {
         geminiFirstTokenReceived = false;
         currentState = STATE_IDLE;
-        suppressUploadThinkingAfterWeather = false;
         suppressUploadThinkingAfterMap = false;
         suppressUploadThinkingAfterCallingCard = false;
-        if (weatherOverlayActive) {
-            weatherNeedsRedraw = true;
-        } else if (callingCardOverlayActive) {
+        if (callingCardOverlayActive) {
             callingCardNeedsRedraw = true;
             lastIdleEyesUpdate = 0;
         } else if (mapOverlayActive) {
@@ -3132,14 +2585,7 @@ void loop() {
         }
     }
 
-    if (weatherOverlayActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
-        if (weatherNeedsRedraw) {
-            drawWeatherOverlay();
-            weatherNeedsRedraw = false;
-        } else {
-            updateWeatherOverlayAnimation(millis());
-        }
-    } else if (callingCardOverlayActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
+    if (callingCardOverlayActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
         if (callingCardNeedsRedraw) {
             drawCallingCardOverlay();
             callingCardNeedsRedraw = false;
@@ -3156,7 +2602,7 @@ void loop() {
         processAudio();
         captureVideoFrame(); 
     } else if (currentState == STATE_UPLOADING) {
-        if (!suppressUploadThinkingAfterWeather && !suppressUploadThinkingAfterMap && !suppressUploadThinkingAfterCallingCard) {
+        if (!suppressUploadThinkingAfterMap && !suppressUploadThinkingAfterCallingCard) {
             updateUploadingThinkingAnimation();
         } else if (!timeScreenActive) {
             updateIdleEyesAnimation();

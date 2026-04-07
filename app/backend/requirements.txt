@@ -21,7 +21,3 @@ python-multipart
 opencv-python-headless
 imageio
 imageio-ffmpeg
-# semantic-router[fastembed]: on Python <3.13 pulls fastembed 0.3.x; on 3.13+ the extra installs no fastembed — pin below.
-semantic-router[fastembed]>=0.1.12
-fastembed>=0.3.0,<0.4; python_version < "3.13"
-fastembed>=0.5.0,<0.9; python_version >= "3.13"
