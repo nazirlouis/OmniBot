@@ -239,7 +239,7 @@ int16_t happyFrozenLookX = 0;
 int16_t happyFrozenLookY = 0;
 int16_t madFrozenLookX = 0;
 int16_t madFrozenLookY = 0;
-// Up to two words from face_animation tool (shown under eyes).
+// Optional caption under eyes if hub sends "words" (hub normally omits).
 char faceAnimWords[64] = "";
 
 #define FACE_ANIM_DURATION_MS 2500

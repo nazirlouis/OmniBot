@@ -68,9 +68,8 @@ DEFAULT_GREETING_COOLDOWN_MINUTES = 30
 DEFAULT_SYSTEM_INSTRUCTION = (
     "You control a small desktop robot named Pixel with a round face display.\n\n"
     "Animation tools:\n"
-    "- Use the `show_face_animation` / `face_animation` tool for conversational or emotional states only "
-    "(animation = speaking, happy, or mad). For these, pass at most two short words that summarize your "
-    "overall reply (e.g. \"thanks\", \"nice one\").\n"
+    "- Use the `show_face_animation` / `face_animation` tool for conversational or emotional states only. "
+    "Pass a single argument: `animation` = speaking, happy, or mad.\n"
     "At most one animation tool should be used per turn. Do not call more than one of: "
     "`face_animation` or `show_face_animation` in the same turn.\n\n"
     "When asked about food, activities, or places near me, provide exactly ONE recommendation and do not list multiple options."
@@ -131,8 +130,7 @@ FACE_ANIMATION_FUNCTION_DECLARATION = {
     "name": "face_animation",
     "description": (
         "Animates Pixel's face on the round display for conversational or emotional states only. "
-        "For speaking/happy/mad, pass at most two short words that summarize the overall reply "
-        "(e.g. \"thanks\", \"nice one\")."
+        "Pass only which face to show: speaking, happy, or mad."
     ),
     "parameters": {
         "type": "object",
@@ -140,16 +138,10 @@ FACE_ANIMATION_FUNCTION_DECLARATION = {
             "animation": {
                 "type": "string",
                 "enum": ["speaking", "happy", "mad"],
-                "description": ("Display mode: speaking, happy, or mad."),
-            },
-            "words": {
-                "type": "string",
-                "description": (
-                    "For speaking/happy/mad: at most two words (e.g. \"hello\", \"nice one\")."
-                ),
+                "description": "Which face animation to display: speaking, happy, or mad.",
             },
         },
-        "required": ["animation", "words"],
+        "required": ["animation"],
     },
 }
 
@@ -813,11 +805,6 @@ async def _push_timezone_to_all_streams(timezone_rule: str) -> None:
             print(f"Failed to push timezone to stream: {e}")
 
 
-def _clamp_face_animation_words(raw: str) -> str:
-    parts = (raw or "").strip().split()
-    return " ".join(parts[:2])
-
-
 def _make_face_animation_tool(device_id: str):
     """Builder so face_animation is bound to the correct bot device."""
 
@@ -825,11 +812,10 @@ def _make_face_animation_tool(device_id: str):
         FACE_ANIMATION_FUNCTION_DECLARATION["parameters"]["properties"]["animation"]["enum"]
     )
 
-    def face_animation(animation: str, words: str = "") -> dict:
+    def face_animation(animation: str) -> dict:
         a = (animation or "").strip().lower()
         if a not in allowed:
             a = "speaking"
-        w = _clamp_face_animation_words(words or "")
         tool_state = turn_tool_state_by_device.setdefault(
             device_id, {"face_animation": False}
         )
@@ -841,24 +827,23 @@ def _make_face_animation_tool(device_id: str):
             }
         tool_state["face_animation"] = True
 
-        _schedule_face_animation_to_esp32(device_id, a, w)
+        _schedule_face_animation_to_esp32(device_id, a)
         anim_ms = FACE_ANIMATION_DISPLAY_MS
         return {"ok": True, "display": "face animation queued on robot"}
 
     return face_animation
 
 
-def show_face_animation(device_id: str, animation: str, words: str = "") -> dict:
+def show_face_animation(device_id: str, animation: str) -> dict:
     """Convenience wrapper to trigger an expressive face animation (speaking/happy/mad).
 
-    Uses the same semantics, clamping, guardrails, and broadcast behavior
-    as the Gemini `face_animation` tool.
+    Uses the same semantics, guardrails, and broadcast behavior as the Gemini `face_animation` tool.
     """
     face_animation_fn = _make_face_animation_tool(device_id)
-    return face_animation_fn(animation=animation, words=words)
+    return face_animation_fn(animation=animation)
 
 
-async def _send_face_animation_json_to_esp32(device_id: str, animation: str, words: str) -> None:
+async def _send_face_animation_json_to_esp32(device_id: str, animation: str) -> None:
     ws = get_active_esp32_socket(device_id)
     if not ws:
         return
@@ -867,7 +852,6 @@ async def _send_face_animation_json_to_esp32(device_id: str, animation: str, wor
         "type": "face_animation",
         "animation": animation,
         "duration_ms": dur,
-        "words": words,
     }
     try:
         await ws.send_text(json.dumps(payload))
@@ -875,13 +859,13 @@ async def _send_face_animation_json_to_esp32(device_id: str, animation: str, wor
         print(f"Failed to send face_animation to ESP32: {e}")
 
 
-def _schedule_face_animation_to_esp32(device_id: str, animation: str, words: str) -> None:
+def _schedule_face_animation_to_esp32(device_id: str, animation: str) -> None:
     loop = _main_async_loop
     if loop is None:
         print("face_animation: no async loop yet; skipping robot display")
         return
     asyncio.run_coroutine_threadsafe(
-        _send_face_animation_json_to_esp32(device_id, animation, words),
+        _send_face_animation_json_to_esp32(device_id, animation),
         loop,
     )
 
@@ -1851,7 +1835,9 @@ async def stream_chat_turn_response(device_id: str, message_content):
                     result = {"error": "Unknown function"}
                     
                     if fname == "face_animation":
-                        result = _make_face_animation_tool(device_id)(**args)
+                        result = _make_face_animation_tool(device_id)(
+                            animation=str(args.get("animation") or "speaking")
+                        )
                     func_responses.append(
                         types.Part(
                             function_response=types.FunctionResponse(
@@ -1946,7 +1932,7 @@ async def _process_presence_jpeg(device_id: str, jpeg_bytes: bytes) -> None:
                 )
             except Exception as e:
                 print(f"[face] failed to send presence reply to ESP32: {e}")
-        _schedule_face_animation_to_esp32(device_id, "happy", "hey")
+        _schedule_face_animation_to_esp32(device_id, "happy")
     except Exception as e:
         print(f"[face] presence greeting failed: {e}")
         last_presence_greeting_at.pop(key, None)
