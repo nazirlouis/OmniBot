@@ -2109,6 +2109,9 @@ async def esp32_stream_endpoint(websocket: WebSocket):
             )
             video_frames = sess.pop("video_wake_clip", None) or []
             await _run_gemini_audio_turn(websocket, did, raw_pcm, video_frames)
+            wp_open = sess.get("wake_processor")
+            if wp_open:
+                wp_open.begin_follow_up_window()
         except Exception as e:
             print(f"\nAPI Error (wake): {e}")
             error_msg = str(e)

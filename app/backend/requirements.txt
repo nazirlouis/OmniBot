@@ -10,7 +10,7 @@ propcache>=0.3.0
 
 requests
 python-dotenv
-# Pillow + fastembed: 3.12 (Docker/CI) uses fastembed 0.3.x + Pillow 10.x. Python 3.13+ has no fastembed 0.3 wheels — use 0.5+ and Pillow 11+.
+# Pillow: Linux Docker/CI use 3.11 + Pillow 10.x. Python 3.13+ has different wheel sets — use Pillow 11+.
 Pillow>=10.3.0,<11.0.0; python_version < "3.13"
 Pillow>=11.0.0,<12.0.0; python_version >= "3.13"
 fastapi
@@ -24,6 +24,7 @@ imageio-ffmpeg
 # Face embeddings: ONNX Runtime + InsightFace (no TensorFlow; works on more Windows CPUs)
 onnxruntime>=1.16.0
 insightface>=0.7.3
+# Linux: transitive tflite-runtime (PyPI) supports Python 3.8–3.11 only; use 3.11 for Docker/CI on Linux. ONNX inference does not need it at runtime.
 openwakeword>=0.6.0
 # webrtcvad imports pkg_resources; setuptools>=81 no longer exposes it as top-level — pin for compatibility
 setuptools>=69,<81

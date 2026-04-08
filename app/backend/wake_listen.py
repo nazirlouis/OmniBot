@@ -13,6 +13,8 @@ Environment:
   OMNIBOT_WAKE_THRESHOLD    Score 0..1 to trigger wake (default 0.55).
   OMNIBOT_WAKE_SILENCE_MS   Trailing silence to end utterance (default 550).
   OMNIBOT_WAKE_COOLDOWN_S   Seconds after a wake before detecting again (default 1.2).
+  OMNIBOT_FOLLOW_UP_S       After each Gemini reply, seconds of VAD-only listening without
+                            repeating the wake phrase (default 5). Set 0 to disable.
 """
 
 from __future__ import annotations
@@ -116,6 +118,9 @@ class WakeListenProcessor:
     _cooldown_until: float = field(init=False, default=0.0)
     _capture_started_at: Optional[float] = field(init=False, default=None)
     paused: bool = field(init=False, default=False)
+    _follow_up_until: Optional[float] = field(init=False, default=None)
+    _followup_scan_carry: bytearray = field(init=False, default_factory=bytearray)
+    _capture_from_followup: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         self.model, self.model_label = build_openwakeword_model()
@@ -130,6 +135,16 @@ class WakeListenProcessor:
         self._pre_roll_bytes = int(PRE_ROLL_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE)
         self._ring = bytearray()
 
+    def begin_follow_up_window(self, seconds: Optional[float] = None) -> None:
+        """After a bot reply, listen for more speech without the wake phrase (VAD-only)."""
+        raw = _env_float("OMNIBOT_FOLLOW_UP_S", 5.0) if seconds is None else float(seconds)
+        if raw <= 0:
+            self._follow_up_until = None
+            self._followup_scan_carry.clear()
+            return
+        self._follow_up_until = time.monotonic() + raw
+        self._cooldown_until = 0.0
+
     def set_paused(self, p: bool) -> None:
         self.paused = bool(p)
         if self.paused:
@@ -140,6 +155,7 @@ class WakeListenProcessor:
             self._utterance = bytearray()
             self._vad_carry = bytearray()
             self._silence_ms_acc = 0.0
+            self._followup_scan_carry.clear()
             try:
                 self.model.reset()
             except Exception:
@@ -171,6 +187,10 @@ class WakeListenProcessor:
         if self.paused:
             return
 
+        if self._follow_up_until is not None and now >= self._follow_up_until:
+            self._follow_up_until = None
+            self._followup_scan_carry.clear()
+
         if self._capturing:
             self._utterance.extend(pcm)
             self._vad_carry.extend(pcm)
@@ -188,7 +208,49 @@ class WakeListenProcessor:
                 await self._finalize_utterance()
             return
 
-        # Listening for wake
+        # Follow-up window: VAD speech onset only (no wake phrase)
+        if (
+            self._follow_up_until is not None
+            and now < self._follow_up_until
+            and now >= self._cooldown_until
+        ):
+            self._ring.extend(pcm)
+            self._trim_ring()
+            self._followup_scan_carry.extend(pcm)
+            while len(self._followup_scan_carry) >= VAD_FRAME_BYTES:
+                frame = bytes(self._followup_scan_carry[:VAD_FRAME_BYTES])
+                del self._followup_scan_carry[:VAD_FRAME_BYTES]
+                if not self.vad.is_speech(frame, SAMPLE_RATE):
+                    continue
+                if self.on_capture_start:
+                    await self.on_capture_start()
+                self._capturing = True
+                self._capture_from_followup = True
+                self._capture_started_at = time.monotonic()
+                self._utterance = bytearray(self._ring)
+                self._ring.clear()
+                self._utterance.extend(frame)
+                self._vad_carry = bytearray(frame)
+                self._silence_ms_acc = 0.0
+                while len(self._followup_scan_carry) >= VAD_FRAME_BYTES:
+                    frame2 = bytes(self._followup_scan_carry[:VAD_FRAME_BYTES])
+                    del self._followup_scan_carry[:VAD_FRAME_BYTES]
+                    self._utterance.extend(frame2)
+                    self._vad_carry.extend(frame2)
+                    if self._process_vad_tail():
+                        await self._finalize_utterance()
+                        return
+                rest = bytes(self._followup_scan_carry)
+                self._followup_scan_carry.clear()
+                if rest:
+                    self._utterance.extend(rest)
+                    self._vad_carry.extend(rest)
+                    if self._process_vad_tail():
+                        await self._finalize_utterance()
+                return
+            return
+
+        # Listening for wake (cooldown after wake capture; skipped for follow-up utterances)
         if now < self._cooldown_until:
             self._ring.extend(pcm)
             self._trim_ring()
@@ -205,9 +267,11 @@ class WakeListenProcessor:
             return
 
         if self._max_wake_score(scores) >= self.wake_threshold:
+            self._followup_scan_carry.clear()
             if self.on_capture_start:
                 await self.on_capture_start()
             self._capturing = True
+            self._capture_from_followup = False
             self._capture_started_at = time.monotonic()
             self._utterance = bytearray(self._ring)
             self._vad_carry = bytearray()
@@ -239,7 +303,9 @@ class WakeListenProcessor:
         self._utterance = bytearray()
         self._vad_carry = bytearray()
         self._silence_ms_acc = 0.0
-        self._cooldown_until = time.monotonic() + self.cooldown_s
+        if not self._capture_from_followup:
+            self._cooldown_until = time.monotonic() + self.cooldown_s
+        self._capture_from_followup = False
         try:
             self.model.reset()
         except Exception:

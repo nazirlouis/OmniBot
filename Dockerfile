@@ -7,7 +7,8 @@ COPY app/frontend/ ./
 RUN npm run build
 
 # --- Stage 2: FastAPI hub + static UI ---
-FROM python:3.12-slim-bookworm
+# Match CI: openwakeword requires tflite-runtime on Linux, which has no cp312 wheels on PyPI.
+FROM python:3.11-slim-bookworm
 
 # OpenCV headless and common native deps for wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \

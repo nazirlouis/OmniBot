@@ -13,7 +13,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # openwakeword pulls tflite-runtime on Linux; PyPI wheels exist for 3.8–3.11 only (not 3.12).
+          python-version: "3.11"
       - name: Install dependencies
         run: pip install -r app/backend/requirements.txt
       - name: Compile Python
