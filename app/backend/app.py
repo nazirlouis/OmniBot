@@ -50,6 +50,7 @@ from face_matching import (
     list_profiles,
     match_probe_jpeg,
 )
+from wake_listen import WakeListenProcessor
 
 # ==========================================
 #          LOAD SECRETS & SETUP (see hub_config: OMNIBOT_DATA_DIR, .env, hub_secrets.json)
@@ -59,6 +60,7 @@ from face_matching import (
 DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_TIMEZONE_RULE = "EST5EDT,M3.2.0/2,M11.1.0/2"
 DEFAULT_VISION_ENABLED = False
+DEFAULT_WAKE_WORD_ENABLED = True
 DEFAULT_PRESENCE_SCAN_ENABLED = False
 DEFAULT_PRESENCE_SCAN_INTERVAL_SEC = 5
 DEFAULT_GREETING_COOLDOWN_MINUTES = 30
@@ -259,6 +261,7 @@ def get_bot_settings(device_id: str):
             1,
             720,
         ),
+        "wake_word_enabled": bool(bot_conf.get("wake_word_enabled", DEFAULT_WAKE_WORD_ENABLED)),
     }
 
 
@@ -271,6 +274,7 @@ def _default_stored_bot_settings() -> dict:
         "presence_scan_enabled": DEFAULT_PRESENCE_SCAN_ENABLED,
         "presence_scan_interval_sec": DEFAULT_PRESENCE_SCAN_INTERVAL_SEC,
         "greeting_cooldown_minutes": DEFAULT_GREETING_COOLDOWN_MINUTES,
+        "wake_word_enabled": DEFAULT_WAKE_WORD_ENABLED,
     }
 
 
@@ -462,6 +466,7 @@ class BotSettingsSchema(BaseModel):
     model: str
     system_instruction: str
     vision_enabled: bool = DEFAULT_VISION_ENABLED
+    wake_word_enabled: bool = DEFAULT_WAKE_WORD_ENABLED
     presence_scan_enabled: bool = DEFAULT_PRESENCE_SCAN_ENABLED
     presence_scan_interval_sec: int = Field(default=DEFAULT_PRESENCE_SCAN_INTERVAL_SEC, ge=3, le=300)
     greeting_cooldown_minutes: int = Field(default=DEFAULT_GREETING_COOLDOWN_MINUTES, ge=1, le=720)
@@ -643,6 +648,7 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
         "model": new_settings.model,
         "system_instruction": new_settings.system_instruction,
         "vision_enabled": bool(new_settings.vision_enabled),
+        "wake_word_enabled": bool(new_settings.wake_word_enabled),
         "presence_scan_enabled": bool(new_settings.presence_scan_enabled),
         "presence_scan_interval_sec": int(new_settings.presence_scan_interval_sec),
         "greeting_cooldown_minutes": int(new_settings.greeting_cooldown_minutes),
@@ -651,7 +657,9 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
     save_all_settings(settings)
     history_by_device.pop(device_id, None)
     vision_enabled_by_device[device_id] = row["vision_enabled"]
+    wake_word_enabled_by_device[device_id] = row["wake_word_enabled"]
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
+    await _send_runtime_wake_word_to_esp32(device_id, row["wake_word_enabled"])
     await _send_runtime_presence_scan_to_esp32(device_id)
     if _maps_debug_enabled():
         _maps_debug(
@@ -673,7 +681,9 @@ async def reset_settings_to_default(device_id: str):
     save_all_settings(settings)
     history_by_device.pop(device_id, None)
     vision_enabled_by_device[device_id] = row["vision_enabled"]
+    wake_word_enabled_by_device[device_id] = row["wake_word_enabled"]
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
+    await _send_runtime_wake_word_to_esp32(device_id, row["wake_word_enabled"])
     await _send_runtime_presence_scan_to_esp32(device_id)
     return {"status": "success", "settings": get_bot_settings(device_id)}
 
@@ -755,6 +765,7 @@ active_streams = {}
 history_by_device: dict[str, list] = {}
 gemini_turn_locks: dict[str, asyncio.Lock] = {}
 vision_enabled_by_device = {}
+wake_word_enabled_by_device = {}
 timezone_rule_by_device = {}
 # (device_id, profile_id) -> unix time of last presence-triggered greeting
 last_presence_greeting_at: dict[tuple[str, str], float] = {}
@@ -766,6 +777,7 @@ def _purge_bot_runtime_state(device_id: str) -> None:
     """Clear per-device in-memory hub state (chat history, locks, tool turn state)."""
     history_by_device.pop(device_id, None)
     vision_enabled_by_device.pop(device_id, None)
+    wake_word_enabled_by_device.pop(device_id, None)
     timezone_rule_by_device.pop(device_id, None)
     gemini_turn_locks.pop(device_id, None)
     turn_tool_state_by_device.pop(device_id, None)
@@ -872,6 +884,12 @@ def is_vision_enabled(device_id: str) -> bool:
     return bool(get_bot_settings(device_id).get("vision_enabled", DEFAULT_VISION_ENABLED))
 
 
+def is_wake_word_enabled(device_id: str) -> bool:
+    if device_id in wake_word_enabled_by_device:
+        return bool(wake_word_enabled_by_device[device_id])
+    return bool(get_bot_settings(device_id).get("wake_word_enabled", DEFAULT_WAKE_WORD_ENABLED))
+
+
 async def _send_runtime_vision_to_esp32(device_id: str, enabled: bool) -> None:
     """Pushes vision/capture setting to Pixel so firmware can skip camera work when off."""
     ws = get_active_esp32_socket(device_id)
@@ -881,6 +899,17 @@ async def _send_runtime_vision_to_esp32(device_id: str, enabled: bool) -> None:
         await ws.send_text(json.dumps({"type": "runtime_vision", "enabled": bool(enabled)}))
     except Exception as e:
         print(f"Failed to send runtime_vision to ESP32: {e}")
+
+
+async def _send_runtime_wake_word_to_esp32(device_id: str, enabled: bool) -> None:
+    """Push wake-word streaming on/off to Pixel firmware."""
+    ws = get_active_esp32_socket(device_id)
+    if not ws:
+        return
+    try:
+        await ws.send_text(json.dumps({"type": "runtime_wake_word", "enabled": bool(enabled)}))
+    except Exception as e:
+        print(f"Failed to send runtime_wake_word to ESP32: {e}")
 
 
 def get_timezone_rule(device_id: str) -> str:
@@ -1942,6 +1971,48 @@ async def _process_enrollment_jpeg(device_id: str, jpeg_bytes: bytes) -> None:
         print(f"[face] enrollment failed (no face or represent error) for {device_id}/{pid}")
 
 
+async def _run_gemini_audio_turn(
+    websocket: WebSocket,
+    device_id: str,
+    raw_pcm: bytes,
+    video_frames: list,
+) -> str:
+    """Build WAV (+ optional MP4), stream one Gemini turn, send JSON reply on same ESP32 socket."""
+    use_vision = is_vision_enabled(device_id) and bool(video_frames)
+    wav_header = create_wav_header(len(raw_pcm), sample_rate=16000)
+    audio_bytes = wav_header + raw_pcm
+
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    audio_data_url = f"data:audio/wav;base64,{audio_b64}"
+    await manager.broadcast({"type": "audio_captured", "data": audio_data_url})
+
+    video_bytes = b""
+    if use_vision:
+        print("Assembling video in background...", end=" ", flush=True)
+        video_bytes = await asyncio.to_thread(assemble_video, video_frames, 10)
+        print(f"Done! ({len(video_bytes)} bytes)")
+
+        if video_bytes:
+            video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+            video_data_url = f"data:video/mp4;base64,{video_b64}"
+            await manager.broadcast({"type": "video_captured", "data": video_data_url})
+
+    print("Sending to Gemini...", end=" ", flush=True)
+    turn_content = [
+        "Listen to the audio and answer the user's question.",
+        types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+    ]
+    if use_vision and video_bytes:
+        turn_content[0] = "Listen to the audio and watch the video. Answer the user's question."
+        turn_content.append(types.Part.from_bytes(data=video_bytes, mime_type="video/mp4"))
+
+    full_text = await stream_chat_turn_response(device_id, turn_content)
+    print(f"\n>>> GEMINI SAYS: {full_text}")
+
+    await websocket.send_text(json.dumps({"status": "success", "reply": full_text}))
+    return full_text
+
+
 @app.websocket("/ws/stream")
 async def esp32_stream_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -1949,11 +2020,10 @@ async def esp32_stream_endpoint(websocket: WebSocket):
 
     print("ESP32 connected to streaming endpoint!")
 
-    # Initialize session buffers
+    # Initialize session (wake streaming + face enrollment / presence binary packets)
     active_streams[websocket] = {
-        "audio_buffer": bytearray(),
-        "video_frames": [],
         "device_id": stream_device_id,
+        "wake_processor": None,
     }
     record_bot_seen(stream_device_id)
     await manager.broadcast(
@@ -1982,8 +2052,46 @@ async def esp32_stream_endpoint(websocket: WebSocket):
             )
         )
         await _send_runtime_presence_scan_to_esp32(stream_device_id)
+        await _send_runtime_wake_word_to_esp32(stream_device_id, is_wake_word_enabled(stream_device_id))
     except Exception as e:
         print(f"Could not sync runtime settings to ESP32 on connect: {e}")
+
+    async def _handle_wake_utterance(raw_pcm: bytes) -> None:
+        sess = active_streams.get(websocket)
+        if not sess:
+            return
+        did = sess["device_id"]
+        wp = sess.get("wake_processor")
+        if wp:
+            wp.set_paused(True)
+        try:
+            await websocket.send_text(json.dumps({"type": "wake_processing"}))
+            await manager.broadcast(
+                {
+                    "type": "processing_started",
+                    "device_id": did,
+                    "data": "Wake utterance captured. Processing via Gemini...",
+                }
+            )
+            await _run_gemini_audio_turn(websocket, did, raw_pcm, [])
+        except Exception as e:
+            print(f"\nAPI Error (wake): {e}")
+            error_msg = str(e)
+            await manager.broadcast(
+                {
+                    "type": "error",
+                    "device_id": did,
+                    "data": error_msg,
+                    "device_stream_connected": device_stream_is_live(did),
+                }
+            )
+            try:
+                await websocket.send_text(json.dumps({"status": "error", "message": error_msg}))
+            except Exception:
+                pass
+        finally:
+            if wp:
+                wp.set_paused(False)
 
     try:
         while True:
@@ -2055,97 +2163,21 @@ async def esp32_stream_endpoint(websocket: WebSocket):
             payload = data[1:]
             
             session = active_streams[websocket]
-            
-            if packet_type == 0x01:
-                # Audio chunk
-                session["audio_buffer"].extend(payload)
-                
-            elif packet_type == 0x02:
-                # Video frame (JPEG)
-                session["video_frames"].append(payload)
-                
-            elif packet_type == 0x03:
-                # Stop Recording & Process Command
-                print(f"\n--- STOP RECORDING RECEIVED ---")
-                print(f"Collected {len(session['audio_buffer'])} bytes of audio and {len(session['video_frames'])} video frames.")
-                
-                # Broadcast to UI that processing started
-                await manager.broadcast({
-                    "type": "processing_started",
-                    "device_id": session["device_id"],
-                    "data": "Stream finished. Processing via Gemini...",
-                })
-                
-                try:
-                    use_vision = is_vision_enabled(session["device_id"])
 
-                    # 1. Create Audio Bytes with WAV Header
-                    raw_audio = bytes(session["audio_buffer"])
-                    wav_header = create_wav_header(len(raw_audio), sample_rate=16000)
-                    audio_bytes = wav_header + raw_audio
-
-                    # 2. Broadcast Audio to React UI
-                    audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-                    audio_data_url = f"data:audio/wav;base64,{audio_b64}"
-                    await manager.broadcast({
-                        "type": "audio_captured",
-                        "data": audio_data_url
-                    })
-
-                    # 3. Optionally assemble video and send to UI/model
-                    video_bytes = b""
-                    if use_vision:
-                        print("Assembling video in background...", end=" ", flush=True)
-                        video_bytes = await asyncio.to_thread(assemble_video, session["video_frames"], 10)
-                        print(f"Done! ({len(video_bytes)} bytes)")
-
-                        if video_bytes:
-                            video_b64 = base64.b64encode(video_bytes).decode('utf-8')
-                            video_data_url = f"data:video/mp4;base64,{video_b64}"
-                            await manager.broadcast({
-                                "type": "video_captured",
-                                "data": video_data_url
-                            })
-
-                    # 4. Call Gemini (local history + fresh config each turn)
-                    print("Sending to Gemini...", end=" ", flush=True)
-                    turn_content = [
-                        "Listen to the audio and answer the user's question.",
-                        types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
-                    ]
-                    if use_vision and video_bytes:
-                        turn_content[0] = "Listen to the audio and watch the video. Answer the user's question."
-                        turn_content.append(types.Part.from_bytes(data=video_bytes, mime_type="video/mp4"))
-
-                    full_text = await stream_chat_turn_response(
-                        session["device_id"],
-                        turn_content
-                    )
-
-                    print(f"\n>>> GEMINI SAYS: {full_text}")
-
-                    # Send Response back to ESP32 via same WebSocket
-                    await websocket.send_text(json.dumps({
-                        "status": "success",
-                        "reply": full_text
-                    }))
-                    
-                except Exception as e:
-                    print(f"\nAPI Error: {e}")
-                    error_msg = str(e)
-                    await manager.broadcast(
-                        {
-                            "type": "error",
-                            "device_id": session["device_id"],
-                            "data": error_msg,
-                            "device_stream_connected": device_stream_is_live(session["device_id"]),
-                        }
-                    )
-                    await websocket.send_text(json.dumps({"status": "error", "message": error_msg}))
-                
-                # Clear buffers for next interaction
-                session["audio_buffer"].clear()
-                session["video_frames"].clear()
+            if packet_type == 0x10:
+                # Continuous PCM for hub-side wake word + VAD (tap-to-record removed)
+                if not is_wake_word_enabled(session["device_id"]):
+                    continue
+                wp = session.get("wake_processor")
+                if wp is None:
+                    try:
+                        session["wake_processor"] = WakeListenProcessor(on_utterance=_handle_wake_utterance)
+                        wp = session["wake_processor"]
+                        print(f"[wake] WakeListenProcessor ready for {session['device_id']!r} (model={getattr(wp, 'model_label', '?')})")
+                    except Exception as ex:
+                        print(f"[wake] Failed to start wake listener: {ex}")
+                        continue
+                await wp.feed_pcm(payload)
 
             elif packet_type == 0x06:
                 # Presence / face-scan snapshot (not part of record upload)

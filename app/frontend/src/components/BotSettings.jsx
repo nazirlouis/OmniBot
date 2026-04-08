@@ -16,6 +16,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
   const [model, setModel] = useState('gemini-3.1-flash-lite-preview');
   const [systemInstruction, setSystemInstruction] = useState('');
   const [visionEnabled, setVisionEnabled] = useState(false);
+  const [wakeWordEnabled, setWakeWordEnabled] = useState(true);
   const [presenceScanEnabled, setPresenceScanEnabled] = useState(false);
   const [presenceIntervalSec, setPresenceIntervalSec] = useState(5);
   const [greetingCooldownMin, setGreetingCooldownMin] = useState(30);
@@ -43,6 +44,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
         setModel(data.model);
         setSystemInstruction(data.system_instruction);
         setVisionEnabled(Boolean(data.vision_enabled));
+        setWakeWordEnabled(data.wake_word_enabled !== false);
         setPresenceScanEnabled(Boolean(data.presence_scan_enabled));
         setPresenceIntervalSec(
           typeof data.presence_scan_interval_sec === 'number'
@@ -73,6 +75,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
         model,
         system_instruction: systemInstruction,
         vision_enabled: visionEnabled,
+        wake_word_enabled: wakeWordEnabled,
         presence_scan_enabled: presenceScanEnabled,
         presence_scan_interval_sec: Math.min(300, Math.max(3, Number(presenceIntervalSec) || 5)),
         greeting_cooldown_minutes: Math.min(720, Math.max(1, Number(greetingCooldownMin) || 30)),
@@ -81,6 +84,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
       setModel(saved.model);
       setSystemInstruction(saved.system_instruction);
       setVisionEnabled(Boolean(saved.vision_enabled));
+      setWakeWordEnabled(saved.wake_word_enabled !== false);
       setPresenceScanEnabled(Boolean(saved.presence_scan_enabled));
       setPresenceIntervalSec(saved.presence_scan_interval_sec ?? 5);
       setGreetingCooldownMin(saved.greeting_cooldown_minutes ?? 30);
@@ -97,7 +101,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
   const handleResetToDefaults = async () => {
     if (
       !window.confirm(
-        'Reset Pixel model, system instructions, vision, and presence scan settings to defaults? Hub clock and Maps location are not changed.'
+        'Reset Pixel model, system instructions, vision, wake word, and presence scan settings to defaults? Hub clock and Maps location are not changed.'
       )
     ) {
       return;
@@ -113,6 +117,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
       setModel(saved.model);
       setSystemInstruction(saved.system_instruction);
       setVisionEnabled(Boolean(saved.vision_enabled));
+      setWakeWordEnabled(saved.wake_word_enabled !== false);
       setPresenceScanEnabled(Boolean(saved.presence_scan_enabled));
       setPresenceIntervalSec(saved.presence_scan_interval_sec ?? 5);
       setGreetingCooldownMin(saved.greeting_cooldown_minutes ?? 30);
@@ -224,7 +229,30 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
             <option value="on">On</option>
           </select>
         </div>
-        <p className="help-text">When on, video frames are sent to Gemini with audio. Stored per bot.</p>
+        <p className="help-text">
+          When on, video can be sent to Gemini with voice turns (wake path is audio-only; tap recording removed). Stored
+          per bot.
+        </p>
+      </div>
+
+      <div className="form-group">
+        <label htmlFor="wakeWordSelect">Wake word (mic stream to hub)</label>
+        <div className="select-wrapper">
+          <select
+            id="wakeWordSelect"
+            value={wakeWordEnabled ? 'on' : 'off'}
+            onChange={(e) => setWakeWordEnabled(e.target.value === 'on')}
+            className="holo-select"
+          >
+            <option value="on">On</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <p className="help-text">
+          When on, Pixel streams the microphone to the hub for wake-word detection and end-of-speech (requires hub on
+          your LAN). Train or place a custom model as <code>pixel.onnx</code> on the hub, or use the default test model
+          (see hub logs).
+        </p>
       </div>
 
       <div className="form-group">

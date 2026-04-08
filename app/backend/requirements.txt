@@ -24,3 +24,7 @@ imageio-ffmpeg
 # Face embeddings: ONNX Runtime + InsightFace (no TensorFlow; works on more Windows CPUs)
 onnxruntime>=1.16.0
 insightface>=0.7.3
+openwakeword>=0.6.0
+# webrtcvad imports pkg_resources; setuptools>=81 no longer exposes it as top-level — pin for compatibility
+setuptools>=69,<81
+webrtcvad>=2.0.10

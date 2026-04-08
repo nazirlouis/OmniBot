@@ -80,26 +80,15 @@ Preferences preferences;
 RTC_PCF8563 rtc;
 
 #define SAMPLE_RATE 16000
-#define MAX_RECORD_SECONDS 15 
-#define FLASH_RECORD_SIZE (SAMPLE_RATE * MAX_RECORD_SECONDS * 2) 
-
-uint8_t *rec_buffer = NULL; 
-size_t recordedAudioLen = 0;
-
-#define MAX_FRAMES 150
-uint8_t* video_frames[MAX_FRAMES];
-size_t video_frame_sizes[MAX_FRAMES];
-int video_frame_count = 0;
+/** PCM bytes per wake stream packet body (hub wake + VAD). */
+#define WAKE_STREAM_CHUNK 2048
 
 WebSocketsClient webSocket;
 bool isWsConnected = false;
 /** Set true only after hub `webSocket.begin()` (Wi‑Fi connected path). Used to guard `webSocket.loop()`. */
 bool hubWebSocketEnabled = false;
 
-#define FRAME_INTERVAL_MS 100 
-unsigned long lastFrameTime = 0;
-
-enum RobotState { STATE_IDLE, STATE_RECORDING, STATE_SETUP, STATE_UPLOADING, STATE_SETTINGS };
+enum RobotState { STATE_IDLE, STATE_SETUP, STATE_UPLOADING, STATE_SETTINGS };
 volatile RobotState currentState = STATE_SETUP;
 
 // Touch & Gesture Tracking Globals
@@ -119,16 +108,16 @@ String lastRenderedDay = "";
 String lastRenderedDate = "";
 String lastRenderedTime = "";
 
-unsigned long lastRecordingEyesUpdate = 0;
 unsigned long lastIdleEyesUpdate = 0;
 unsigned long lastUploadingEyesUpdate = 0;
 
 bool needsRestart = false;
-volatile bool triggerUpload = false;
 volatile bool geminiFirstTokenReceived = false;
 
 // When false, skip JPEG capture during record (matches app "Vision" / server use_vision).
 bool deviceVisionCaptureEnabled = true;
+/** Hub pushes wake streaming on/off (mic upload for openWakeWord + VAD). */
+bool deviceWakeWordEnabled = true;
 
 // Hub presence face scan (0x06) + prefs mirrored from hub runtime JSON
 bool presenceScanEnabled = false;
@@ -358,16 +347,6 @@ struct UploadAnimState {
 };
 
 UploadAnimState uploadAnim;
-
-struct RecordingAnimState {
-    int16_t prevEyeXOffset = 0;
-    int16_t prevEyeYOffset = 0;
-    int16_t prevEyeRyL = 52;
-    int16_t prevEyeRyR = 52;
-    bool hasPrevFrame = false;
-};
-
-RecordingAnimState recordingAnim;
 
 // ==========================================
 //          UI HELPER
@@ -1302,58 +1281,6 @@ void drawDeltaTimeLine(const String& previous, const String& current, int16_t y,
     }
 }
 
-void updateRecordingEyesAnimation() {
-    const uint32_t now = millis();
-    if (now - lastRecordingEyesUpdate < 80) return;
-    lastRecordingEyesUpdate = now;
-
-    // Subtle movement so recording face doesn't feel static.
-    uint16_t step = (uint16_t)((now / 220) % 8);
-    int16_t eyeXOffset = 0;
-    if (step < 2) eyeXOffset = -3;
-    else if (step < 4) eyeXOffset = -1;
-    else if (step < 6) eyeXOffset = 1;
-    else eyeXOffset = 3;
-
-    int16_t eyeYOffset = 0;
-    int16_t ryPulse = (step % 2 == 0) ? 0 : 2;
-    int16_t eyeRyL = 52 - ryPulse; // slight squint + tiny pulse
-    int16_t eyeRyR = 52 - ryPulse;
-
-    if (!recordingAnim.hasPrevFrame) {
-        gfx->fillScreen(BLACK);
-        drawEyes(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR, RED);
-    } else {
-        drawEyesDelta(
-            recordingAnim.prevEyeXOffset,
-            recordingAnim.prevEyeYOffset,
-            recordingAnim.prevEyeRyL,
-            recordingAnim.prevEyeRyR,
-            eyeXOffset,
-            eyeYOffset,
-            eyeRyL,
-            eyeRyR,
-            RED
-        );
-    }
-
-    // Recording badge in the same area as the thinking question mark.
-    const int16_t recX = 164;
-    const int16_t recY = 24;
-    gfx->fillRect(recX - 18, recY - 1, 18 + (6 * 3) + 2, (8 * 2) + 2, BLACK);
-    fillOval(recX - 10, recY + 7, 4, 4, RED);
-    gfx->setTextSize(2);
-    gfx->setTextColor(RED);
-    gfx->setCursor(recX, recY);
-    gfx->print("REC");
-
-    recordingAnim.prevEyeXOffset = eyeXOffset;
-    recordingAnim.prevEyeYOffset = eyeYOffset;
-    recordingAnim.prevEyeRyL = eyeRyL;
-    recordingAnim.prevEyeRyR = eyeRyR;
-    recordingAnim.hasPrevFrame = true;
-}
-
 void updateUploadingThinkingAnimation() {
     const uint32_t now = millis();
     if (now - lastUploadingEyesUpdate < 80) return;
@@ -1696,6 +1623,19 @@ static void setTimezoneRule(const char* tzRule) {
     preferences.end();
 }
 
+static void loadWakeWordFromPrefs() {
+    preferences.begin("pixel_prefs", true);
+    deviceWakeWordEnabled = preferences.getBool("wake_word", true);
+    preferences.end();
+}
+
+static void setDeviceWakeWordEnabled(bool en) {
+    deviceWakeWordEnabled = en;
+    preferences.begin("pixel_prefs", false);
+    preferences.putBool("wake_word", en);
+    preferences.end();
+}
+
 static void loadPresenceFromPrefs() {
     preferences.begin("pixel_prefs", true);
     presenceScanEnabled = preferences.getBool("presence_scan", false);
@@ -1876,38 +1816,6 @@ void drawSettingsScreen() {
     int16_t clrw = (int16_t)(strlen(clrLabel) * 6);
     gfx->setCursor((240 - clrw) / 2, kWifiResetBtnY + kWifiResetBtnH + 4);
     gfx->print(clrLabel);
-}
-
-void captureVideoFrame() {
-    if (!isWsConnected) return;
-    if (!deviceVisionCaptureEnabled) return;
-    if (millis() - lastFrameTime < FRAME_INTERVAL_MS) return;
-    lastFrameTime = millis();
-
-    if (video_frame_count >= MAX_FRAMES) return;
-
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) return;
-
-    uint8_t* frame_buf = (uint8_t*)ps_malloc(fb->len);
-    if (frame_buf) {
-        memcpy(frame_buf, fb->buf, fb->len);
-        video_frames[video_frame_count] = frame_buf;
-        video_frame_sizes[video_frame_count] = fb->len;
-        video_frame_count++;
-    } 
-    
-    esp_camera_fb_return(fb);
-}
-
-void processAudio() {
-    size_t bytesRead = 0;
-    if (recordedAudioLen + 512 > FLASH_RECORD_SIZE) return;
-    
-    i2s_read(I2S_NUM_0, rec_buffer + 44 + recordedAudioLen, 512, &bytesRead, portMAX_DELAY);
-    if (bytesRead > 0) {
-        recordedAudioLen += bytesRead;
-    }
 }
 
 // ==========================================
@@ -2182,14 +2090,14 @@ void setupWiFi() {
                         } else if (strcmp(msgType, "runtime_vision") == 0) {
                             bool en = doc["enabled"] | true;
                             setDeviceVisionCaptureEnabled(en);
-                            if (!en && currentState == STATE_RECORDING) {
-                                for (int i = 0; i < video_frame_count; i++) {
-                                    if (video_frames[i]) {
-                                        free(video_frames[i]);
-                                        video_frames[i] = NULL;
-                                    }
-                                }
-                                video_frame_count = 0;
+                        } else if (strcmp(msgType, "runtime_wake_word") == 0) {
+                            bool en = doc["enabled"] | true;
+                            setDeviceWakeWordEnabled(en);
+                        } else if (strcmp(msgType, "wake_processing") == 0) {
+                            if (currentState == STATE_IDLE) {
+                                currentState = STATE_UPLOADING;
+                                lastUploadingEyesUpdate = 0;
+                                updateUploadingThinkingAnimation();
                             }
                         } else if (strcmp(msgType, "runtime_timezone") == 0) {
                             const char* tzRule = doc["timezone_rule"] | DEFAULT_TIMEZONE_RULE;
@@ -2263,80 +2171,38 @@ void setupWiFi() {
     hubWebSocketEnabled = true;
 }
 
-void triggerGeminiProcessing() {
-    if (isWsConnected) {
-        uint8_t header = 0x03; 
-        webSocket.sendBIN(&header, 1);
+// ==========================================
+//     FREERTOS WAKE MIC STREAM (CORE 0)
+//     Continuous 0x10 PCM for hub openWakeWord + VAD (tap-to-record removed).
+// ==========================================
+void wakeStreamTask(void* pvParameters) {
+    uint8_t* pkt = (uint8_t*)malloc(WAKE_STREAM_CHUNK + 1);
+    if (!pkt) {
+        Serial.println("[Wake] malloc failed for stream buffer");
+        vTaskDelete(NULL);
+        return;
     }
-}
-
-// ==========================================
-//     FREERTOS UPLOAD TASK (CORE 0)
-// ==========================================
-void uploadDataTask(void * pvParameters) {
-    for(;;) {
-        if (triggerUpload) {
-            
-            if (!isWsConnected) {
-                for (int i=0; i<video_frame_count; i++) {
-                    if (video_frames[i]) {
-                        free(video_frames[i]);
-                        video_frames[i] = NULL;
-                    }
-                }
-                recordedAudioLen = 0;
-                video_frame_count = 0;
-            } else {
-                
-                size_t offset = 0;
-                while(offset < recordedAudioLen) {
-                    size_t chunk = 4096; 
-                    if (offset + chunk > recordedAudioLen) chunk = recordedAudioLen - offset;
-                    
-                    uint8_t* packet = (uint8_t*)malloc(chunk + 1);
-                    if (packet) {
-                        packet[0] = 0x01;
-                        memcpy(packet + 1, rec_buffer + 44 + offset, chunk);
-                        webSocket.sendBIN(packet, chunk + 1);
-                        free(packet);
-                    }
-                    offset += chunk;
-                    webSocket.loop(); 
-                    vTaskDelay(pdMS_TO_TICKS(1)); 
-                }
-
-                for (int i=0; i<video_frame_count; i++) {
-                    size_t fsize = video_frame_sizes[i];
-                    uint8_t* packet = (uint8_t*)malloc(fsize + 1);
-                    if (packet) {
-                        packet[0] = 0x02;
-                        memcpy(packet + 1, video_frames[i], fsize);
-                        webSocket.sendBIN(packet, fsize + 1);
-                        free(packet);
-                    }
-                    
-                    if (video_frames[i]) {
-                        free(video_frames[i]);
-                        video_frames[i] = NULL;
-                    }
-                    
-                    webSocket.loop();
-                    vTaskDelay(pdMS_TO_TICKS(1));
-                }
-
-                recordedAudioLen = 0;
-                video_frame_count = 0;
-                triggerGeminiProcessing();
+    for (;;) {
+        if (
+            hubWebSocketEnabled &&
+            isWsConnected &&
+            currentState == STATE_IDLE &&
+            deviceWakeWordEnabled &&
+            !timeScreenActive &&
+            !mapOverlayActive &&
+            !callingCardOverlayActive &&
+            !faceAnimActive
+        ) {
+            size_t n = 0;
+            i2s_read(I2S_NUM_0, pkt + 1, WAKE_STREAM_CHUNK, &n, pdMS_TO_TICKS(120));
+            if (n > 0) {
+                pkt[0] = 0x10;
+                webSocket.sendBIN(pkt, n + 1);
+                webSocket.loop();
             }
-
-            triggerUpload = false;
-            if (!isWsConnected) {
-                currentState = STATE_IDLE;
-                showIdleEyes();
-            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(25));
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(10)); 
     }
 }
 
@@ -2367,12 +2233,6 @@ void setup() {
         Serial.println("[RTC] Initialized successfully.");
     }
 
-    rec_buffer = (uint8_t *)ps_malloc(FLASH_RECORD_SIZE + 44);
-    if (rec_buffer == NULL) {
-        updateScreen("MEM ERROR", RED);
-        while(1);
-    }
-
     setupMicrophone();
     
     camera_config_t config;
@@ -2389,12 +2249,13 @@ void setup() {
     esp_camera_init(&config);
 
     loadTimezoneRuleFromPrefs();
+    loadWakeWordFromPrefs();
     loadPresenceFromPrefs();
     lastPresenceScanMs = millis();
     setupWiFi();
 
     xTaskCreatePinnedToCore(
-        uploadDataTask, "Upload Task", 10000, NULL, 1, NULL, 0
+        wakeStreamTask, "WakeStream", 8192, NULL, 1, NULL, 0
     );
 }
 
@@ -2414,7 +2275,6 @@ void loop() {
             uploadAnim.prevQSize = 0;
             lastUploadingEyesUpdate = 0;
             lastIdleEyesUpdate = 0;
-            lastRecordingEyesUpdate = 0;
         }
         previousVisualState = currentState;
     }
@@ -2459,7 +2319,6 @@ void loop() {
         gfx->fillScreen(BLACK);
         idleAnim.hasPrevFrame = false;
         uploadAnim.hasPrevFrame = false;
-        recordingAnim.hasPrevFrame = false;
         if (!timeScreenActive && !mapOverlayActive && !callingCardOverlayActive
             && currentState == STATE_IDLE) {
             lastIdleEyesUpdate = 0;
@@ -2636,28 +2495,6 @@ void loop() {
                         showIdleEyes();
                     }
                 }
-                else if (currentState == STATE_IDLE) {
-                    Serial.println("\n*** TAP DETECTED: STARTING RECORD ***\n");
-                    callingCardOverlayActive = false;
-                    currentState = STATE_RECORDING;
-                    timeScreenActive = false;
-                    resetTimeScreenCache();
-                    lastRecordingEyesUpdate = 0; // force immediate redraw
-                    recordingAnim.hasPrevFrame = false;
-                    lastFrameTime = 0;
-                    recordedAudioLen = 0;
-                    video_frame_count = 0;
-                    updateRecordingEyesAnimation();
-                } 
-                else if (currentState == STATE_RECORDING) {
-                    Serial.println("\n*** TAP DETECTED: STOPPING RECORD ***\n");
-                    currentState = STATE_UPLOADING;
-                    timeScreenActive = false;
-                    resetTimeScreenCache();
-                    lastUploadingEyesUpdate = 0; // force immediate redraw
-                    updateUploadingThinkingAnimation();
-                    triggerUpload = true; 
-                }
             }
         }
         // Evaluate SWIPE
@@ -2748,10 +2585,6 @@ void loop() {
         }
     } else if (faceAnimActive && (currentState == STATE_IDLE || currentState == STATE_UPLOADING) && !timeScreenActive) {
         updateFaceEmotionAnimation();
-    } else if (currentState == STATE_RECORDING) {
-        updateRecordingEyesAnimation();
-        processAudio();
-        captureVideoFrame(); 
     } else if (currentState == STATE_UPLOADING) {
         if (!suppressUploadThinkingAfterMap && !suppressUploadThinkingAfterCallingCard) {
             updateUploadingThinkingAnimation();

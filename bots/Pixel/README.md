@@ -19,19 +19,19 @@ When Wi‑Fi works and the hub is reachable, Pixel connects with a WebSocket; th
 
 ## Using Pixel day to day
 
-### Voice and vision (touch)
+### Voice (wake word on the hub)
 
-- From the **idle** face, **tap once** to **start** recording (mic + optional camera if **VIDEO** is on).
-- **Tap again** to **stop** and send the turn to the hub. Pixel shows a short “thinking” state, then the reply.
-- **Vision** on the device: **swipe down** from idle → **SETTINGS** → **VIDEO: ON/OFF**. When the hub is connected, this stays in line with **Pixel bot** settings in the web UI.
+- With the **hub running** on your LAN and **wake word** enabled (default) in **Pixel bot** settings, Pixel **streams the microphone** to the hub. The hub runs **wake-word detection** and **end-of-speech** (VAD), then sends the clip to **Gemini**.
+- Say your wake phrase (train a **custom** `pixel.onnx` on the hub, or use the hub’s default test model—see hub logs), then your question. Pixel shows **thinking** when the hub starts processing, then the reply on the face.
+- **Voice does not work** if the hub is offline or wake word is turned off in settings (there is no on-device tap-to-record).
 
-If the hub is **offline** when you finish a recording, that turn is **not** uploaded; wait until the bot shows as connected again, then try another turn.
+**Vision:** optional JPEG bursts with voice may be added later; **Vision** in the web UI / device settings mainly applies to future or hub-side behavior. Presence face scan uses the camera separately.
 
 ### On-device settings (swipe down from idle)
 
 | Control | What it does |
 |--------|----------------|
-| **VIDEO: ON/OFF** | Include JPEG frames in each turn when ON. |
+| **VIDEO: ON/OFF** | Reserved for hub/UI vision toggles (wake turns are audio-only in current firmware). |
 | **BT SETUP** | Disconnects from the hub, turns **Wi‑Fi off**, and advertises **BLE** so you can send a **new** SSID/password from the dashboard (**Add New Bot**). |
 | **CLR WIFI** | Erases saved SSID/password and **reboots**. Next boot uses BLE setup if nothing is stored. |
 
@@ -45,8 +45,6 @@ If the hub is **offline** when you finish a recording, that turn is **not** uplo
 
 | Gesture | When | Action |
 |---------|------|--------|
-| **Tap** | Idle | Start recording |
-| **Tap** | Recording | Stop and send turn |
 | **Swipe left** | Idle | Open clock screen |
 | **Swipe right** | Clock | Close clock |
 | **Swipe down** | Idle | Open settings |
