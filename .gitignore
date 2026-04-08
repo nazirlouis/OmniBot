@@ -31,3 +31,4 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
+app/backend/face_profiles/

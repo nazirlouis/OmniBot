@@ -37,10 +37,19 @@ from hub_config import (
     save_hub_app_settings,
 )
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from bleak import BleakScanner, BleakClient
 import uuid
+import time
 from functools import partial
+
+from face_matching import (
+    add_reference_jpeg,
+    create_profile,
+    delete_profile,
+    list_profiles,
+    match_probe_jpeg,
+)
 
 # ==========================================
 #          LOAD SECRETS & SETUP (see hub_config: OMNIBOT_DATA_DIR, .env, hub_secrets.json)
@@ -50,6 +59,9 @@ from functools import partial
 DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_TIMEZONE_RULE = "EST5EDT,M3.2.0/2,M11.1.0/2"
 DEFAULT_VISION_ENABLED = False
+DEFAULT_PRESENCE_SCAN_ENABLED = False
+DEFAULT_PRESENCE_SCAN_INTERVAL_SEC = 5
+DEFAULT_GREETING_COOLDOWN_MINUTES = 30
 DEFAULT_SYSTEM_INSTRUCTION = (
     "You control a small desktop robot named Pixel with a round face display.\n\n"
     "Animation tools:\n"
@@ -216,6 +228,14 @@ def list_registered_bots() -> list[dict[str, Any]]:
     return out
 
 
+def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
+    try:
+        x = int(v)
+        return max(lo, min(hi, x))
+    except Exception:
+        return default
+
+
 def get_bot_settings(device_id: str):
     """Merge per-device Pixel fields from bot_settings.json with hub-wide clock settings."""
     settings = get_all_settings()
@@ -226,15 +246,31 @@ def get_bot_settings(device_id: str):
         "system_instruction": bot_conf.get("system_instruction", DEFAULT_SYSTEM_INSTRUCTION),
         "vision_enabled": bool(bot_conf.get("vision_enabled", DEFAULT_VISION_ENABLED)),
         "timezone_rule": hub.get("timezone_rule", DEFAULT_TIMEZONE_RULE),
+        "presence_scan_enabled": bool(bot_conf.get("presence_scan_enabled", DEFAULT_PRESENCE_SCAN_ENABLED)),
+        "presence_scan_interval_sec": _clamp_int(
+            bot_conf.get("presence_scan_interval_sec"),
+            DEFAULT_PRESENCE_SCAN_INTERVAL_SEC,
+            3,
+            300,
+        ),
+        "greeting_cooldown_minutes": _clamp_int(
+            bot_conf.get("greeting_cooldown_minutes"),
+            DEFAULT_GREETING_COOLDOWN_MINUTES,
+            1,
+            720,
+        ),
     }
 
 
 def _default_stored_bot_settings() -> dict:
-    """Persisted row for a bot after reset-to-default (model, system prompt, vision only)."""
+    """Persisted row for a bot after reset-to-default (model, system prompt, vision, presence)."""
     return {
         "model": DEFAULT_MODEL,
         "system_instruction": DEFAULT_SYSTEM_INSTRUCTION,
         "vision_enabled": DEFAULT_VISION_ENABLED,
+        "presence_scan_enabled": DEFAULT_PRESENCE_SCAN_ENABLED,
+        "presence_scan_interval_sec": DEFAULT_PRESENCE_SCAN_INTERVAL_SEC,
+        "greeting_cooldown_minutes": DEFAULT_GREETING_COOLDOWN_MINUTES,
     }
 
 
@@ -426,6 +462,9 @@ class BotSettingsSchema(BaseModel):
     model: str
     system_instruction: str
     vision_enabled: bool = DEFAULT_VISION_ENABLED
+    presence_scan_enabled: bool = DEFAULT_PRESENCE_SCAN_ENABLED
+    presence_scan_interval_sec: int = Field(default=DEFAULT_PRESENCE_SCAN_INTERVAL_SEC, ge=3, le=300)
+    greeting_cooldown_minutes: int = Field(default=DEFAULT_GREETING_COOLDOWN_MINUTES, ge=1, le=720)
 
 
 class HubAppSettingsSchema(BaseModel):
@@ -450,6 +489,10 @@ class HubSettingsUpdate(BaseModel):
     nominatim_user_agent: Optional[str] = None
 
     model_config = ConfigDict(extra="forbid")
+
+
+class CreateFaceProfileBody(BaseModel):
+    display_name: str = "Person"
 
 
 # Use a standard BLE UUID for our custom generic characteristic
@@ -594,18 +637,22 @@ async def get_settings(device_id: str):
 
 @app.post("/api/settings/{device_id}")
 async def update_settings(device_id: str, new_settings: BotSettingsSchema):
-    """Updates Pixel-only settings (model, system instruction, vision) for a bot."""
+    """Updates Pixel-only settings (model, system instruction, vision, presence) for a bot."""
     settings = get_all_settings()
     row = {
         "model": new_settings.model,
         "system_instruction": new_settings.system_instruction,
         "vision_enabled": bool(new_settings.vision_enabled),
+        "presence_scan_enabled": bool(new_settings.presence_scan_enabled),
+        "presence_scan_interval_sec": int(new_settings.presence_scan_interval_sec),
+        "greeting_cooldown_minutes": int(new_settings.greeting_cooldown_minutes),
     }
     settings[device_id] = row
     save_all_settings(settings)
     history_by_device.pop(device_id, None)
     vision_enabled_by_device[device_id] = row["vision_enabled"]
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
+    await _send_runtime_presence_scan_to_esp32(device_id)
     if _maps_debug_enabled():
         _maps_debug(
             f"pixel_settings_saved device_id={device_id!r} in_memory_history_cleared=True"
@@ -627,7 +674,76 @@ async def reset_settings_to_default(device_id: str):
     history_by_device.pop(device_id, None)
     vision_enabled_by_device[device_id] = row["vision_enabled"]
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
+    await _send_runtime_presence_scan_to_esp32(device_id)
     return {"status": "success", "settings": get_bot_settings(device_id)}
+
+
+@app.get("/api/bots/{device_id}/face-profiles")
+async def api_list_face_profiles(device_id: str):
+    """List enrolled face profiles for a bot (reference embeddings on disk)."""
+    return {"profiles": list_profiles(device_id)}
+
+
+@app.post("/api/bots/{device_id}/face-profiles")
+async def api_create_face_profile(device_id: str, body: CreateFaceProfileBody):
+    row = create_profile(device_id, body.display_name)
+    return {"status": "success", "profile": row}
+
+
+@app.delete("/api/bots/{device_id}/face-profiles/{profile_id}")
+async def api_delete_face_profile(device_id: str, profile_id: str):
+    if not delete_profile(device_id, profile_id):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"status": "success"}
+
+
+@app.post("/api/bots/{device_id}/face-profiles/{profile_id}/reference")
+async def api_upload_face_reference(device_id: str, profile_id: str, file: UploadFile = File(...)):
+    data = await file.read()
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large")
+    rows = list_profiles(device_id)
+    if not any(r.get("profile_id") == profile_id for r in rows):
+        raise HTTPException(status_code=404, detail="Unknown profile")
+    name = add_reference_jpeg(device_id, profile_id, data)
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not extract a face embedding from this image (try another photo).",
+        )
+    return {"status": "success", "filename": name}
+
+
+@app.post("/api/bots/{device_id}/face-profiles/{profile_id}/capture-from-pixel")
+async def api_capture_face_reference_from_pixel(device_id: str, profile_id: str):
+    if not device_stream_is_live(device_id):
+        raise HTTPException(status_code=503, detail="Pixel is not connected to the hub")
+    rows = list_profiles(device_id)
+    if not any(r.get("profile_id") == profile_id for r in rows):
+        raise HTTPException(status_code=404, detail="Unknown profile")
+    ws = get_active_esp32_socket(device_id)
+    if not ws:
+        raise HTTPException(status_code=503, detail="No active WebSocket for this bot")
+    request_id = uuid.uuid4().hex
+    pending_reference_capture[device_id] = {
+        "request_id": request_id,
+        "profile_id": profile_id,
+        "deadline": time.monotonic() + 45.0,
+    }
+    try:
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "request_reference_capture",
+                    "request_id": request_id,
+                    "profile_id": profile_id,
+                }
+            )
+        )
+    except Exception as e:
+        pending_reference_capture.pop(device_id, None)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"status": "accepted", "request_id": request_id}
 
 
 # ==========================================
@@ -640,6 +756,10 @@ history_by_device: dict[str, list] = {}
 gemini_turn_locks: dict[str, asyncio.Lock] = {}
 vision_enabled_by_device = {}
 timezone_rule_by_device = {}
+# (device_id, profile_id) -> unix time of last presence-triggered greeting
+last_presence_greeting_at: dict[tuple[str, str], float] = {}
+# device_id -> pending enrollment capture from hub UI
+pending_reference_capture: dict[str, dict[str, Any]] = {}
 
 
 def _purge_bot_runtime_state(device_id: str) -> None:
@@ -785,6 +905,27 @@ async def _send_runtime_timezone_to_esp32(device_id: str, timezone_rule: str) ->
         )
     except Exception as e:
         print(f"Failed to send runtime_timezone to ESP32: {e}")
+
+
+async def _send_runtime_presence_scan_to_esp32(device_id: str) -> None:
+    """Pushes presence-scan interval/cooldown/enabled to Pixel firmware."""
+    ws = get_active_esp32_socket(device_id)
+    if not ws:
+        return
+    bs = get_bot_settings(device_id)
+    try:
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "runtime_presence_scan",
+                    "enabled": bool(bs.get("presence_scan_enabled", DEFAULT_PRESENCE_SCAN_ENABLED)),
+                    "interval_sec": int(bs.get("presence_scan_interval_sec", DEFAULT_PRESENCE_SCAN_INTERVAL_SEC)),
+                    "cooldown_minutes": int(bs.get("greeting_cooldown_minutes", DEFAULT_GREETING_COOLDOWN_MINUTES)),
+                }
+            )
+        )
+    except Exception as e:
+        print(f"Failed to send runtime_presence_scan to ESP32: {e}")
 
 
 
@@ -1722,6 +1863,85 @@ def get_active_esp32_socket(device_id: str):
             return ws
     return next(iter(active_streams), None)
 
+
+async def _process_presence_jpeg(device_id: str, jpeg_bytes: bytes) -> None:
+    """Match face on hub; optionally run a short Gemini greeting (cooldown + lock aware)."""
+    bs = get_bot_settings(device_id)
+    if not bs.get("presence_scan_enabled"):
+        return
+    if not jpeg_bytes:
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        match = await loop.run_in_executor(
+            None, lambda: match_probe_jpeg(device_id, jpeg_bytes)
+        )
+    except Exception as e:
+        print(f"[face] presence match error: {e}")
+        return
+    if not match:
+        return
+    profile_id, display_name, _score = match
+    cool_min = int(bs.get("greeting_cooldown_minutes", DEFAULT_GREETING_COOLDOWN_MINUTES))
+    key = (device_id, profile_id)
+    now = time.time()
+    last = last_presence_greeting_at.get(key, 0)
+    if now - last < cool_min * 60:
+        return
+    lock = gemini_turn_locks.setdefault(device_id, asyncio.Lock())
+    if lock.locked():
+        return
+    if not get_gemini_api_key():
+        return
+
+    last_presence_greeting_at[key] = now
+    msg = (
+        f"The person named {display_name} is visible in front of you. "
+        "Give a very brief, warm greeting using their name (one or two short sentences)."
+    )
+    try:
+        full_text = await stream_chat_turn_response(device_id, msg)
+        esp32_ws = get_active_esp32_socket(device_id)
+        if esp32_ws:
+            try:
+                await esp32_ws.send_text(
+                    json.dumps({"status": "success", "reply": full_text})
+                )
+            except Exception as e:
+                print(f"[face] failed to send presence reply to ESP32: {e}")
+        _schedule_face_animation_to_esp32(device_id, "happy", "hey")
+    except Exception as e:
+        print(f"[face] presence greeting failed: {e}")
+        last_presence_greeting_at.pop(key, None)
+
+
+async def _process_enrollment_jpeg(device_id: str, jpeg_bytes: bytes) -> None:
+    pend = pending_reference_capture.pop(device_id, None)
+    if not pend:
+        print("[face] 0x07 JPEG received but no pending enrollment")
+        return
+    if time.monotonic() > float(pend.get("deadline", 0)):
+        print("[face] enrollment capture expired")
+        return
+    pid = str(pend.get("profile_id") or "")
+    if not pid or not jpeg_bytes:
+        return
+    loop = asyncio.get_running_loop()
+
+    def _add() -> Optional[str]:
+        return add_reference_jpeg(device_id, pid, jpeg_bytes)
+
+    try:
+        name = await loop.run_in_executor(None, _add)
+    except Exception as e:
+        print(f"[face] enrollment save error: {e}")
+        return
+    if name:
+        print(f"[face] saved enrollment ref {name} for {device_id}/{pid}")
+    else:
+        print(f"[face] enrollment failed (no face or represent error) for {device_id}/{pid}")
+
+
 @app.websocket("/ws/stream")
 async def esp32_stream_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -1761,6 +1981,7 @@ async def esp32_stream_endpoint(websocket: WebSocket):
                 }
             )
         )
+        await _send_runtime_presence_scan_to_esp32(stream_device_id)
     except Exception as e:
         print(f"Could not sync runtime settings to ESP32 on connect: {e}")
 
@@ -1768,6 +1989,9 @@ async def esp32_stream_endpoint(websocket: WebSocket):
         while True:
             # Receive data from ESP32 (binary or text)
             msg = await websocket.receive()
+            # Starlette: after a disconnect, further receive() calls raise — exit cleanly.
+            if msg.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect()
 
             # Handle text messages from ESP32 (settings sync)
             if "text" in msg:
@@ -1791,6 +2015,33 @@ async def esp32_stream_endpoint(websocket: WebSocket):
                         hub_tz["timezone_rule"] = tz
                         save_hub_app_settings(hub_tz)
                         await manager.broadcast({"type": "timezone_changed", "device_id": dev_id, "timezone_rule": tz})
+                    elif msg_type == "presence_settings_changed":
+                        settings = get_all_settings()
+                        bot_conf = dict(settings.get(dev_id) or {})
+                        bot_conf["presence_scan_enabled"] = bool(j.get("presence_scan_enabled", DEFAULT_PRESENCE_SCAN_ENABLED))
+                        bot_conf["presence_scan_interval_sec"] = _clamp_int(
+                            j.get("presence_scan_interval_sec"),
+                            DEFAULT_PRESENCE_SCAN_INTERVAL_SEC,
+                            3,
+                            300,
+                        )
+                        bot_conf["greeting_cooldown_minutes"] = _clamp_int(
+                            j.get("greeting_cooldown_minutes"),
+                            DEFAULT_GREETING_COOLDOWN_MINUTES,
+                            1,
+                            720,
+                        )
+                        settings[dev_id] = bot_conf
+                        save_all_settings(settings)
+                        await manager.broadcast(
+                            {
+                                "type": "presence_settings_changed",
+                                "device_id": dev_id,
+                                "presence_scan_enabled": bot_conf["presence_scan_enabled"],
+                                "presence_scan_interval_sec": bot_conf["presence_scan_interval_sec"],
+                                "greeting_cooldown_minutes": bot_conf["greeting_cooldown_minutes"],
+                            }
+                        )
                 except Exception as e:
                     print(f"Error parsing ESP32 text message: {e}")
                 continue
@@ -1895,11 +2146,22 @@ async def esp32_stream_endpoint(websocket: WebSocket):
                 # Clear buffers for next interaction
                 session["audio_buffer"].clear()
                 session["video_frames"].clear()
-                
+
+            elif packet_type == 0x06:
+                # Presence / face-scan snapshot (not part of record upload)
+                did = session["device_id"]
+                asyncio.create_task(_process_presence_jpeg(did, payload))
+
+            elif packet_type == 0x07:
+                # Enrollment reference shot from Pixel (response to request_reference_capture)
+                did = session["device_id"]
+                asyncio.create_task(_process_enrollment_jpeg(did, payload))
+
     except WebSocketDisconnect:
         print("ESP32 disconnected from streaming endpoint.")
         if websocket in active_streams:
             dev_id = active_streams[websocket].get("device_id", "default_bot")
+            pending_reference_capture.pop(dev_id, None)
             del active_streams[websocket]
             # Early map send may have ACK'd on the server while Pixel never decoded it.
             # Clear so end-of-turn can push again after reconnect.
@@ -1918,6 +2180,7 @@ async def esp32_stream_endpoint(websocket: WebSocket):
         print(f"Stream error: {e}")
         if websocket in active_streams:
             dev_id = active_streams[websocket].get("device_id", "default_bot")
+            pending_reference_capture.pop(dev_id, None)
             del active_streams[websocket]
             if not active_streams:
                 map_jpeg_sent_this_turn_by_device.clear()

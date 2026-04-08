@@ -21,3 +21,6 @@ python-multipart
 opencv-python-headless
 imageio
 imageio-ffmpeg
+# Face embeddings: ONNX Runtime + InsightFace (no TensorFlow; works on more Windows CPUs)
+onnxruntime>=1.16.0
+insightface>=0.7.3

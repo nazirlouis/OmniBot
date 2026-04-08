@@ -130,6 +130,13 @@ volatile bool geminiFirstTokenReceived = false;
 // When false, skip JPEG capture during record (matches app "Vision" / server use_vision).
 bool deviceVisionCaptureEnabled = true;
 
+// Hub presence face scan (0x06) + prefs mirrored from hub runtime JSON
+bool presenceScanEnabled = false;
+uint32_t presenceScanIntervalSec = 5;
+uint32_t greetingCooldownMinutes = 30;
+unsigned long lastPresenceScanMs = 0;
+volatile bool pendingEnrollmentCapture = false;
+
 // Settings screen
 bool settingsScreenNeedsRedraw = true;
 
@@ -1523,8 +1530,29 @@ void updateFaceEmotionAnimation() {
     idleAnim.hasPrevFrame = true;
 }
 
+/** Reject garbage DateTime when PCF8563 I2C read fails (invalid month/day etc.). */
+static bool isPlausibleRtc(const DateTime& t) {
+    int y = t.year();
+    if (y < 2020 || y > 2100) {
+        return false;
+    }
+    if (t.month() < 1 || t.month() > 12) {
+        return false;
+    }
+    if (t.day() < 1 || t.day() > 31) {
+        return false;
+    }
+    if (t.hour() > 23 || t.minute() > 59 || t.second() > 59) {
+        return false;
+    }
+    return true;
+}
+
 void updateTimeScreen() {
     DateTime now = rtc.now();
+    if (!isPlausibleRtc(now)) {
+        return;
+    }
     static const char* weekdayNames[] = {
         "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
     };
@@ -1668,34 +1696,142 @@ static void setTimezoneRule(const char* tzRule) {
     preferences.end();
 }
 
+static void loadPresenceFromPrefs() {
+    preferences.begin("pixel_prefs", true);
+    presenceScanEnabled = preferences.getBool("presence_scan", false);
+    presenceScanIntervalSec = preferences.getUInt("presence_iv", 5);
+    greetingCooldownMinutes = preferences.getUInt("presence_cd", 30);
+    preferences.end();
+    if (presenceScanIntervalSec < 3u) {
+        presenceScanIntervalSec = 3u;
+    }
+    if (presenceScanIntervalSec > 300u) {
+        presenceScanIntervalSec = 300u;
+    }
+    if (greetingCooldownMinutes < 1u) {
+        greetingCooldownMinutes = 1u;
+    }
+    if (greetingCooldownMinutes > 720u) {
+        greetingCooldownMinutes = 720u;
+    }
+}
 
+static void applyRuntimePresenceScan(bool en, uint32_t intervalSec, uint32_t cooldownMin) {
+    presenceScanEnabled = en;
+    presenceScanIntervalSec = intervalSec;
+    if (presenceScanIntervalSec < 3u) {
+        presenceScanIntervalSec = 3u;
+    }
+    if (presenceScanIntervalSec > 300u) {
+        presenceScanIntervalSec = 300u;
+    }
+    greetingCooldownMinutes = cooldownMin;
+    if (greetingCooldownMinutes < 1u) {
+        greetingCooldownMinutes = 1u;
+    }
+    if (greetingCooldownMinutes > 720u) {
+        greetingCooldownMinutes = 720u;
+    }
+    preferences.begin("pixel_prefs", false);
+    preferences.putBool("presence_scan", presenceScanEnabled);
+    preferences.putUInt("presence_iv", presenceScanIntervalSec);
+    preferences.putUInt("presence_cd", greetingCooldownMinutes);
+    preferences.end();
+    lastPresenceScanMs = 0;
+}
+
+/**
+ * Face presence (0x06) and enrollment (0x07) snapshots.
+ * Uses VGA + low jpeg_quality value (ESP: lower number = better JPEG). Requires
+ * WEBSOCKETS_MAX_DATA_SIZE in platformio.ini for multi‑10KB frames.
+ */
+static const framesize_t kFaceHubFramesize = FRAMESIZE_VGA;
+/** ESP camera JPEG quality 0–63; lower = higher quality (larger files). */
+static const int kFaceHubJpegQuality = 12;
+
+static bool captureAndSendJpegPacket(uint8_t packetType) {
+    const bool isFaceHubPacket = (packetType == 0x06 || packetType == 0x07);
+    if (!hubWebSocketEnabled || !isWsConnected) {
+        if (isFaceHubPacket) {
+            Serial.println("[Face] snapshot skipped (hub WebSocket not connected)");
+        }
+        return false;
+    }
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) {
+        if (isFaceHubPacket) {
+            Serial.println("[Face] snapshot failed (no camera sensor)");
+        }
+        return false;
+    }
+    if (isFaceHubPacket) {
+        const char* why = (packetType == 0x06) ? "presence face scan" : "enrollment reference";
+        Serial.printf("[Face] capturing VGA (quality=%d) for %s...\n", kFaceHubJpegQuality, why);
+    }
+    framesize_t prevSize = s->status.framesize;
+    int prevQ = s->status.quality;
+    s->set_framesize(s, kFaceHubFramesize);
+    s->set_quality(s, kFaceHubJpegQuality);
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+        s->set_framesize(s, prevSize);
+        s->set_quality(s, prevQ);
+        if (isFaceHubPacket) {
+            Serial.println("[Face] snapshot failed (esp_camera_fb_get)");
+        }
+        return false;
+    }
+    size_t len = fb->len;
+    uint8_t* packet = (uint8_t*)ps_malloc(len + 1);
+    if (!packet) {
+        esp_camera_fb_return(fb);
+        s->set_framesize(s, prevSize);
+        s->set_quality(s, prevQ);
+        if (isFaceHubPacket) {
+            Serial.printf("[Face] snapshot failed (ps_malloc %u bytes)\n", (unsigned)(len + 1));
+        }
+        return false;
+    }
+    packet[0] = packetType;
+    memcpy(packet + 1, fb->buf, len);
+    esp_camera_fb_return(fb);
+    s->set_framesize(s, prevSize);
+    s->set_quality(s, prevQ);
+    webSocket.sendBIN(packet, len + 1);
+    if (isFaceHubPacket) {
+        const char* why = (packetType == 0x06) ? "presence scan" : "enrollment";
+        Serial.printf(
+            "[Face] sent %s to hub: JPEG %u bytes, packet 0x%02X (%u bytes total)\n",
+            why,
+            (unsigned)len,
+            (unsigned)packetType,
+            (unsigned)(len + 1)
+        );
+    }
+    free(packet);
+    return true;
+}
 
 // ==========================================
 //          SETTINGS SCREEN UI
+//          (Vision / presence scan — hub only; device keeps BT + Wi‑Fi tools.)
 // ==========================================
 static const uint16_t kSetBg       = 0x10A2; // dark gray
 static const uint16_t kSetRing     = 0x2124;
 static const uint16_t kSetTitle    = 0xEF9D; // warm white
 static const uint16_t kSetLabel    = 0xB5B6; // light gray
-static const uint16_t kSetOnColor  = 0x07E0; // green
-static const uint16_t kSetOffColor = 0xF800; // red
-
-static const int16_t kVidBtnX = 52;
-static const int16_t kVidBtnY = 68;
-static const int16_t kVidBtnW = 136;
-static const int16_t kVidBtnH = 32;
 
 static const int16_t kBleBtnX = 52;
-static const int16_t kBleBtnY = 118;
+static const int16_t kBleBtnY = 88;
 static const int16_t kBleBtnW = 136;
-static const int16_t kBleBtnH = 30;
+static const int16_t kBleBtnH = 32;
 static const uint16_t kBleBtnFill = 0x19BF; // blue-gray, readable on round panel
 
 static const int16_t kWifiResetBtnX = 52;
-static const int16_t kWifiResetBtnY = 164;
+static const int16_t kWifiResetBtnY = 158;
 static const int16_t kWifiResetBtnW = 136;
-static const int16_t kWifiResetBtnH = 28;
-static const uint16_t kWifiResetFill = 0xC986; // distinct from BT / video
+static const int16_t kWifiResetBtnH = 30;
+static const uint16_t kWifiResetFill = 0xC986; // distinct from BT
 
 void drawSettingsScreen() {
     gfx->fillScreen(kSetBg);
@@ -1708,24 +1844,6 @@ void drawSettingsScreen() {
     int16_t tw = (int16_t)(strlen(title) * 12);
     gfx->setCursor((240 - tw) / 2, 40);
     gfx->print(title);
-
-    // Video toggle button
-    uint16_t btnColor = deviceVisionCaptureEnabled ? kSetOnColor : kSetOffColor;
-    gfx->fillRoundRect(kVidBtnX, kVidBtnY, kVidBtnW, kVidBtnH, 10, btnColor);
-    gfx->setTextSize(2);
-    gfx->setTextColor(WHITE);
-    const char* vidText = deviceVisionCaptureEnabled ? "VIDEO: ON" : "VIDEO: OFF";
-    int16_t vtw = (int16_t)(strlen(vidText) * 12);
-    gfx->setCursor((240 - vtw) / 2, kVidBtnY + 8);
-    gfx->print(vidText);
-
-    // Video label
-    gfx->setTextSize(1);
-    gfx->setTextColor(kSetLabel);
-    const char* camLabel = "CAMERA CAPTURE";
-    int16_t clw = (int16_t)(strlen(camLabel) * 6);
-    gfx->setCursor((240 - clw) / 2, kVidBtnY + kVidBtnH + 6);
-    gfx->print(camLabel);
 
     // Bluetooth Wi‑Fi provisioning (turns off Wi‑Fi, same flow as first-time BLE setup)
     gfx->fillRoundRect(kBleBtnX, kBleBtnY, kBleBtnW, kBleBtnH, 10, kBleBtnFill);
@@ -2080,6 +2198,13 @@ void setupWiFi() {
                                 syncRtcFromWifiNtp();
                                 lastRtcWifiSyncAttemptMs = millis();
                             }
+                        } else if (strcmp(msgType, "runtime_presence_scan") == 0) {
+                            bool en = doc["enabled"] | false;
+                            uint32_t iv = (uint32_t)(doc["interval_sec"] | 5);
+                            uint32_t cd = (uint32_t)(doc["cooldown_minutes"] | 30);
+                            applyRuntimePresenceScan(en, iv, cd);
+                        } else if (strcmp(msgType, "request_reference_capture") == 0) {
+                            pendingEnrollmentCapture = true;
                         } else if (strcmp(msgType, "face_animation") == 0) {
                             const char* anim = doc["animation"] | "speaking";
                             const char* w = doc["words"] | "";
@@ -2226,8 +2351,9 @@ void setup() {
     gfx->begin(80000000); 
     updateScreen("BOOTING...", WHITE);
     
-    // Initialize native I2C for the CHSC6X Touch Controller & RTC
+    // Initialize native I2C for the CHSC6X Touch Controller & RTC (shared bus).
     Wire.begin(TOUCH_SDA, TOUCH_SCL);
+    Wire.setClock(100000);
     pinMode(TOUCH_INT, INPUT_PULLUP);
 
     // Initialize RTC
@@ -2263,6 +2389,8 @@ void setup() {
     esp_camera_init(&config);
 
     loadTimezoneRuleFromPrefs();
+    loadPresenceFromPrefs();
+    lastPresenceScanMs = millis();
     setupWiFi();
 
     xTaskCreatePinnedToCore(
@@ -2341,11 +2469,24 @@ void loop() {
     // --- RTC SERIAL TICKER ---
     if (millis() - lastRtcPrintTime > 1000) {
         lastRtcPrintTime = millis();
+        static unsigned long lastRtcBadLogMs = 0;
         DateTime now = rtc.now();
-        
-        Serial.printf("[RTC] %04d/%02d/%02d %02d:%02d:%02d\n", 
-                      now.year(), now.month(), now.day(), 
-                      now.hour(), now.minute(), now.second());
+        if (isPlausibleRtc(now)) {
+            Serial.printf(
+                "[RTC] %04d/%02d/%02d %02d:%02d:%02d\n",
+                now.year(),
+                now.month(),
+                now.day(),
+                now.hour(),
+                now.minute(),
+                now.second()
+            );
+        } else if (millis() - lastRtcBadLogMs > 5000) {
+            lastRtcBadLogMs = millis();
+            Serial.println(
+                "[RTC] I2C read failed or bogus time (touch+RTC share Wire — check flex/cable, power)"
+            );
+        }
     }
 
     // Hourly RTC re-sync while WiFi is connected.
@@ -2369,6 +2510,31 @@ void loop() {
         webSocket.loop();
     }
 
+    if (hubWebSocketEnabled && isWsConnected && currentState == STATE_IDLE) {
+        if (pendingEnrollmentCapture) {
+            if (captureAndSendJpegPacket(0x07)) {
+                pendingEnrollmentCapture = false;
+                lastPresenceScanMs = millis();
+            }
+        } else if (
+            presenceScanEnabled &&
+            !timeScreenActive &&
+            !mapOverlayActive &&
+            !callingCardOverlayActive &&
+            !faceAnimActive
+        ) {
+            uint32_t intervalMs = presenceScanIntervalSec * 1000UL;
+            if (intervalMs < 3000UL) {
+                intervalMs = 3000UL;
+            }
+            unsigned long nowMs = millis();
+            if (nowMs - lastPresenceScanMs >= intervalMs) {
+                lastPresenceScanMs = nowMs;
+                captureAndSendJpegPacket(0x06);
+            }
+        }
+    }
+
     // ========================================================
     //      Native CHSC6X Touch & Gesture Implementation
     // ========================================================
@@ -2377,8 +2543,8 @@ void loop() {
     
     // 1. Read Data on Interrupt Pulse (Active LOW)
     if (currentTouchState == LOW) {
-        Wire.requestFrom(CHSC6X_I2C_ID, 5);
-        if (Wire.available() == 5) {
+        size_t got = Wire.requestFrom((uint8_t)CHSC6X_I2C_ID, (size_t)5);
+        if (got == 5 && Wire.available() == 5) {
             uint8_t points = Wire.read(); 
             Wire.read(); // Event ID
             int tempX = Wire.read(); 
@@ -2387,8 +2553,8 @@ void loop() {
             
             // Map raw CHSC6X to GC9A01 rotation-3 framebuffer (same axes as gfx->draw*).
             // Rotation: (tempX,tempY) -> (tempY, 239-tempX). Then mirror Y so on-screen
-            // "up" matches drawable coords; without this, SETTINGS rows cycle (video/BT
-            // swap) and bottom taps read as gaps / "outside".
+            // "up" matches drawable coords; without this, SETTINGS rows (BT / CLR WIFI)
+            // read misaligned and bottom taps read as gaps / "outside".
             int mappedX = tempY;
             int mappedY = 239 - tempX;
             mappedY = 219 - mappedY;
@@ -2452,23 +2618,8 @@ void loop() {
                     int tapX = endX;
                     int tapY = endY;
 
-                    // Video toggle (top)
-                    if (tapY >= kVidBtnY && tapY <= (kVidBtnY + kVidBtnH)
-                             && tapX >= kVidBtnX && tapX <= (kVidBtnX + kVidBtnW)) {
-                        bool newVal = !deviceVisionCaptureEnabled;
-                        setDeviceVisionCaptureEnabled(newVal);
-                        if (isWsConnected) {
-                            StaticJsonDocument<128> vDoc;
-                            vDoc["type"] = "vision_changed";
-                            vDoc["enabled"] = newVal;
-                            char buf[128];
-                            serializeJson(vDoc, buf, sizeof(buf));
-                            webSocket.sendTXT(buf);
-                        }
-                        settingsScreenNeedsRedraw = true;
-                    }
                     // Bluetooth Wi‑Fi setup
-                    else if (tapY >= kBleBtnY && tapY <= (kBleBtnY + kBleBtnH)
+                    if (tapY >= kBleBtnY && tapY <= (kBleBtnY + kBleBtnH)
                              && tapX >= kBleBtnX && tapX <= (kBleBtnX + kBleBtnW)) {
                         Serial.printf("[BT] BT SETUP button pressed (tap %d,%d)\n", tapX, tapY);
                         enterBleProvisioningFromSettings();

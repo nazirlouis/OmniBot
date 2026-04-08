@@ -95,6 +95,64 @@ export const resetBotSettingsToDefault = async (device_id) => {
   return await res.json();
 };
 
+export const listFaceProfiles = async (device_id) => {
+  const res = await fetch(hubUrl(`/api/bots/${encodeURIComponent(device_id)}/face-profiles`));
+  if (!res.ok) throw new Error('Failed to list face profiles');
+  return res.json();
+};
+
+export const createFaceProfile = async (device_id, display_name) => {
+  const res = await fetch(hubUrl(`/api/bots/${encodeURIComponent(device_id)}/face-profiles`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ display_name: display_name || 'Person' }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to create profile');
+  }
+  return res.json();
+};
+
+export const deleteFaceProfile = async (device_id, profile_id) => {
+  const res = await fetch(
+    hubUrl(`/api/bots/${encodeURIComponent(device_id)}/face-profiles/${encodeURIComponent(profile_id)}`),
+    { method: 'DELETE' }
+  );
+  if (!res.ok) throw new Error('Failed to delete profile');
+  return res.json();
+};
+
+export const uploadFaceReference = async (device_id, profile_id, file) => {
+  const fd = new FormData();
+  fd.append('file', file);
+  const res = await fetch(
+    hubUrl(
+      `/api/bots/${encodeURIComponent(device_id)}/face-profiles/${encodeURIComponent(profile_id)}/reference`
+    ),
+    { method: 'POST', body: fd }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Upload failed');
+  }
+  return res.json();
+};
+
+export const captureFaceFromPixel = async (device_id, profile_id) => {
+  const res = await fetch(
+    hubUrl(
+      `/api/bots/${encodeURIComponent(device_id)}/face-profiles/${encodeURIComponent(profile_id)}/capture-from-pixel`
+    ),
+    { method: 'POST' }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Capture request failed');
+  }
+  return res.json();
+};
+
 export const getHubStatus = async () => {
   const res = await fetch(hubUrl('/api/hub/status'));
   if (!res.ok) throw new Error('Hub status failed');
