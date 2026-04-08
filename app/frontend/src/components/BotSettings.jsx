@@ -463,8 +463,9 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
           model; edit here). <strong>TOOLS.md</strong> documents tools for context. The model can update{' '}
           <strong>SOUL.md</strong>, <strong>MEMORY.md</strong>, <strong>IDENTITY.md</strong>, <strong>USER.md</strong>, and{' '}
           <strong>HEARTBEAT.md</strong> via tools when appropriate (dashboard &quot;Give me a soul&quot; runs{' '}
-          <strong>BOOTSTRAP.md</strong>). Heartbeat <em>maintenance</em> only updates MEMORY from daily logs. Wake speech
-          may be transcribed for daily logs when local STT is available. Save model and heartbeat toggles with the form{' '}
+          <strong>BOOTSTRAP.md</strong>). Heartbeat <em>maintenance</em> can merge daily logs into MEMORY. Voice turns use
+          Gemini on the audio; add explicit daily-log lines with the <code>daily_log_append</code> tool if you want raw
+          notes on disk. Save model and heartbeat toggles with the form{' '}
           <strong>Save</strong> button; save markdown with <strong>Save persona file</strong>.
         </p>
         <div className="persona-tab-row" role="tablist">
@@ -535,10 +536,6 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
           />
           Enable heartbeat maintenance
         </label>
-        <p className="help-text">
-          Hub operators: <code>OMNIBOT_STT=0</code> turns off local STT only if needed; <code>OMNIBOT_WHISPER_MODEL</code>{' '}
-          defaults to <code>tiny</code>.
-        </p>
       </div>
 
       <div className="form-actions">

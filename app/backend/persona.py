@@ -451,13 +451,11 @@ def set_heartbeat_state(device_id: str, **updates: Any) -> None:
 def persona_status(device_id: str) -> dict[str, Any]:
     ensure_persona_layout(device_id)
     root = persona_root_dir(device_id)
-    stt = stt_environment_enabled()
     out: dict[str, Any] = {
         "device_id": safe_device_id(device_id),
         "persona_dir": str(root),
         "files": {},
         "heartbeat": get_heartbeat_state(device_id),
-        "stt_globally_enabled": stt,
     }
     for key, fname in _FILE_MAP.items():
         p = root / fname
@@ -471,11 +469,6 @@ def persona_status(device_id: str) -> dict[str, Any]:
         "bytes": bp.stat().st_size if bp.is_file() else 0,
     }
     return out
-
-
-def stt_environment_enabled() -> bool:
-    v = (os.getenv("OMNIBOT_STT") or "1").strip().lower()
-    return v not in ("0", "false", "no", "off")
 
 
 def list_all_device_ids_for_heartbeat() -> list[str]:

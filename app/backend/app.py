@@ -56,7 +56,6 @@ from wake_listen import MAX_UTTERANCE_SEC, WakeListenProcessor
 
 import heartbeat_service
 import persona
-import stt_local
 
 # ==========================================
 #          LOAD SECRETS & SETUP (see hub_config: OMNIBOT_DATA_DIR, .env, hub_secrets.json)
@@ -2086,36 +2085,6 @@ async def _process_enrollment_jpeg(device_id: str, jpeg_bytes: bytes) -> None:
         print(f"[face] enrollment failed (no face or represent error) for {device_id}/{pid}")
 
 
-def _schedule_persona_stt_log(device_id: str, raw_pcm: bytes) -> None:
-    """Fire-and-forget local STT → daily log (does not block Gemini audio)."""
-    if not raw_pcm:
-        return
-
-    async def _run():
-        try:
-            if not persona.stt_environment_enabled():
-                return
-
-            def _transcribe():
-                return stt_local.transcribe_pcm_s16le(raw_pcm)
-
-            r = await asyncio.to_thread(_transcribe)
-            if not r:
-                return
-            text, lp = r
-            line = f"stt text={text!r}"
-            if lp is not None:
-                line += f" avg_logprob={lp:.3f}"
-            persona.append_daily_log_line(device_id, line)
-        except Exception as e:
-            print(f"[Omnibot/stt] log failed: {e}")
-
-    try:
-        asyncio.get_running_loop().create_task(_run())
-    except RuntimeError:
-        pass
-
-
 async def _run_gemini_audio_turn(
     websocket: WebSocket,
     device_id: str,
@@ -2123,7 +2092,6 @@ async def _run_gemini_audio_turn(
     video_frames: list,
 ) -> str:
     """Build WAV (+ optional MP4), stream one Gemini turn, send JSON reply on same ESP32 socket."""
-    _schedule_persona_stt_log(device_id, raw_pcm)
     use_vision = is_vision_enabled(device_id) and bool(video_frames)
     wav_header = create_wav_header(len(raw_pcm), sample_rate=16000)
     audio_bytes = wav_header + raw_pcm
@@ -2569,7 +2537,7 @@ class PersonaMarkdownBody(BaseModel):
 
 @app.get("/api/persona/{device_id}/status")
 async def api_persona_status(device_id: str):
-    """Byte sizes, paths, heartbeat state, STT env flag."""
+    """Byte sizes, paths, heartbeat state."""
     return persona.persona_status(device_id)
 
 

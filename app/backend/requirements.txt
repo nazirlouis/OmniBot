@@ -29,5 +29,3 @@ openwakeword>=0.6.0
 # webrtcvad imports pkg_resources; setuptools>=81 no longer exposes it as top-level — pin for compatibility
 setuptools>=69,<81
 webrtcvad>=2.0.10
-# Optional: local STT for persona daily logs (disable with OMNIBOT_STT=0)
-faster-whisper>=1.0.0,<2
