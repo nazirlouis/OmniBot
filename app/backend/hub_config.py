@@ -35,6 +35,21 @@ HUB_APP_SETTINGS_FILE = DATA_DIR / "hub_app_settings.json"
 # Must match app.py DEFAULT_TIMEZONE_RULE for merged defaults.
 DEFAULT_HUB_TIMEZONE_RULE = "EST5EDT,M3.2.0/2,M11.1.0/2"
 
+# Gemini 3 thinking: https://ai.google.dev/gemini-api/docs/thinking
+# Stored values: "auto" = omit ThinkingConfig (API default dynamic thinking); or minimal/low/medium/high.
+GEMINI_THINKING_LEVEL_AUTO = "auto"
+VALID_GEMINI_THINKING_LEVELS = frozenset(
+    {GEMINI_THINKING_LEVEL_AUTO, "minimal", "low", "medium", "high"}
+)
+DEFAULT_GEMINI_THINKING_LEVEL = "minimal"
+
+
+def normalize_gemini_thinking_level(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if s in VALID_GEMINI_THINKING_LEVELS:
+        return s
+    return DEFAULT_GEMINI_THINKING_LEVEL
+
 DEFAULT_NOMINATIM_USER_AGENT = (
     "OmnibotHub/1.0 (set NOMINATIM_USER_AGENT in .env - Nominatim usage policy)"
 )

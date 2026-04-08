@@ -15,8 +15,12 @@ import {
   putPersonaFile,
 } from './setupService';
 
+/** Matches hub `normalize_gemini_thinking_level` / Gemini 3 docs thinking levels. */
+const GEMINI_THINKING_LEVELS = ['auto', 'minimal', 'low', 'medium', 'high'];
+
 const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', onBotsChanged }) => {
   const [model, setModel] = useState('gemini-3.1-flash-lite-preview');
+  const [thinkingLevel, setThinkingLevel] = useState('minimal');
   const [visionEnabled, setVisionEnabled] = useState(false);
   const [wakeWordEnabled, setWakeWordEnabled] = useState(true);
   const [presenceScanEnabled, setPresenceScanEnabled] = useState(false);
@@ -78,6 +82,9 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
       try {
         const data = await getBotSettings(deviceId);
         setModel(data.model);
+        setThinkingLevel(
+          GEMINI_THINKING_LEVELS.includes(data.thinking_level) ? data.thinking_level : 'minimal'
+        );
         setVisionEnabled(Boolean(data.vision_enabled));
         setWakeWordEnabled(data.wake_word_enabled !== false);
         setPresenceScanEnabled(Boolean(data.presence_scan_enabled));
@@ -115,6 +122,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
     try {
       const res = await updateBotSettings(deviceId, {
         model,
+        thinking_level: thinkingLevel,
         vision_enabled: visionEnabled,
         wake_word_enabled: wakeWordEnabled,
         presence_scan_enabled: presenceScanEnabled,
@@ -125,6 +133,9 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
       });
       const saved = res.settings || {};
       setModel(saved.model);
+      setThinkingLevel(
+        GEMINI_THINKING_LEVELS.includes(saved.thinking_level) ? saved.thinking_level : 'minimal'
+      );
       setVisionEnabled(Boolean(saved.vision_enabled));
       setWakeWordEnabled(saved.wake_word_enabled !== false);
       setPresenceScanEnabled(Boolean(saved.presence_scan_enabled));
@@ -145,7 +156,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
   const handleResetToDefaults = async () => {
     if (
       !window.confirm(
-        'Reset Pixel model, vision, wake word, presence scan, and heartbeat settings to defaults? ' +
+        'Reset Pixel model, thinking level, vision, wake word, presence scan, and heartbeat settings to defaults? ' +
           'SOUL.md, IDENTITY.md, USER.md, TOOLS.md, MEMORY.md, HEARTBEAT.md, and AGENTS.md will be overwritten with hub templates (your edits are lost). BOOTSTRAP.md is removed if present. Daily logs under logs/daily/ are kept. Hub clock is unchanged.'
       )
     ) {
@@ -160,6 +171,9 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
       }
       const saved = res.settings;
       setModel(saved.model);
+      setThinkingLevel(
+        GEMINI_THINKING_LEVELS.includes(saved.thinking_level) ? saved.thinking_level : 'minimal'
+      );
       setVisionEnabled(Boolean(saved.vision_enabled));
       setWakeWordEnabled(saved.wake_word_enabled !== false);
       setPresenceScanEnabled(Boolean(saved.presence_scan_enabled));
@@ -454,6 +468,37 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
             <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
           </select>
         </div>
+      </div>
+
+      <div className="form-group">
+        <label htmlFor="thinkingLevelSelect">Gemini thinking level</label>
+        <div className="select-wrapper">
+          <select
+            id="thinkingLevelSelect"
+            value={thinkingLevel}
+            onChange={(e) => setThinkingLevel(e.target.value)}
+            className="holo-select"
+          >
+            <option value="auto">Auto (API default — dynamic thinking)</option>
+            <option value="minimal">Minimal (Flash / Flash-Lite; lowest latency)</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High (deeper reasoning; slower)</option>
+          </select>
+        </div>
+        <p className="help-text">
+          Maps to Gemini 3 <code>thinking_config.thinking_level</code> (see{' '}
+          <a
+            href="https://ai.google.dev/gemini-api/docs/thinking"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Thinking (Gemini API docs)
+          </a>
+          ). <strong>Auto</strong> does not send a level — the model uses its default dynamic thinking.{' '}
+          <strong>minimal</strong> is not supported on Gemini 3.1 Pro; Flash and Flash-Lite support the full set per
+          the docs table. If a request fails, try another level or model.
+        </p>
       </div>
 
       <div className="form-group persona-section">

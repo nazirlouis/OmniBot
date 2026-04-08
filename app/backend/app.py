@@ -18,7 +18,7 @@ from PIL import Image
 from google.genai import types
 import json
 from datetime import datetime, timezone
-from typing import Any, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple
 from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
@@ -26,6 +26,8 @@ import requests
 from wifi_scan import scan_wifi_ssids
 
 from hub_config import (
+    DEFAULT_GEMINI_THINKING_LEVEL,
+    GEMINI_THINKING_LEVEL_AUTO,
     DEFAULT_NOMINATIM_USER_AGENT,
     KNOWN_BOTS_FILE,
     SETTINGS_FILE,
@@ -36,6 +38,7 @@ from hub_config import (
     hub_settings_public_view,
     load_hub_app_settings,
     merge_hub_secrets,
+    normalize_gemini_thinking_level,
     save_hub_app_settings,
 )
 
@@ -279,6 +282,7 @@ def get_bot_settings(device_id: str):
             720,
         ),
         "heartbeat_enabled": bool(bot_conf.get("heartbeat_enabled", DEFAULT_HEARTBEAT_ENABLED)),
+        "thinking_level": normalize_gemini_thinking_level(bot_conf.get("thinking_level")),
     }
 
 
@@ -314,6 +318,7 @@ def _default_stored_bot_settings() -> dict:
         "wake_word_enabled": DEFAULT_WAKE_WORD_ENABLED,
         "heartbeat_interval_minutes": DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
         "heartbeat_enabled": DEFAULT_HEARTBEAT_ENABLED,
+        "thinking_level": DEFAULT_GEMINI_THINKING_LEVEL,
     }
 
 
@@ -423,6 +428,7 @@ def _pixel_chat_generate_config(
     *,
     system_instruction,
     device_id: str,
+    thinking_level: str,
 ) -> types.GenerateContentConfig:
     """Tools + server-side tool flag per Gemini 3 multi-tool docs.
 
@@ -441,12 +447,15 @@ def _pixel_chat_generate_config(
         types.Tool(function_declarations=custom_declarations),
     ]
 
-    return types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        thinking_config=types.ThinkingConfig(thinking_level="minimal"),
-        tools=tools,
-        tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
-    )
+    # "auto" = API default (dynamic thinking); see https://ai.google.dev/gemini-api/docs/thinking
+    cfg_kw: dict = {
+        "system_instruction": system_instruction,
+        "tools": tools,
+        "tool_config": types.ToolConfig(include_server_side_tool_invocations=True),
+    }
+    if thinking_level != GEMINI_THINKING_LEVEL_AUTO:
+        cfg_kw["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+    return types.GenerateContentConfig(**cfg_kw)
 
 
 app.add_middleware(
@@ -521,6 +530,10 @@ class WifiCredentials(BaseModel):
     hub_ip: Optional[str] = None
     hub_port: int = 8000
 
+
+GeminiThinkingLevel = Literal["auto", "minimal", "low", "medium", "high"]
+
+
 class BotSettingsSchema(BaseModel):
     """Pixel-only fields stored per device_id in bot_settings.json."""
 
@@ -534,6 +547,7 @@ class BotSettingsSchema(BaseModel):
         default=DEFAULT_HEARTBEAT_INTERVAL_MINUTES, ge=5, le=720
     )
     heartbeat_enabled: bool = DEFAULT_HEARTBEAT_ENABLED
+    thinking_level: GeminiThinkingLevel = DEFAULT_GEMINI_THINKING_LEVEL
 
 
 class HubAppSettingsSchema(BaseModel):
@@ -718,6 +732,7 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
         "greeting_cooldown_minutes": int(new_settings.greeting_cooldown_minutes),
         "heartbeat_interval_minutes": int(new_settings.heartbeat_interval_minutes),
         "heartbeat_enabled": bool(new_settings.heartbeat_enabled),
+        "thinking_level": normalize_gemini_thinking_level(new_settings.thinking_level),
     }
     settings[device_id] = row
     save_all_settings(settings)
@@ -1823,6 +1838,7 @@ async def stream_chat_turn_response(
         config = _pixel_chat_generate_config(
             system_instruction=system_instruction,
             device_id=device_id,
+            thinking_level=bot_settings["thinking_level"],
         )
         gc = get_genai_client()
         if gc is None:
@@ -2040,10 +2056,15 @@ async def _process_presence_jpeg(device_id: str, jpeg_bytes: bytes) -> None:
     last_presence_greeting_at[key] = now
     msg = (
         f"The person named {display_name} is visible in front of you. "
+        "The attached image is the current camera view from your perspective. "
         "Give a very brief, warm greeting using their name (one or two short sentences)."
     )
+    turn_content = [
+        types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
+        msg,
+    ]
     try:
-        full_text = await stream_chat_turn_response(device_id, msg)
+        full_text = await stream_chat_turn_response(device_id, turn_content)
         esp32_ws = get_active_esp32_socket(device_id)
         if esp32_ws:
             try:

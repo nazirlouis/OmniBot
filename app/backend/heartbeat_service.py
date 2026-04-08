@@ -9,7 +9,12 @@ from typing import Any
 
 from google.genai import types
 
-from hub_config import get_genai_client, get_gemini_api_key
+from hub_config import (
+    GEMINI_THINKING_LEVEL_AUTO,
+    get_genai_client,
+    get_gemini_api_key,
+    normalize_gemini_thinking_level,
+)
 from persona import (
     build_composed_system_instruction,
     get_heartbeat_state,
@@ -51,16 +56,18 @@ MEMORY_REPLACE_DECLARATION = {
 }
 
 
-def _heartbeat_generate_config(*, system_instruction: str) -> types.GenerateContentConfig:
+def _heartbeat_generate_config(*, system_instruction: str, thinking_level: str) -> types.GenerateContentConfig:
     custom = [types.FunctionDeclaration(**MEMORY_REPLACE_DECLARATION)]
-    return types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        thinking_config=types.ThinkingConfig(thinking_level="minimal"),
-        tools=[types.Tool(function_declarations=custom)],
-        tool_config=types.ToolConfig(
+    kw: dict = {
+        "system_instruction": system_instruction,
+        "tools": [types.Tool(function_declarations=custom)],
+        "tool_config": types.ToolConfig(
             function_calling_config=types.FunctionCallingConfig(mode="AUTO")
         ),
-    )
+    }
+    if thinking_level != GEMINI_THINKING_LEVEL_AUTO:
+        kw["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+    return types.GenerateContentConfig(**kw)
 
 
 async def run_heartbeat_tick(
@@ -103,7 +110,10 @@ async def run_heartbeat_tick(
         if gc is None:
             return
 
-        config = _heartbeat_generate_config(system_instruction=sys_instr)
+        config = _heartbeat_generate_config(
+            system_instruction=sys_instr,
+            thinking_level=normalize_gemini_thinking_level(bs.get("thinking_level")),
+        )
         loop = asyncio.get_running_loop()
 
         def _run_chat() -> tuple[str, bool]:
