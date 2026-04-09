@@ -10,7 +10,7 @@ Human-editable notes; this text is injected into your context. **It does not tur
 
 ### `face_animation`
 
-- Shows an expression on Pixel's round face display.
+- Shows an expression on your round face display.
 - **Parameter:** `animation` — exactly one of: `speaking`, `happy`, `mad`.
 - **Limit:** At most **one** face animation per turn. For conversational mood, not spam.
 
@@ -27,7 +27,7 @@ Human-editable notes; this text is injected into your context. **It does not tur
 ### `persona_replace`
 
 - Replaces **IDENTITY.md**, **USER.md**, or **HEARTBEAT.md** (parameters `file` + `markdown`).
-- Use when learning about the human, settling Pixel's name/vibe, or updating heartbeat checklists.
+- Use when learning about the human, settling name/vibe, or updating heartbeat checklists.
 
 ### `daily_log_append`
 

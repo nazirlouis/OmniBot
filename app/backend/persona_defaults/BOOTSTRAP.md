@@ -38,7 +38,7 @@ Refine **SOUL.md** with **soul_replace** so it matches what you agreed — not g
 
 ## Connect
 
-Primary place to reach each other is **this hub** (dashboard text chat) and **Pixel** on the desk (voice when connected). No need to set up other channels unless your human adds them later.
+Primary place to reach each other is **this hub** (dashboard text chat) and your body on the desk (voice when connected). No need to set up other channels unless your human adds them later.
 
 ## When you are done
 
