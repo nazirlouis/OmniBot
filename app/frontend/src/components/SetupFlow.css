@@ -261,3 +261,74 @@
   color: var(--accent);
   font-weight: 500;
 }
+
+/* Post–Wi‑Fi walkthrough: soul step + Intelligence Feed */
+.setup-soul-layout {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  width: 100%;
+  align-self: stretch;
+}
+
+.setup-soul-layout .intelligence-feed {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.setup-soul-layout .setup-container {
+  flex-shrink: 0;
+}
+
+@media (min-width: 960px) {
+  .setup-soul-layout {
+    flex-direction: row;
+    align-items: stretch;
+  }
+
+  .setup-soul-layout .setup-container {
+    flex: 0 0 min(400px, 36vw);
+    align-items: flex-start;
+    overflow-y: auto;
+  }
+
+  .setup-soul-layout .setup-card--soul-panel {
+    max-width: none;
+    min-height: min(100%, 720px);
+  }
+}
+
+.setup-card--soul-panel {
+  max-width: 100%;
+}
+
+.setup-waiting-body {
+  text-align: center;
+}
+
+.setup-waiting-spinner {
+  margin: 1rem 0 1.25rem;
+}
+
+.setup-waiting-spinner-icon {
+  border-color: rgba(88, 166, 255, 0.25);
+  border-top-color: var(--accent);
+}
+
+.setup-waiting-lead {
+  font-size: 0.95rem;
+  margin-bottom: 0.75rem;
+}
+
+.setup-soul-copy code {
+  font-size: 0.85em;
+  padding: 0.1em 0.35em;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 4px;
+}
+
+.setup-soul-actions .btn-block + .btn-block {
+  margin-top: 0.5rem;
+}

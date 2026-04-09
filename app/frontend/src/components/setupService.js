@@ -2,7 +2,12 @@ import { hubUrl } from '../hubOrigin';
 
 export const initialSetupState = {
   appMode: 'dashboard', // 'dashboard' or 'setup'
-  setupStep: 'device', // 'device', 'wifi', 'password'
+  /** device → wifi → password → waiting (for hub) → soul (bootstrap) → complete */
+  setupStep: 'device',
+  /** Bot being walked through after Wi‑Fi connect; used for bootstrap + feed targeting */
+  walkthroughDeviceId: null,
+  /** True after user clicks Begin soul ritual in post–Wi‑Fi walkthrough */
+  soulWalkthroughStarted: false,
   bleDevices: [],
   bleScanMessage: null,
   isScanning: false,

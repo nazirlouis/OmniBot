@@ -54,8 +54,18 @@ function App() {
   const [isSendingText, setIsSendingText] = useState(false);
 
   const [setupState, setSetupState] = useState(initialSetupState);
+  const setupStateRef = useRef(setupState);
+  setupStateRef.current = setupState;
   const [settingsTab, setSettingsTab] = useState('pixel');
   const provisionPollRef = useRef(null);
+
+  const exitSetupToDashboard = useCallback(() => {
+    setSetupState({ ...initialSetupState, appMode: 'dashboard', setupStep: 'device' });
+  }, []);
+
+  const enterSetupFlow = useCallback(() => {
+    setSetupState({ ...initialSetupState, appMode: 'setup', setupStep: 'device' });
+  }, []);
 
   const updateSetup = (key, value) => {
     setSetupState((prev) => ({ ...prev, [key]: value }));
@@ -185,9 +195,23 @@ function App() {
                 clearInterval(provisionPollRef.current);
                 provisionPollRef.current = null;
               }
-              setSetupState((prev) =>
-                prev.appMode === 'setup' ? { ...prev, appMode: 'dashboard', setupStep: 'device' } : prev
-              );
+              const walkthroughToSoul =
+                setupStateRef.current.appMode === 'setup' &&
+                setupStateRef.current.setupStep === 'waiting';
+              setSetupState((prev) => {
+                if (prev.appMode === 'setup' && prev.setupStep === 'waiting') {
+                  return {
+                    ...prev,
+                    setupStep: 'soul',
+                    walkthroughDeviceId: did,
+                    soulWalkthroughStarted: false,
+                  };
+                }
+                return prev;
+              });
+              if (walkthroughToSoul) {
+                setSelectedBotId(did);
+              }
               setBotUiStatus((prev) => ({ ...prev, [did]: 'online' }));
               const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
               setLastPingById((p) => ({ ...p, [did]: t }));
@@ -270,6 +294,21 @@ function App() {
               'system',
               did ? `Persona updated (${did}): ${f}` : `Persona updated: ${f}`
             );
+            const st = setupStateRef.current;
+            if (
+              st.appMode === 'setup' &&
+              st.setupStep === 'soul' &&
+              did === st.walkthroughDeviceId &&
+              typeof f === 'string' &&
+              f.includes('BOOTSTRAP') &&
+              f.includes('deleted')
+            ) {
+              setSetupState((prev) =>
+                prev.appMode === 'setup' && prev.setupStep === 'soul'
+                  ? { ...prev, setupStep: 'complete' }
+                  : prev
+              );
+            }
           }
         } catch {
           console.error('Failed to parse message:', event.data);
@@ -364,6 +403,7 @@ function App() {
             ? `Credentials and hub address (${hubIp}:${hubPort}) sent to ${setupState.selectedDevice.name}. Waiting for Pixel to connect…`
             : `Credentials sent to ${setupState.selectedDevice.name}. Hub LAN IP was not detected — ensure Pixel firmware points to this PC, then wait for connection…`
         );
+        updateSetup('setupStep', 'waiting');
         try {
           await refreshBotList();
         } catch {
@@ -446,6 +486,32 @@ function App() {
     handleScan,
     handleWifiScan,
     handleProvision,
+    exitSetupToDashboard,
+    onStartSoulWalkthrough: async () => {
+      const id = setupState.walkthroughDeviceId;
+      if (!id || isSendingText) return;
+      updateSetup('soulWalkthroughStarted', true);
+      addLog('user', 'Give me a soul — starting bootstrap ritual');
+      setIsSendingText(true);
+      try {
+        await startBootstrapSoul(id);
+      } catch (error) {
+        addLog('error', error.message || 'Bootstrap ritual failed');
+        updateSetup('soulWalkthroughStarted', false);
+      } finally {
+        setIsSendingText(false);
+      }
+    },
+    onSkipSoulWalkthrough: () => {
+      setSetupState((prev) => ({ ...prev, setupStep: 'complete' }));
+    },
+    onConfigureSettings: () => {
+      setSettingsTab('pixel');
+      setSetupState({ ...initialSetupState, appMode: 'settings', setupStep: 'device' });
+    },
+    onGoToFeed: () => {
+      setSetupState({ ...initialSetupState, appMode: 'dashboard', setupStep: 'device' });
+    },
   };
 
   if (hubLoadError) {
@@ -491,6 +557,7 @@ function App() {
         setSetupStep={setupSetters.setSetupStep}
         setSettingsTab={setSettingsTab}
         settingsTab={settingsTab}
+        onEnterSetup={enterSetupFlow}
       />
 
       <main className="main-content">
@@ -509,9 +576,26 @@ function App() {
           />
         )}
 
-        {setupState.appMode === 'setup' && (
-          <SetupOrchestrator state={setupState} setters={setupSetters} actions={setupActions} />
-        )}
+        {setupState.appMode === 'setup' &&
+          (setupState.setupStep === 'soul' ? (
+            <div className="setup-soul-layout">
+              <SetupOrchestrator state={setupState} setters={setupSetters} actions={setupActions} />
+              <IntelligenceFeed
+                logs={logs}
+                toolCalls={toolCalls}
+                hubActivityLog={hubActivityLog}
+                selectedBotId={setupState.walkthroughDeviceId || selectedBotId}
+                wsStatus={wsStatus}
+                textMessage={textMessage}
+                setTextMessage={setTextMessage}
+                isSendingText={isSendingText}
+                onSendTextCommand={handleSendTextCommand}
+                onGiveSoul={null}
+              />
+            </div>
+          ) : (
+            <SetupOrchestrator state={setupState} setters={setupSetters} actions={setupActions} />
+          ))}
 
         {setupState.appMode === 'settings' && (
           <SettingsShell

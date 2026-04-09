@@ -28,6 +28,7 @@ const Sidebar = ({
   setSetupStep,
   setSettingsTab,
   settingsTab = 'pixel',
+  onEnterSetup,
 }) => {
   return (
     <aside className="sidebar">
@@ -168,8 +169,11 @@ const Sidebar = ({
         <button
           className={`nav-btn ${appMode === 'setup' ? 'active' : ''}`}
           onClick={() => {
-            setAppMode('setup');
-            setSetupStep('device');
+            if (onEnterSetup) onEnterSetup();
+            else {
+              setAppMode('setup');
+              setSetupStep('device');
+            }
           }}
         >
           <span className="nav-icon">
