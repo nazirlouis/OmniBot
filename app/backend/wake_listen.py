@@ -191,6 +191,30 @@ class WakeListenProcessor:
         self._schedule_wake_listen_state(WAKE_LISTEN_STREAMING)
         return True
 
+    async def activate_live_forwarding_from_external_wake(self) -> None:
+        """Pixel (or other source) detected wake; stream conversation audio from elsewhere (e.g. browser).
+
+        Skips forwarding the local pre-roll ring into Live — avoids sending ESP32 audio when the hub
+        uses browser mic for Gemini Live.
+        """
+        if not self.use_gemini_live or not self.on_live_pcm:
+            return
+        if self._live_forward:
+            return
+        if self.on_capture_start:
+            await self.on_capture_start()
+        if self.on_live_wake:
+            await self.on_live_wake()
+        self._ring.clear()
+        self._followup_scan_carry.clear()
+        self._cooldown_until = time.monotonic() + self.cooldown_s
+        self._live_forward = True
+        await self._await_wake_listen_state(WAKE_LISTEN_STREAMING)
+        try:
+            self.model.reset()
+        except Exception:
+            pass
+
     def note_model_user_activity(self) -> None:
         """Refresh follow-up timeout based on Gemini input transcription activity."""
         if self._follow_up_until is None:

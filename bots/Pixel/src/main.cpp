@@ -2607,11 +2607,13 @@ void setupWiFi() {
 }
 
 // Rolling JPEGs to hub (0x02) while idle + wake + vision on — hub builds MP4 for Gemini + dashboard.
+// Hub "browser live voice" disables wake word on-device but still needs 0x02 when vision is on (Gemini Live).
 static unsigned long s_lastWakeVideoFrameMs = 0;
 
 // ==========================================
 //     FREERTOS WAKE STREAM (CORE 0)
 //     Single task: 0x10 PCM + optional 0x02 JPEG (vision on). Avoids concurrent WebSocket use (disconnect loops).
+//     PCM is skipped when wake word is off (e.g. browser mic); JPEG still sent if vision is enabled.
 // ==========================================
 void wakeStreamTask(void* pvParameters) {
     uint8_t* pkt = (uint8_t*)malloc(WAKE_STREAM_CHUNK + 1);
@@ -2626,15 +2628,18 @@ void wakeStreamTask(void* pvParameters) {
             hubWebSocketEnabled &&
             isWsConnected &&
             (currentState == STATE_IDLE
-                || (deviceLiveVoiceStream && currentState == STATE_UPLOADING)) &&
-            deviceWakeWordEnabled &&
+                || (currentState == STATE_UPLOADING
+                    && (deviceLiveVoiceStream || deviceVisionCaptureEnabled))) &&
+            (deviceWakeWordEnabled || deviceVisionCaptureEnabled) &&
             !timeScreenActive &&
             !mapOverlayActive &&
             !callingCardOverlayActive &&
             !faceAnimActive
         ) {
             size_t n = 0;
-            i2s_read(I2S_NUM_0, pkt + 1, WAKE_STREAM_CHUNK, &n, pdMS_TO_TICKS(120));
+            if (deviceWakeWordEnabled) {
+                i2s_read(I2S_NUM_0, pkt + 1, WAKE_STREAM_CHUNK, &n, pdMS_TO_TICKS(120));
+            }
 
             uint8_t* videoPacket = nullptr;
             size_t videoLen = 0;

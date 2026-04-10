@@ -63,7 +63,6 @@ from wake_listen import (
 
 import heartbeat_service
 import persona
-import gemini_hub_tts
 import gemini_live_session
 
 # ==========================================
@@ -82,8 +81,6 @@ DEFAULT_SLEEP_TIMEOUT_SEC = 300
 DEFAULT_POST_REPLY_LISTEN_SEC = 10
 DEFAULT_HEARTBEAT_INTERVAL_MINUTES = 30
 DEFAULT_HEARTBEAT_ENABLED = True
-DEFAULT_HUB_TTS_ENABLED = True
-DEFAULT_HUB_TTS_VOICE = gemini_hub_tts.DEFAULT_HUB_TTS_VOICE
 
 # Gemini Live (3.1 Flash Live): streaming audio/video + native audio. Disable with OMNIBOT_USE_GEMINI_LIVE=0.
 USE_GEMINI_LIVE = (os.environ.get("OMNIBOT_USE_GEMINI_LIVE", "1") or "1").strip().lower() not in (
@@ -307,10 +304,6 @@ def get_bot_settings(device_id: str):
         ),
         "heartbeat_enabled": bool(bot_conf.get("heartbeat_enabled", DEFAULT_HEARTBEAT_ENABLED)),
         "thinking_level": normalize_gemini_thinking_level(bot_conf.get("thinking_level")),
-        "hub_tts_enabled": bool(bot_conf.get("hub_tts_enabled", DEFAULT_HUB_TTS_ENABLED)),
-        "hub_tts_voice": gemini_hub_tts.normalize_hub_tts_voice(
-            str(bot_conf.get("hub_tts_voice") or DEFAULT_HUB_TTS_VOICE)
-        ),
     }
 
 
@@ -355,8 +348,6 @@ def _default_stored_bot_settings() -> dict:
         "heartbeat_interval_minutes": DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
         "heartbeat_enabled": DEFAULT_HEARTBEAT_ENABLED,
         "thinking_level": DEFAULT_GEMINI_THINKING_LEVEL,
-        "hub_tts_enabled": DEFAULT_HUB_TTS_ENABLED,
-        "hub_tts_voice": DEFAULT_HUB_TTS_VOICE,
     }
 
 
@@ -609,8 +600,6 @@ class BotSettingsSchema(BaseModel):
     )
     heartbeat_enabled: bool = DEFAULT_HEARTBEAT_ENABLED
     thinking_level: GeminiThinkingLevel = DEFAULT_GEMINI_THINKING_LEVEL
-    hub_tts_enabled: bool = DEFAULT_HUB_TTS_ENABLED
-    hub_tts_voice: str = DEFAULT_HUB_TTS_VOICE
 
 
 class HubAppSettingsSchema(BaseModel):
@@ -801,8 +790,6 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
         "heartbeat_interval_minutes": int(new_settings.heartbeat_interval_minutes),
         "heartbeat_enabled": bool(new_settings.heartbeat_enabled),
         "thinking_level": normalize_gemini_thinking_level(new_settings.thinking_level),
-        "hub_tts_enabled": bool(new_settings.hub_tts_enabled),
-        "hub_tts_voice": gemini_hub_tts.normalize_hub_tts_voice(new_settings.hub_tts_voice),
     }
     settings[device_id] = row
     save_all_settings(settings)
@@ -810,10 +797,7 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
     vision_enabled_by_device[device_id] = row["vision_enabled"]
     wake_word_enabled_by_device[device_id] = row["wake_word_enabled"]
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
-    wake_push = (
-        False if _hub_live_voice_source_is_browser() else row["wake_word_enabled"]
-    )
-    await _send_runtime_wake_word_to_esp32(device_id, wake_push)
+    await _send_runtime_wake_word_to_esp32(device_id, bool(row["wake_word_enabled"]))
     await _send_runtime_presence_scan_to_esp32(device_id)
     await _send_runtime_sleep_timeout_to_esp32(device_id)
     if not row["vision_enabled"]:
@@ -845,10 +829,7 @@ async def reset_settings_to_default(device_id: str):
     wake_word_enabled_by_device[device_id] = row["wake_word_enabled"]
     persona.reset_persona_markdown_to_templates(device_id)
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
-    wake_push = (
-        False if _hub_live_voice_source_is_browser() else row["wake_word_enabled"]
-    )
-    await _send_runtime_wake_word_to_esp32(device_id, wake_push)
+    await _send_runtime_wake_word_to_esp32(device_id, bool(row["wake_word_enabled"]))
     await _send_runtime_presence_scan_to_esp32(device_id)
     await _send_runtime_sleep_timeout_to_esp32(device_id)
     if not row["vision_enabled"]:
@@ -932,7 +913,7 @@ active_streams = {}
 vision_enabled_by_device = {}
 wake_word_enabled_by_device = {}
 timezone_rule_by_device = {}
-# Browser Live Voice: OpenWakeWord + Live uplink from dashboard mic (see /ws/voice-bridge).
+# Browser Live Voice: Gemini Live PCM from dashboard mic; wake can be Pixel mic (OWW on /ws/stream) or browser.
 browser_voice_wake_processor: dict[str, WakeListenProcessor] = {}
 voice_bridge_ws_by_device: dict[str, WebSocket] = {}
 # (device_id, profile_id) -> unix time of last presence-triggered greeting
@@ -1177,11 +1158,10 @@ async def _apply_live_voice_source_runtime() -> None:
     browser = _hub_live_voice_source_is_browser()
     for _ws, sess in list(active_streams.items()):
         did = sess.get("device_id", "default_bot")
+        await _send_runtime_wake_word_to_esp32(did, is_wake_word_enabled(did))
         if browser:
-            await _send_runtime_wake_word_to_esp32(did, False)
             await _send_runtime_live_voice_to_esp32(did, False)
         else:
-            await _send_runtime_wake_word_to_esp32(did, is_wake_word_enabled(did))
             live_on = bool(USE_GEMINI_LIVE and get_gemini_api_key() and sess.get("live_coordinator"))
             await _send_runtime_live_voice_to_esp32(did, live_on)
 
@@ -2474,24 +2454,33 @@ async def _process_presence_jpeg(device_id: str, jpeg_bytes: bytes) -> None:
 
     last_presence_greeting_at[key] = now
     msg = (
-        f"The person named {display_name} is visible in front of you. "
-        "The attached image is the current camera view from your perspective. "
+        f"The person named {display_name} is in front of you. "
         "Give a very brief, warm greeting using their name (one or two short sentences)."
     )
-    turn_content = [
-        types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
-        msg,
-    ]
+    turn_content = msg
     try:
-        full_text, _stream_id = await stream_chat_turn_response(device_id, turn_content)
-        esp32_ws = get_active_esp32_socket(device_id)
-        if esp32_ws:
-            try:
-                await esp32_ws.send_text(
-                    json.dumps({"status": "success", "reply": full_text})
-                )
-            except Exception as e:
-                print(f"[face] failed to send presence reply to ESP32: {e}")
+        used_live = False
+        if USE_GEMINI_LIVE and get_gemini_api_key():
+            coord = await _ensure_live_coordinator_for_device(device_id)
+            if coord is not None:
+                try:
+                    await coord.send_text(msg)
+                    used_live = True
+                except Exception as ex:
+                    print(f"[face] presence Gemini Live failed, using REST: {ex}")
+
+        if not used_live:
+            full_text, _stream_id = await stream_chat_turn_response(device_id, turn_content)
+            esp32_ws = get_active_esp32_socket(device_id)
+            if esp32_ws:
+                try:
+                    await esp32_ws.send_text(
+                        json.dumps({"status": "success", "reply": full_text})
+                    )
+                except Exception as e:
+                    print(f"[face] failed to send presence reply to ESP32: {e}")
+        # Live path: ESP32 reply + history come from gemini_live_session receive loop
+        # (_notify_esp32_live_reply / transcriptions).
         _schedule_face_animation_to_esp32(device_id, "happy")
     except Exception as e:
         print(f"[face] presence greeting failed: {e}")
@@ -2523,45 +2512,6 @@ async def _process_enrollment_jpeg(device_id: str, jpeg_bytes: bytes) -> None:
         print(f"[face] saved enrollment ref {name} for {device_id}/{pid}")
     else:
         print(f"[face] enrollment failed (no face or represent error) for {device_id}/{pid}")
-
-
-async def _broadcast_hub_tts(
-    device_id: str, stream_id: str, text: str, voice_name: str
-) -> None:
-    """Send Gemini TTS audio to dashboard WebSockets for PC speaker playback."""
-    try:
-        await manager.broadcast(
-            {
-                "type": "hub_tts_start",
-                "device_id": device_id,
-                "stream_id": stream_id,
-                "sample_rate": gemini_hub_tts.TTS_SAMPLE_RATE,
-                "channels": gemini_hub_tts.TTS_CHANNELS,
-                "encoding": "pcm_s16le",
-            }
-        )
-        async for pcm in gemini_hub_tts.async_iter_tts_pcm(text, voice_name):
-            for piece in gemini_hub_tts.split_pcm_for_ws(pcm):
-                await manager.broadcast(
-                    {
-                        "type": "hub_tts_chunk",
-                        "stream_id": stream_id,
-                        "b64": base64.b64encode(piece).decode("ascii"),
-                    }
-                )
-        await manager.broadcast({"type": "hub_tts_end", "stream_id": stream_id})
-    except Exception as e:
-        print(f"[hub_tts] broadcast error: {e}")
-        try:
-            await manager.broadcast(
-                {
-                    "type": "hub_tts_end",
-                    "stream_id": stream_id,
-                    "error": str(e),
-                }
-            )
-        except Exception as send_e:
-            print(f"[hub_tts] failed to send hub_tts_end: {send_e}")
 
 
 async def _run_gemini_audio_turn(
@@ -2603,12 +2553,6 @@ async def _run_gemini_audio_turn(
     print(f"\n>>> GEMINI SAYS: {full_text}")
 
     await websocket.send_text(json.dumps({"status": "success", "reply": full_text}))
-    bs = get_bot_settings(device_id)
-    if bs.get("hub_tts_enabled", DEFAULT_HUB_TTS_ENABLED) and (full_text or "").strip():
-        voice = bs.get("hub_tts_voice") or DEFAULT_HUB_TTS_VOICE
-        asyncio.create_task(
-            _broadcast_hub_tts(device_id, reply_stream_id, full_text.strip(), voice)
-        )
     return full_text
 
 
@@ -2671,7 +2615,7 @@ async def esp32_stream_endpoint(websocket: WebSocket):
         browser_voice = _hub_live_voice_source_is_browser()
         await _send_runtime_wake_word_to_esp32(
             stream_device_id,
-            False if browser_voice else is_wake_word_enabled(stream_device_id),
+            is_wake_word_enabled(stream_device_id),
         )
         if USE_GEMINI_LIVE and live_coord is not None:
             await websocket.send_text(
@@ -2862,16 +2806,22 @@ async def esp32_stream_endpoint(websocket: WebSocket):
             session = active_streams[websocket]
 
             if packet_type == 0x10:
-                # Continuous PCM for hub-side wake word + VAD (tap-to-record removed)
-                if _hub_live_voice_source_is_browser():
-                    continue
+                # Continuous PCM: Pixel mic for hub-side wake (+ Live uplink only when hub uses ESP32 for voice).
                 if not is_wake_word_enabled(session["device_id"]):
+                    continue
+                browser_voice = _hub_live_voice_source_is_browser()
+                if browser_voice and not (
+                    USE_GEMINI_LIVE and session.get("live_coordinator") is not None
+                ):
                     continue
                 wp = session.get("wake_processor")
                 if wp is None:
                     try:
 
                         async def _noop_utterance(_raw: bytes) -> None:
+                            return None
+
+                        async def _noop_live_pcm(_chunk: bytes) -> None:
                             return None
 
                         def _post_reply_listen_sec() -> float:
@@ -2898,17 +2848,41 @@ async def esp32_stream_endpoint(websocket: WebSocket):
                             )
 
                         if USE_GEMINI_LIVE and session.get("live_coordinator") is not None:
-                            session["wake_processor"] = WakeListenProcessor(
-                                on_utterance=_noop_utterance,
-                                on_capture_start=_on_wake_video_capture_start,
-                                on_capture_end=_on_wake_video_capture_end,
-                                on_capture_abort=_abort_wake_video,
-                                use_gemini_live=True,
-                                on_live_pcm=_forward_live_pcm_chunk,
-                                on_live_wake=_on_live_wake_started,
-                                get_follow_up_window_s=_post_reply_listen_sec,
-                                on_wake_listen_state=_notify_wake_listen_state,
-                            )
+                            if browser_voice:
+
+                                async def _esp32_wake_triggers_browser_live() -> None:
+                                    did = active_streams.get(websocket, {}).get(
+                                        "device_id", "default_bot"
+                                    )
+                                    wp_b = browser_voice_wake_processor.get(did)
+                                    if wp_b:
+                                        await wp_b.activate_live_forwarding_from_external_wake()
+                                    else:
+                                        await _on_browser_live_wake_started(did)
+
+                                session["wake_processor"] = WakeListenProcessor(
+                                    on_utterance=_noop_utterance,
+                                    on_capture_start=_on_wake_video_capture_start,
+                                    on_capture_end=_on_wake_video_capture_end,
+                                    on_capture_abort=_abort_wake_video,
+                                    use_gemini_live=True,
+                                    on_live_pcm=_noop_live_pcm,
+                                    on_live_wake=_esp32_wake_triggers_browser_live,
+                                    get_follow_up_window_s=_post_reply_listen_sec,
+                                    on_wake_listen_state=_notify_wake_listen_state,
+                                )
+                            else:
+                                session["wake_processor"] = WakeListenProcessor(
+                                    on_utterance=_noop_utterance,
+                                    on_capture_start=_on_wake_video_capture_start,
+                                    on_capture_end=_on_wake_video_capture_end,
+                                    on_capture_abort=_abort_wake_video,
+                                    use_gemini_live=True,
+                                    on_live_pcm=_forward_live_pcm_chunk,
+                                    on_live_wake=_on_live_wake_started,
+                                    get_follow_up_window_s=_post_reply_listen_sec,
+                                    on_wake_listen_state=_notify_wake_listen_state,
+                                )
                         else:
                             session["wake_processor"] = WakeListenProcessor(
                                 on_utterance=_handle_wake_utterance,

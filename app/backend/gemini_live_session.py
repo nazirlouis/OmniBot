@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 # Preview model per https://ai.google.dev/gemini-api/docs/live-api/get-started-sdk
 LIVE_MODEL = "gemini-3.1-flash-live-preview"
+
+# Native Live output voice (prebuilt names match Gemini speech docs, e.g. Kore, Umbriel, Puck).
+# Override without editing code: set OMNIBOT_LIVE_VOICE_NAME=Puck
+LIVE_PREBUILT_VOICE_NAME = (os.environ.get("OMNIBOT_LIVE_VOICE_NAME") or "Umbriel").strip() or "Umbriel"
 
 # Live output audio is typically 24 kHz PCM (see Live API tool use samples).
 LIVE_OUTPUT_AUDIO_SAMPLE_RATE = 24000
@@ -157,6 +162,13 @@ class GeminiLiveCoordinator:
         tools = build_pixel_live_tools()
         kw: dict[str, Any] = {
             "response_modalities": [types.Modality.AUDIO],
+            "speech_config": types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=LIVE_PREBUILT_VOICE_NAME
+                    )
+                )
+            ),
             "system_instruction": sys_instr,
             "tools": tools,
             "input_audio_transcription": types.AudioTranscriptionConfig(),

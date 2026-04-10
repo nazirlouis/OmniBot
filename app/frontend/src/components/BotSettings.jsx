@@ -15,41 +15,9 @@ import {
   putPersonaFile,
 } from './setupService';
 
-/** Matches hub `normalize_gemini_thinking_level` / Gemini 3 docs thinking levels. */
-const GEMINI_THINKING_LEVELS = ['auto', 'minimal', 'low', 'medium', 'high'];
-/** Matches hub `gemini_hub_tts.ALLOWED_TTS_VOICES` (Gemini 2.5 Flash Preview TTS). */
-const GEMINI_TTS_VOICES = [
-  'Achernar',
-  'Achird',
-  'Algenib',
-  'Algieba',
-  'Alnilam',
-  'Aoede',
-  'Autonoe',
-  'Callirrhoe',
-  'Charon',
-  'Despina',
-  'Enceladus',
-  'Erinome',
-  'Fenrir',
-  'Gacrux',
-  'Iapetus',
-  'Kore',
-  'Laomedeia',
-  'Leda',
-  'Orus',
-  'Puck',
-  'Pulcherrima',
-  'Rasalgethi',
-  'Sadachbia',
-  'Sadaltager',
-  'Schedar',
-  'Sulafat',
-  'Umbriel',
-  'Vindemiatrix',
-  'Zephyr',
-  'Zubenelgenubi',
-];
+/** Hub REST/text paths still persist these; Gemini Live uses the fixed Live model in the backend. */
+const HIDDEN_REST_MODEL = 'gemini-3-flash-preview';
+const HIDDEN_THINKING_LEVEL = 'minimal';
 
 const SLEEP_TIMEOUT_OPTIONS = [
   { value: 30, label: '30 seconds' },
@@ -64,8 +32,6 @@ const SLEEP_TIMEOUT_OPTIONS = [
 ];
 
 const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', onBotsChanged }) => {
-  const [model, setModel] = useState('gemini-3.1-flash-lite-preview');
-  const [thinkingLevel, setThinkingLevel] = useState('minimal');
   const [visionEnabled, setVisionEnabled] = useState(false);
   const [wakeWordEnabled, setWakeWordEnabled] = useState(true);
   const [postReplyListenSec, setPostReplyListenSec] = useState(10);
@@ -75,8 +41,6 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
   const [sleepTimeoutSec, setSleepTimeoutSec] = useState(300);
   const [heartbeatIntervalMin, setHeartbeatIntervalMin] = useState(30);
   const [heartbeatEnabled, setHeartbeatEnabled] = useState(true);
-  const [hubTtsEnabled, setHubTtsEnabled] = useState(true);
-  const [hubTtsVoice, setHubTtsVoice] = useState('Kore');
   const [personaTab, setPersonaTab] = useState('soul');
   const [personaDrafts, setPersonaDrafts] = useState({
     soul: '',
@@ -130,10 +94,6 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
     const fetchSettings = async () => {
       try {
         const data = await getBotSettings(deviceId);
-        setModel(data.model);
-        setThinkingLevel(
-          GEMINI_THINKING_LEVELS.includes(data.thinking_level) ? data.thinking_level : 'minimal'
-        );
         setVisionEnabled(Boolean(data.vision_enabled));
         setWakeWordEnabled(data.wake_word_enabled !== false);
         setPostReplyListenSec(
@@ -165,10 +125,6 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
             : 30
         );
         setHeartbeatEnabled(data.heartbeat_enabled !== false);
-        setHubTtsEnabled(data.hub_tts_enabled !== false);
-        setHubTtsVoice(
-          GEMINI_TTS_VOICES.includes(data.hub_tts_voice) ? data.hub_tts_voice : 'Kore'
-        );
         await loadProfiles();
         await loadPersona();
       } catch (err) {
@@ -186,8 +142,8 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
     setSaveStatus(null);
     try {
       const res = await updateBotSettings(deviceId, {
-        model,
-        thinking_level: thinkingLevel,
+        model: HIDDEN_REST_MODEL,
+        thinking_level: HIDDEN_THINKING_LEVEL,
         vision_enabled: visionEnabled,
         wake_word_enabled: wakeWordEnabled,
         post_reply_listen_sec: Math.min(120, Math.max(0, Number(postReplyListenSec) || 0)),
@@ -197,14 +153,8 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
         sleep_timeout_sec: Math.min(1800, Math.max(30, Number(sleepTimeoutSec) || 300)),
         heartbeat_interval_minutes: Math.min(720, Math.max(5, Number(heartbeatIntervalMin) || 30)),
         heartbeat_enabled: heartbeatEnabled,
-        hub_tts_enabled: hubTtsEnabled,
-        hub_tts_voice: hubTtsVoice,
       });
       const saved = res.settings || {};
-      setModel(saved.model);
-      setThinkingLevel(
-        GEMINI_THINKING_LEVELS.includes(saved.thinking_level) ? saved.thinking_level : 'minimal'
-      );
       setVisionEnabled(Boolean(saved.vision_enabled));
       setWakeWordEnabled(saved.wake_word_enabled !== false);
       setPostReplyListenSec(
@@ -220,10 +170,6 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
       setSleepTimeoutSec(saved.sleep_timeout_sec ?? 300);
       setHeartbeatIntervalMin(saved.heartbeat_interval_minutes ?? 30);
       setHeartbeatEnabled(saved.heartbeat_enabled !== false);
-      setHubTtsEnabled(saved.hub_tts_enabled !== false);
-      setHubTtsVoice(
-        GEMINI_TTS_VOICES.includes(saved.hub_tts_voice) ? saved.hub_tts_voice : 'Kore'
-      );
       setSaveStatus('success');
       setTimeout(() => setSaveStatus(null), 3000);
     } catch (err) {
@@ -237,7 +183,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
   const handleResetToDefaults = async () => {
     if (
       !window.confirm(
-        'Reset Pixel model, thinking level, vision, wake word, presence scan, and heartbeat settings to defaults? ' +
+        'Reset Pixel vision, wake word, presence scan, and heartbeat settings to defaults? ' +
           'SOUL.md, IDENTITY.md, USER.md, TOOLS.md, MEMORY.md, HEARTBEAT.md, and AGENTS.md will be overwritten with hub templates (your edits are lost). BOOTSTRAP.md is removed if present. Daily logs under logs/daily/ are kept. Hub clock is unchanged.'
       )
     ) {
@@ -251,10 +197,6 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
         throw new Error(res.detail || 'Reset failed');
       }
       const saved = res.settings;
-      setModel(saved.model);
-      setThinkingLevel(
-        GEMINI_THINKING_LEVELS.includes(saved.thinking_level) ? saved.thinking_level : 'minimal'
-      );
       setVisionEnabled(Boolean(saved.vision_enabled));
       setWakeWordEnabled(saved.wake_word_enabled !== false);
       setPostReplyListenSec(
@@ -270,10 +212,6 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
       setSleepTimeoutSec(saved.sleep_timeout_sec ?? 300);
       setHeartbeatIntervalMin(saved.heartbeat_interval_minutes ?? 30);
       setHeartbeatEnabled(saved.heartbeat_enabled !== false);
-      setHubTtsEnabled(saved.hub_tts_enabled !== false);
-      setHubTtsVoice(
-        GEMINI_TTS_VOICES.includes(saved.hub_tts_voice) ? saved.hub_tts_voice : 'Kore'
-      );
       await loadPersona();
       setSaveStatus('success');
       setTimeout(() => setSaveStatus(null), 3000);
@@ -448,46 +386,6 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
       </div>
 
       <div className="form-group">
-        <label htmlFor="hubTtsSelect">Hub speaker (TTS after voice)</label>
-        <div className="select-wrapper">
-          <select
-            id="hubTtsSelect"
-            value={hubTtsEnabled ? 'on' : 'off'}
-            onChange={(e) => setHubTtsEnabled(e.target.value === 'on')}
-            className="holo-select"
-          >
-            <option value="on">On</option>
-            <option value="off">Off</option>
-          </select>
-        </div>
-        <p className="help-text">
-          When on, after you speak to the bot (wake path), the hub reads the assistant reply aloud through this
-          computer&apos;s speakers using Gemini 2.5 Flash TTS. Typed hub messages are never spoken.
-        </p>
-      </div>
-
-      {hubTtsEnabled ? (
-        <div className="form-group">
-          <label htmlFor="hubTtsVoice">TTS voice</label>
-          <div className="select-wrapper">
-            <select
-              id="hubTtsVoice"
-              value={hubTtsVoice}
-              onChange={(e) => setHubTtsVoice(e.target.value)}
-              className="holo-select"
-            >
-              {GEMINI_TTS_VOICES.map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
-              ))}
-            </select>
-          </div>
-          <p className="help-text">Prebuilt Gemini TTS voice (preview model).</p>
-        </div>
-      ) : null}
-
-      <div className="form-group">
         <label htmlFor="presenceScan">Presence face scan (hub)</label>
         <div className="select-wrapper">
           <select
@@ -631,53 +529,6 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
         )}
       </div>
 
-      <div className="form-group">
-        <label htmlFor="modelSelect">Generative model</label>
-        <div className="select-wrapper">
-          <select
-            id="modelSelect"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            className="holo-select"
-          >
-            <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Flash Lite (default)</option>
-            <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
-            <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
-          </select>
-        </div>
-      </div>
-
-      <div className="form-group">
-        <label htmlFor="thinkingLevelSelect">Gemini thinking level</label>
-        <div className="select-wrapper">
-          <select
-            id="thinkingLevelSelect"
-            value={thinkingLevel}
-            onChange={(e) => setThinkingLevel(e.target.value)}
-            className="holo-select"
-          >
-            <option value="auto">Auto (API default — dynamic thinking)</option>
-            <option value="minimal">Minimal (Flash / Flash-Lite; lowest latency)</option>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High (deeper reasoning; slower)</option>
-          </select>
-        </div>
-        <p className="help-text">
-          Maps to Gemini 3 <code>thinking_config.thinking_level</code> (see{' '}
-          <a
-            href="https://ai.google.dev/gemini-api/docs/thinking"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Thinking (Gemini API docs)
-          </a>
-          ). <strong>Auto</strong> does not send a level — the model uses its default dynamic thinking.{' '}
-          <strong>minimal</strong> is not supported on Gemini 3.1 Pro; Flash and Flash-Lite support the full set per
-          the docs table. If a request fails, try another level or model.
-        </p>
-      </div>
-
       <div className="form-group persona-section">
         <label>Persona (AGENTS / SOUL / IDENTITY / USER / TOOLS / MEMORY / HEARTBEAT)</label>
         <p className="help-text">
@@ -686,9 +537,8 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
           <strong>SOUL.md</strong>, <strong>MEMORY.md</strong>, <strong>IDENTITY.md</strong>, <strong>USER.md</strong>, and{' '}
           <strong>HEARTBEAT.md</strong> via tools when appropriate (Hub settings → <strong>Give me a soul</strong> runs{' '}
           <strong>BOOTSTRAP.md</strong>). Heartbeat <em>maintenance</em> can merge daily logs into MEMORY. Voice turns use
-          Gemini on the audio; add explicit daily-log lines with the <code>daily_log_append</code> tool if you want raw
-          notes on disk. Save model and heartbeat toggles with the form{' '}
-          <strong>Save</strong> button; save markdown with <strong>Save persona file</strong>.
+          Gemini Live on the hub; add explicit daily-log lines with the <code>daily_log_append</code> tool if you want raw
+          notes on disk. Save Pixel options with <strong>Save</strong>; save markdown with <strong>Save persona file</strong>.
         </p>
         <div className="persona-tab-row" role="tablist">
           {[

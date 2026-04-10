@@ -328,7 +328,8 @@ const HubSettings = () => {
         Use your <strong>PC microphone and speakers</strong> in the dashboard so the browser can apply echo
         cancellation (same machine for capture and playback). Requires a secure context (HTTPS or localhost).
         Saved device IDs are browser- and machine-specific; use <strong>Refresh devices</strong> if hardware
-        changes.
+        changes. With <strong>wake word</strong> enabled for the bot in Pixel settings, Pixel still listens for
+        the wake phrase on its mic; only your spoken question is taken from the browser mic after wake.
       </p>
 
       <form className="settings-form" onSubmit={handleSubmitVoice}>

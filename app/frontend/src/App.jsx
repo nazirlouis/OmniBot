@@ -68,11 +68,6 @@ function App() {
   const selectedBotIdRef = useRef(selectedBotId);
   selectedBotIdRef.current = selectedBotId;
 
-  const hubTtsCtxRef = useRef(null);
-  const hubTtsNextTimeRef = useRef(0);
-  const hubTtsSampleRateRef = useRef(24000);
-  const hubTtsStreamIdRef = useRef(null);
-
   const liveAudioCtxRef = useRef(null);
   const liveAudioNextTimeRef = useRef(0);
   const liveAudioSrRef = useRef(24000);
@@ -101,21 +96,6 @@ function App() {
       }
     }
   }, []);
-
-  const stopHubTtsAudio = useCallback(() => {
-    const ctx = hubTtsCtxRef.current;
-    hubTtsCtxRef.current = null;
-    hubTtsStreamIdRef.current = null;
-    hubTtsNextTimeRef.current = 0;
-    if (ctx) {
-      try {
-        ctx.close();
-      } catch {
-        /* ignore */
-      }
-    }
-    stopLiveAudio();
-  }, [stopLiveAudio]);
 
   const [logs, setLogs] = useState([]);
   const [toolCalls, setToolCalls] = useState([]);
@@ -470,42 +450,6 @@ function App() {
                   : prev
               );
             }
-          } else if (message.type === 'hub_tts_start') {
-            stopHubTtsAudio();
-            const rate = Number(message.sample_rate) || 24000;
-            hubTtsSampleRateRef.current = rate;
-            hubTtsStreamIdRef.current = message.stream_id || null;
-            const ctx = new AudioContext();
-            hubTtsCtxRef.current = ctx;
-            hubTtsNextTimeRef.current = ctx.currentTime + 0.08;
-            void ctx.resume().catch(() => {});
-            void applyPlaybackSinkId(ctx);
-          } else if (message.type === 'hub_tts_chunk') {
-            if (message.stream_id !== hubTtsStreamIdRef.current) return;
-            const ctx = hubTtsCtxRef.current;
-            if (!ctx || !message.b64) return;
-            try {
-              const int16 = base64ToInt16PCM(message.b64);
-              if (!int16.length) return;
-              const sr = hubTtsSampleRateRef.current;
-              const buffer = ctx.createBuffer(1, int16.length, sr);
-              const ch = buffer.getChannelData(0);
-              for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768.0;
-              const src = ctx.createBufferSource();
-              src.buffer = buffer;
-              src.connect(ctx.destination);
-              const startAt = Math.max(ctx.currentTime, hubTtsNextTimeRef.current);
-              src.start(startAt);
-              hubTtsNextTimeRef.current = startAt + buffer.duration;
-            } catch (e) {
-              console.error('Hub TTS chunk playback failed', e);
-            }
-          } else if (message.type === 'hub_tts_end') {
-            if (message.stream_id !== hubTtsStreamIdRef.current) return;
-            hubTtsStreamIdRef.current = null;
-            if (message.error) {
-              console.warn('Hub TTS:', message.error);
-            }
           } else if (message.type === 'live_transcription') {
             appendLiveTranscription(
               message.device_id,
@@ -516,17 +460,31 @@ function App() {
           } else if (message.type === 'live_audio_chunk') {
             const did = message.device_id || selectedBotIdRef.current;
             if (did !== selectedBotIdRef.current) return;
-            if (message.stream_id && message.stream_id !== liveAudioStreamIdRef.current) {
-              stopLiveAudio();
-              liveAudioStreamIdRef.current = message.stream_id;
-              const rate = Number(message.sample_rate) || 24000;
-              liveAudioSrRef.current = rate;
+            const rate = Number(message.sample_rate) || 24000;
+            if (rate > 0) liveAudioSrRef.current = rate;
+
+            // Reuse one AudioContext across Live turns. Closing/recreating on every new stream_id
+            // often breaks playback after other hub work (e.g. presence REST) due to autoplay rules.
+            const sid = message.stream_id;
+            if (sid && sid !== liveAudioStreamIdRef.current) {
+              liveAudioStreamIdRef.current = sid;
+              let ctx = liveAudioCtxRef.current;
+              if (!ctx) {
+                ctx = new AudioContext();
+                liveAudioCtxRef.current = ctx;
+                void ctx.resume().catch(() => {});
+                void applyPlaybackSinkId(ctx);
+              }
+              liveAudioNextTimeRef.current = ctx.currentTime + 0.08;
+            } else if (!liveAudioCtxRef.current) {
               const ctx = new AudioContext();
               liveAudioCtxRef.current = ctx;
+              if (sid) liveAudioStreamIdRef.current = sid;
               liveAudioNextTimeRef.current = ctx.currentTime + 0.08;
               void ctx.resume().catch(() => {});
               void applyPlaybackSinkId(ctx);
             }
+
             const ctx = liveAudioCtxRef.current;
             if (!ctx || !message.b64) return;
             try {
@@ -552,7 +510,7 @@ function App() {
       };
 
       ws.onclose = () => {
-        stopHubTtsAudio();
+        stopLiveAudio();
         setLivePreviewByDevice({});
         setWakeListenByDevice({});
         setWsStatus('disconnected');
@@ -573,14 +531,13 @@ function App() {
 
     return () => {
       cancelled = true;
-      stopHubTtsAudio();
+      stopLiveAudio();
       if (ws) ws.close();
     };
   }, [
     geminiConfigured,
     mergeBotList,
     refreshBotList,
-    stopHubTtsAudio,
     appendLiveTranscription,
     stopLiveAudio,
     applyPlaybackSinkId,
