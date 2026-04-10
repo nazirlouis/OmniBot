@@ -684,7 +684,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
           Markdown files on the hub (OpenClaw-style). <strong>AGENTS.md</strong> is high-level behavior (injected for the
           model; edit here). <strong>TOOLS.md</strong> documents tools for context. The model can update{' '}
           <strong>SOUL.md</strong>, <strong>MEMORY.md</strong>, <strong>IDENTITY.md</strong>, <strong>USER.md</strong>, and{' '}
-          <strong>HEARTBEAT.md</strong> via tools when appropriate (dashboard &quot;Give me a soul&quot; runs{' '}
+          <strong>HEARTBEAT.md</strong> via tools when appropriate (Hub settings → <strong>Give me a soul</strong> runs{' '}
           <strong>BOOTSTRAP.md</strong>). Heartbeat <em>maintenance</em> can merge daily logs into MEMORY. Voice turns use
           Gemini on the audio; add explicit daily-log lines with the <code>daily_log_append</code> tool if you want raw
           notes on disk. Save model and heartbeat toggles with the form{' '}

@@ -804,19 +804,6 @@ function App() {
     }
   };
 
-  const handleGiveSoul = async () => {
-    if (isSendingText) return;
-    addLog('user', 'Give me a soul — starting bootstrap ritual');
-    setIsSendingText(true);
-    try {
-      await startBootstrapSoul(selectedBotId);
-    } catch (error) {
-      addLog('error', error.message || 'Bootstrap ritual failed');
-    } finally {
-      setIsSendingText(false);
-    }
-  };
-
   const setupSetters = {
     setAppMode: (val) => updateSetup('appMode', val),
     setSetupStep: (val) => updateSetup('setupStep', val),
@@ -932,7 +919,6 @@ function App() {
             setTextMessage={setTextMessage}
             isSendingText={isSendingText}
             onSendTextCommand={handleSendTextCommand}
-            onGiveSoul={handleGiveSoul}
           />
         )}
 
@@ -954,7 +940,6 @@ function App() {
                 setTextMessage={setTextMessage}
                 isSendingText={isSendingText}
                 onSendTextCommand={handleSendTextCommand}
-                onGiveSoul={null}
               />
             </div>
           ) : (

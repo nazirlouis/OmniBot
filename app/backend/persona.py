@@ -37,8 +37,8 @@ SOUL_REWRITE_CHECKLIST = """1. Strong opinions — commit to a take; stop hedgin
 SOUL_REPLACE_DECLARATION = {
     "name": "soul_replace",
     "description": (
-        "Replace the entire SOUL.md file with new markdown (Pixel's voice, tone, boundaries). "
-        "Use when the user asks to change personality, attitude, or how Pixel speaks. "
+        "Replace the entire SOUL.md file with new markdown (voice, tone, boundaries). "
+        "Use when the user asks to change personality, attitude, or how the bot speaks. "
         "Pass the complete file body. Max size enforced server-side."
     ),
     "parameters": {
@@ -57,7 +57,7 @@ PERSONA_REPLACE_DECLARATION = {
     "name": "persona_replace",
     "description": (
         "Replace the entire IDENTITY.md, USER.md, or HEARTBEAT.md file. "
-        "Use during bootstrap or when the user asks to update who Pixel is, who the human is, or heartbeat checklists. "
+        "Use during bootstrap or when the user asks to update bot identity, the human's profile, or heartbeat checklists. "
         "Pass the complete file body. Tell the user in your reply whenever you change a file. "
         "Do not use this for SOUL.md (use soul_replace), MEMORY.md (use memory_replace), TOOLS.md, or AGENTS.md."
     ),
@@ -195,10 +195,33 @@ def ensure_persona_layout(device_id: str) -> Path:
     return root
 
 
+def clear_daily_logs_and_heartbeat_state(device_id: str) -> dict[str, Any]:
+    """Delete logs/daily/*.md and remove .heartbeat_state.json (fresh narrative, no prior log injection)."""
+    ensure_persona_layout(device_id)
+    removed_logs = 0
+    d = daily_logs_dir(device_id)
+    if d.is_dir():
+        for p in d.glob("*.md"):
+            try:
+                p.unlink()
+                removed_logs += 1
+            except OSError:
+                pass
+    hp = heartbeat_state_path(device_id)
+    hb_removed = False
+    if hp.is_file():
+        try:
+            hp.unlink()
+            hb_removed = True
+        except OSError:
+            pass
+    return {"ok": True, "daily_logs_removed": removed_logs, "heartbeat_state_removed": hb_removed}
+
+
 def reset_persona_markdown_to_templates(device_id: str) -> dict[str, Any]:
     """Overwrite SOUL/IDENTITY/USER/TOOLS/MEMORY/HEARTBEAT/AGENTS with hub templates; remove BOOTSTRAP.md.
 
-    Does not delete logs/daily/*.md or .heartbeat_state.json.
+    Does not delete logs/daily/*.md or .heartbeat_state.json (use clear_daily_logs_and_heartbeat_state for that).
     """
     ensure_persona_layout(device_id)
     root = persona_root_dir(device_id)
@@ -277,6 +300,7 @@ def build_composed_system_instruction(
     *,
     for_heartbeat_maintenance: bool = False,
     extra_system_suffix: str = "",
+    use_neutral_hub_rules_header: bool = False,
 ) -> str:
     """Hub rules + persona context. Chat: SOUL/USER/MEMORY. Heartbeat: MEMORY only + daily logs come in user message."""
     ensure_persona_layout(device_id)
@@ -302,8 +326,11 @@ def build_composed_system_instruction(
     user = read_persona_markdown(device_id, "user")
     tools_doc = read_persona_markdown(device_id, "tools")
     daily_tail = tail_recent_daily_logs(device_id)
+    hub_header = (
+        "=== HUB_RULES ===\n" if use_neutral_hub_rules_header else "=== PIXEL_HUB_RULES ===\n"
+    )
     parts = [
-        "=== PIXEL_HUB_RULES ===\n" + (base_hub_rules or "").strip(),
+        hub_header + (base_hub_rules or "").strip(),
         "=== AGENTS.md (read-only) ===\n" + agents.strip(),
         "=== TOOLS.md (read-only reference) ===\n" + tools_doc.strip(),
         "=== SOUL ===\n" + soul.strip(),

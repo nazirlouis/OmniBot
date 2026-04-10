@@ -5,6 +5,8 @@ import {
   postHubSettings,
   getHubAppSettings,
   postHubAppSettings,
+  listBots,
+  startBootstrapSoul,
 } from './setupService';
 
 const TIMEZONE_OPTIONS = [
@@ -41,11 +43,26 @@ const HubSettings = () => {
     browser_audio_output_device_id: '',
   });
 
+  const [soulBots, setSoulBots] = useState([]);
+  const [soulDeviceId, setSoulDeviceId] = useState('default_bot');
+  const [soulRunning, setSoulRunning] = useState(false);
+  const [soulFeedback, setSoulFeedback] = useState(null);
+
   const hasTimezoneOption = TIMEZONE_OPTIONS.some((tz) => tz.value === locForm.timezone_rule);
 
   const load = async () => {
     try {
-      const [v, app] = await Promise.all([getHubSettings(), getHubAppSettings()]);
+      const [v, app, botsRes] = await Promise.all([
+        getHubSettings(),
+        getHubAppSettings(),
+        listBots().catch(() => ({ bots: [] })),
+      ]);
+      const bots = botsRes.bots || [];
+      setSoulBots(bots);
+      setSoulDeviceId((prev) => {
+        if (bots.some((b) => b.device_id === prev)) return prev;
+        return bots[0]?.device_id || 'default_bot';
+      });
       setView(v);
       setForm((f) => ({
         ...f,
@@ -135,6 +152,40 @@ const HubSettings = () => {
       setAudioOutputs(list.filter((d) => d.kind === 'audiooutput'));
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  const handleGiveSoul = async () => {
+    const warn = [
+      "Give me a soul resets this bot to a fresh persona baseline:",
+      '',
+      '• Hub chat history is cleared.',
+      '• SOUL, IDENTITY, USER, TOOLS, MEMORY, HEARTBEAT, and AGENTS are overwritten from the hub persona templates (persona_defaults).',
+      '• A new BOOTSTRAP.md is written and the soul ritual runs with Gemini.',
+      '• Daily logs under logs/daily/ and .heartbeat_state.json are removed so the model is not fed old diary context.',
+      '',
+      'Face profiles and saved Pixel settings (model, vision, etc.) are unchanged.',
+      '',
+      'Continue?',
+    ].join('\n');
+    if (!window.confirm(warn)) return;
+
+    setSoulRunning(true);
+    setSoulFeedback(null);
+    try {
+      await startBootstrapSoul(soulDeviceId);
+      setSoulFeedback({
+        type: 'success',
+        text: 'Bootstrap ritual started. Open the dashboard Intelligence Feed to follow progress.',
+      });
+    } catch (err) {
+      console.error(err);
+      setSoulFeedback({
+        type: 'error',
+        text: err.message || 'Bootstrap ritual failed.',
+      });
+    } finally {
+      setSoulRunning(false);
     }
   };
 
@@ -375,6 +426,56 @@ const HubSettings = () => {
           <div className="status-message error slide-enter">Failed to save voice settings.</div>
         )}
       </form>
+
+      <h3 className="hub-section-title">Give me a soul</h3>
+      <p className="help-text">
+        Resets persona markdown to hub templates (like a fresh install), clears that bot&apos;s hub chat history,
+        removes daily logs and heartbeat state on disk, writes <code>BOOTSTRAP.md</code>, and runs the bootstrap ritual
+        with Gemini. Confirm to proceed.
+      </p>
+      <div className="settings-form">
+        <div className="form-group">
+          <label htmlFor="hubSoulBot">Bot</label>
+          <div className="select-wrapper">
+            <select
+              id="hubSoulBot"
+              className="holo-select"
+              value={soulDeviceId}
+              onChange={(e) => setSoulDeviceId(e.target.value)}
+              disabled={soulRunning}
+            >
+              {soulBots.length === 0 ? (
+                <option value="default_bot">default_bot</option>
+              ) : (
+                soulBots.map((b) => (
+                  <option key={b.device_id} value={b.device_id}>
+                    {b.device_id}
+                    {b.online === true ? ' (online)' : ''}
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
+        </div>
+        <div className="form-actions">
+          <div className="form-actions-trailing">
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={soulRunning}
+              onClick={() => void handleGiveSoul()}
+            >
+              {soulRunning ? 'Starting…' : 'Give me a soul'}
+            </button>
+          </div>
+        </div>
+        {soulFeedback?.type === 'success' && (
+          <div className="status-message success slide-enter">{soulFeedback.text}</div>
+        )}
+        {soulFeedback?.type === 'error' && (
+          <div className="status-message error slide-enter">{soulFeedback.text}</div>
+        )}
+      </div>
 
       <h3 className="hub-section-title">Clock</h3>
       <p className="help-text">

@@ -123,29 +123,6 @@
   }
 }
 
-.feed-soul-btn {
-  font-size: 0.7rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 0.45rem 0.85rem;
-  border-radius: 20px;
-  border: 1px solid rgba(0, 102, 204, 0.35);
-  background: linear-gradient(135deg, rgba(0, 102, 204, 0.12), rgba(138, 43, 226, 0.08));
-  color: var(--text-main);
-  cursor: pointer;
-  transition: opacity 0.15s ease, border-color 0.15s ease;
-}
-
-.feed-soul-btn:hover:not(:disabled) {
-  border-color: rgba(0, 102, 204, 0.55);
-}
-
-.feed-soul-btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
 .feed-tool-log-btn {
   position: relative;
   font-size: 0.7rem;

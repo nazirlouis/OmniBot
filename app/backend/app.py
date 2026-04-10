@@ -93,14 +93,26 @@ USE_GEMINI_LIVE = (os.environ.get("OMNIBOT_USE_GEMINI_LIVE", "1") or "1").strip(
     "off",
 )
 # Hub rules always injected; personality lives in persona/SOUL.md (and USER/MEMORY).
-DEFAULT_PIXEL_BASE_RULES = (
-    "You control a small desktop robot named Pixel with a round face display.\n\n"
+_PIXEL_ANIMATION_AND_SINGLE_REC_RULES = (
     "Animation tools:\n"
     "- Use the `show_face_animation` / `face_animation` tool for conversational or emotional states only. "
     "Pass a single argument: `animation` = speaking, happy, or mad.\n"
     "At most one animation tool should be used per turn. Do not call more than one of: "
     "`face_animation` or `show_face_animation` in the same turn.\n\n"
     "When asked about food, activities, or places near me, provide exactly ONE recommendation and do not list multiple options."
+)
+
+DEFAULT_PIXEL_BASE_RULES = (
+    "You control a small desktop robot named Pixel with a round face display.\n\n"
+    + _PIXEL_ANIMATION_AND_SINGLE_REC_RULES
+)
+
+# Soul bootstrap: do not assert a name—daily logs are cleared and IDENTITY is a blank template.
+SOUL_BOOTSTRAP_BASE_RULES = (
+    "You are helping pilot a small desktop robot with a round face display. "
+    "During soul bootstrap the bot has no settled name or persona until you and the human agree and record it in the persona files; "
+    "do not treat hub wording, firmware labels, or prior sessions as facts about identity.\n\n"
+    + _PIXEL_ANIMATION_AND_SINGLE_REC_RULES
 )
 
 FACE_ANIMATION_DISPLAY_MS = 2500
@@ -305,11 +317,17 @@ def get_bot_settings(device_id: str):
 def resolve_effective_system_instruction(
     device_id: str, *, extra_system_suffix: str = ""
 ) -> str:
-    """Compose OpenClaw-style persona files + hub rules."""
+    """Compose OpenClaw-style persona files + hub rules.
+
+    While BOOTSTRAP.md exists (soul ritual in progress), use neutral hub rules so the model does not assume a settled name.
+    """
+    bootstrap_active = persona.bootstrap_path(device_id).is_file()
+    base = SOUL_BOOTSTRAP_BASE_RULES if bootstrap_active else DEFAULT_PIXEL_BASE_RULES
     return persona.build_composed_system_instruction(
         device_id,
-        DEFAULT_PIXEL_BASE_RULES,
+        base,
         extra_system_suffix=extra_system_suffix,
+        use_neutral_hub_rules_header=bootstrap_active,
     )
 
 
@@ -3075,7 +3093,10 @@ async def text_command(req: TextCommandRequest):
     message = (req.message or "").strip()
     if req.bootstrap:
         history_by_device.pop(req.device_id, None)
-        persona.ensure_persona_layout(req.device_id)
+        # Fresh run: overwrite SOUL/IDENTITY/USER/TOOLS/MEMORY/HEARTBEAT/AGENTS from hub templates,
+        # remove any old BOOTSTRAP.md, then write a new BOOTSTRAP.md for the ritual.
+        persona.reset_persona_markdown_to_templates(req.device_id)
+        persona.clear_daily_logs_and_heartbeat_state(req.device_id)
         persona.write_bootstrap_markdown(req.device_id, persona.TEMPLATE_BOOTSTRAP)
         ritual_msg = (
             "The human started the **Give me a soul** ritual from the hub. "

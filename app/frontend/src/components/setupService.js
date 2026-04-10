@@ -130,7 +130,7 @@ export const putPersonaFile = async (device_id, persona_file, content) => {
   return res.json();
 };
 
-/** Start OpenClaw-style bootstrap: hub resets chat history, writes BOOTSTRAP.md, streams Gemini with bootstrap tools. */
+/** Start soul bootstrap: reset persona markdown to hub templates, clear chat history, clear daily logs + heartbeat state, write BOOTSTRAP.md, stream Gemini. */
 export const startBootstrapSoul = async (device_id) => {
   const res = await fetch(hubUrl('/api/text-command'), {
     method: 'POST',

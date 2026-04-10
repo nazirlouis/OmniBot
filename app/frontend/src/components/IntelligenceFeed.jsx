@@ -68,7 +68,6 @@ const IntelligenceFeed = ({
   setTextMessage,
   isSendingText,
   onSendTextCommand,
-  onGiveSoul,
 }) => {
   const logEndRef = useRef(null);
   const textInputRef = useRef(null);
@@ -113,17 +112,6 @@ const IntelligenceFeed = ({
             Hub log
             {hubLogCount > 0 && <span className="feed-tool-log-badge">{hubLogCount}</span>}
           </button>
-          {onGiveSoul && (
-            <button
-              type="button"
-              className="feed-soul-btn"
-              onClick={onGiveSoul}
-              disabled={isSendingText}
-              title="Reset chat history and start the first-run soul ritual (BOOTSTRAP.md)"
-            >
-              Give me a soul
-            </button>
-          )}
           {wakeListenMode && WAKE_LISTEN_UI[wakeListenMode] ? (
             <div
               className={`wake-listen-pill wake-listen-pill--${wakeListenMode}`}
