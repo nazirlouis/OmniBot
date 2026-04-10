@@ -168,6 +168,9 @@ def get_genai_client():
 def _default_hub_app_settings_dict() -> dict[str, Any]:
     return {
         "timezone_rule": DEFAULT_HUB_TIMEZONE_RULE,
+        "live_voice_source": "esp32",
+        "browser_audio_input_device_id": "",
+        "browser_audio_output_device_id": "",
     }
 
 

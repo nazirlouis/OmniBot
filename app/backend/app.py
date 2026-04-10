@@ -596,9 +596,12 @@ class BotSettingsSchema(BaseModel):
 
 
 class HubAppSettingsSchema(BaseModel):
-    """Hub-wide clock settings (hub_app_settings.json)."""
+    """Hub-wide app settings (hub_app_settings.json). All fields optional on POST for partial updates."""
 
-    timezone_rule: str = DEFAULT_TIMEZONE_RULE
+    timezone_rule: Optional[str] = None
+    live_voice_source: Optional[Literal["esp32", "browser"]] = None
+    browser_audio_input_device_id: Optional[str] = None
+    browser_audio_output_device_id: Optional[str] = None
 
 class TextCommandRequest(BaseModel):
     message: str = ""
@@ -789,7 +792,10 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
     vision_enabled_by_device[device_id] = row["vision_enabled"]
     wake_word_enabled_by_device[device_id] = row["wake_word_enabled"]
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
-    await _send_runtime_wake_word_to_esp32(device_id, row["wake_word_enabled"])
+    wake_push = (
+        False if _hub_live_voice_source_is_browser() else row["wake_word_enabled"]
+    )
+    await _send_runtime_wake_word_to_esp32(device_id, wake_push)
     await _send_runtime_presence_scan_to_esp32(device_id)
     await _send_runtime_sleep_timeout_to_esp32(device_id)
     if not row["vision_enabled"]:
@@ -821,7 +827,10 @@ async def reset_settings_to_default(device_id: str):
     wake_word_enabled_by_device[device_id] = row["wake_word_enabled"]
     persona.reset_persona_markdown_to_templates(device_id)
     await _send_runtime_vision_to_esp32(device_id, row["vision_enabled"])
-    await _send_runtime_wake_word_to_esp32(device_id, row["wake_word_enabled"])
+    wake_push = (
+        False if _hub_live_voice_source_is_browser() else row["wake_word_enabled"]
+    )
+    await _send_runtime_wake_word_to_esp32(device_id, wake_push)
     await _send_runtime_presence_scan_to_esp32(device_id)
     await _send_runtime_sleep_timeout_to_esp32(device_id)
     if not row["vision_enabled"]:
@@ -905,6 +914,9 @@ active_streams = {}
 vision_enabled_by_device = {}
 wake_word_enabled_by_device = {}
 timezone_rule_by_device = {}
+# Browser Live Voice: OpenWakeWord + Live uplink from dashboard mic (see /ws/voice-bridge).
+browser_voice_wake_processor: dict[str, WakeListenProcessor] = {}
+voice_bridge_ws_by_device: dict[str, WebSocket] = {}
 # (device_id, profile_id) -> unix time of last presence-triggered greeting
 last_presence_greeting_at: dict[tuple[str, str], float] = {}
 # device_id -> pending enrollment capture from hub UI
@@ -919,6 +931,7 @@ def _purge_bot_runtime_state(device_id: str) -> None:
     timezone_rule_by_device.pop(device_id, None)
     gemini_turn_locks.pop(device_id, None)
     turn_tool_state_by_device.pop(device_id, None)
+    browser_voice_wake_processor.pop(device_id, None)
 
 
 async def _disconnect_websockets_for_device(device_id: str) -> None:
@@ -1043,6 +1056,157 @@ async def _send_runtime_wake_word_to_esp32(device_id: str, enabled: bool) -> Non
         await ws.send_text(json.dumps({"type": "runtime_wake_word", "enabled": bool(enabled)}))
     except Exception as e:
         print(f"Failed to send runtime_wake_word to ESP32: {e}")
+
+
+async def _send_runtime_live_voice_to_esp32(device_id: str, enabled: bool) -> None:
+    """Push Gemini Live mic streaming hint to Pixel (firmware gates 0x10 during STATE_UPLOADING)."""
+    ws = get_active_esp32_socket(device_id)
+    if not ws:
+        return
+    bind_esp32_stream_to_device(ws, device_id)
+    try:
+        await ws.send_text(json.dumps({"type": "runtime_live_voice", "enabled": bool(enabled)}))
+    except Exception as e:
+        print(f"Failed to send runtime_live_voice to ESP32: {e}")
+
+
+def _hub_live_voice_source_is_browser() -> bool:
+    return str(load_hub_app_settings().get("live_voice_source") or "esp32").lower() == "browser"
+
+
+def _esp32_session_dict_for_device(device_id: str) -> Optional[dict[str, Any]]:
+    ws = get_active_esp32_socket(device_id)
+    if not ws:
+        return None
+    return active_streams.get(ws)
+
+
+def _browser_abort_wake_video(device_id: str) -> None:
+    sess = _esp32_session_dict_for_device(device_id)
+    if not sess:
+        return
+    sess["video_pre_roll"] = None
+    sess["video_utterance"] = None
+    sess.pop("video_wake_clip", None)
+
+
+async def _browser_on_wake_video_capture_start(device_id: str) -> None:
+    sess = _esp32_session_dict_for_device(device_id)
+    if not sess:
+        return
+    sess.pop("video_wake_clip", None)
+    buf = sess.get("video_frame_buffer")
+    sess["video_pre_roll"] = list(buf) if buf else []
+    sess["video_utterance"] = []
+
+
+async def _browser_on_wake_video_capture_end(device_id: str) -> None:
+    sess = _esp32_session_dict_for_device(device_id)
+    if not sess:
+        return
+    pre = sess.pop("video_pre_roll", None) or []
+    extra = sess.pop("video_utterance", None)
+    sess["video_wake_clip"] = pre + (extra if isinstance(extra, list) else [])
+
+
+async def _ensure_live_coordinator_for_device(device_id: str) -> Optional[Any]:
+    """Return Live coordinator for device_id, creating/registering one if absent (browser-only hub)."""
+    did = (device_id or "").strip() or "default_bot"
+    coord = gemini_live_session.live_coordinator_for(did)
+    if coord is not None:
+        return coord
+    if not USE_GEMINI_LIVE or not get_gemini_api_key():
+        return None
+    coord = _build_live_coordinator(did)
+    gemini_live_session.register_live_coordinator(did, coord)
+    try:
+        await coord.ensure_started()
+    except Exception as ex:
+        print(f"[live] ensure_started (standalone) failed for {did!r}: {ex}")
+    return coord
+
+
+async def _on_browser_live_wake_started(device_id: str) -> None:
+    did = (device_id or "").strip() or "default_bot"
+    coord = await _ensure_live_coordinator_for_device(did)
+    if not coord:
+        return
+    coord.begin_user_turn()
+    try:
+        await coord.ensure_started()
+    except Exception as ex:
+        print(f"[live] browser live wake ensure_started failed: {ex}")
+        return
+    turn_tool_state_by_device[did] = {"face_animation": False}
+    await _send_activity_event_to_esp32(did, "wake_word")
+    esp32_ws = get_active_esp32_socket(did)
+    if esp32_ws:
+        try:
+            await esp32_ws.send_text(json.dumps({"type": "wake_processing"}))
+        except Exception as e:
+            print(f"[live] browser wake wake_processing to ESP32 failed: {e}")
+    await manager.broadcast(
+        {
+            "type": "processing_started",
+            "device_id": did,
+            "data": "Streaming voice to Gemini Live (browser mic)...",
+        }
+    )
+
+
+async def _apply_live_voice_source_runtime() -> None:
+    """Push runtime_wake_word + runtime_live_voice to all ESP32 streams from hub mode."""
+    browser = _hub_live_voice_source_is_browser()
+    for _ws, sess in list(active_streams.items()):
+        did = sess.get("device_id", "default_bot")
+        if browser:
+            await _send_runtime_wake_word_to_esp32(did, False)
+            await _send_runtime_live_voice_to_esp32(did, False)
+        else:
+            await _send_runtime_wake_word_to_esp32(did, is_wake_word_enabled(did))
+            live_on = bool(USE_GEMINI_LIVE and get_gemini_api_key() and sess.get("live_coordinator"))
+            await _send_runtime_live_voice_to_esp32(did, live_on)
+
+
+def _build_browser_voice_wake_processor(device_id: str) -> WakeListenProcessor:
+    did = (device_id or "").strip() or "default_bot"
+
+    async def _noop_utterance(_raw: bytes) -> None:
+        return None
+
+    async def _forward_live_pcm(chunk: bytes) -> None:
+        coord = gemini_live_session.live_coordinator_for(did)
+        if coord and chunk:
+            await coord.enqueue_pcm(chunk)
+
+    def _post_reply_listen_sec() -> float:
+        return float(
+            get_bot_settings(did).get("post_reply_listen_sec", DEFAULT_POST_REPLY_LISTEN_SEC)
+        )
+
+    async def _notify_wake_listen_state(mode: str) -> None:
+        await manager.broadcast({"type": "wake_listen_state", "device_id": did, "mode": mode})
+
+    async def _on_cap_start() -> None:
+        await _browser_on_wake_video_capture_start(did)
+
+    async def _on_cap_end() -> None:
+        await _browser_on_wake_video_capture_end(did)
+
+    async def _live_wake() -> None:
+        await _on_browser_live_wake_started(did)
+
+    return WakeListenProcessor(
+        on_utterance=_noop_utterance,
+        on_capture_start=_on_cap_start,
+        on_capture_end=_on_cap_end,
+        on_capture_abort=lambda: _browser_abort_wake_video(did),
+        use_gemini_live=True,
+        on_live_pcm=_forward_live_pcm,
+        on_live_wake=_live_wake,
+        get_follow_up_window_s=_post_reply_listen_sec,
+        on_wake_listen_state=_notify_wake_listen_state,
+    )
 
 
 def get_timezone_rule(device_id: str) -> str:
@@ -1967,6 +2131,9 @@ def _on_wake_live_turn_done(device_id: str) -> None:
         if wp and getattr(wp, "use_gemini_live", False):
             wp.end_live_forwarding()
         break
+    wp_b = browser_voice_wake_processor.get(device_id)
+    if wp_b and getattr(wp_b, "use_gemini_live", False):
+        wp_b.end_live_forwarding()
 
 
 def _on_live_user_transcription_activity(device_id: str) -> None:
@@ -1980,6 +2147,12 @@ def _on_live_user_transcription_activity(device_id: str) -> None:
                 coord.begin_user_turn()
             wp.note_model_user_activity()
         break
+    wp_b = browser_voice_wake_processor.get(device_id)
+    if wp_b and getattr(wp_b, "use_gemini_live", False):
+        coord = gemini_live_session.live_coordinator_for(device_id)
+        if coord and wp_b.begin_follow_up_turn_if_needed():
+            coord.begin_user_turn()
+        wp_b.note_model_user_activity()
 
 
 async def _notify_esp32_live_first_token(device_id: str) -> None:
@@ -2477,10 +2650,16 @@ async def esp32_stream_endpoint(websocket: WebSocket):
         )
         await _send_runtime_presence_scan_to_esp32(stream_device_id)
         await _send_runtime_sleep_timeout_to_esp32(stream_device_id)
-        await _send_runtime_wake_word_to_esp32(stream_device_id, is_wake_word_enabled(stream_device_id))
+        browser_voice = _hub_live_voice_source_is_browser()
+        await _send_runtime_wake_word_to_esp32(
+            stream_device_id,
+            False if browser_voice else is_wake_word_enabled(stream_device_id),
+        )
         if USE_GEMINI_LIVE and live_coord is not None:
             await websocket.send_text(
-                json.dumps({"type": "runtime_live_voice", "enabled": True})
+                json.dumps(
+                    {"type": "runtime_live_voice", "enabled": bool(not browser_voice)}
+                )
             )
     except Exception as e:
         print(f"Could not sync runtime settings to ESP32 on connect: {e}")
@@ -2666,6 +2845,8 @@ async def esp32_stream_endpoint(websocket: WebSocket):
 
             if packet_type == 0x10:
                 # Continuous PCM for hub-side wake word + VAD (tap-to-record removed)
+                if _hub_live_voice_source_is_browser():
+                    continue
                 if not is_wake_word_enabled(session["device_id"]):
                     continue
                 wp = session.get("wake_processor")
@@ -2764,7 +2945,8 @@ async def esp32_stream_endpoint(websocket: WebSocket):
                 ws is not websocket and s.get("device_id") == dev_id
                 for ws, s in active_streams.items()
             )
-            if coord is not None and not other:
+            bridge_active = voice_bridge_ws_by_device.get(dev_id) is not None
+            if coord is not None and not other and not bridge_active:
                 try:
                     await coord.stop()
                 except Exception as ex:
@@ -2797,7 +2979,8 @@ async def esp32_stream_endpoint(websocket: WebSocket):
                 ws is not websocket and s.get("device_id") == dev_id
                 for ws, s in active_streams.items()
             )
-            if coord is not None and not other:
+            bridge_active = voice_bridge_ws_by_device.get(dev_id) is not None
+            if coord is not None and not other and not bridge_active:
                 try:
                     await coord.stop()
                 except Exception as ex:
@@ -2819,6 +3002,72 @@ async def esp32_stream_endpoint(websocket: WebSocket):
                     "data": "ESP32 stream disconnected",
                 }
             )
+
+
+@app.websocket("/ws/voice-bridge")
+async def voice_bridge_websocket(websocket: WebSocket):
+    """Browser mic uplink for wake + Gemini Live when live_voice_source=browser."""
+    await websocket.accept()
+    raw_q = websocket.scope.get("query_string", b"") or b""
+    q = parse_qs(raw_q.decode("utf-8", errors="replace"))
+    did_list = q.get("device_id") or ["default_bot"]
+    did = str(did_list[0] or "default_bot").strip() or "default_bot"
+
+    if not _hub_live_voice_source_is_browser():
+        await websocket.close(code=4003)
+        return
+    if not USE_GEMINI_LIVE or not get_gemini_api_key():
+        await websocket.close(code=4003)
+        return
+
+    prev = voice_bridge_ws_by_device.get(did)
+    if prev is not None and prev is not websocket:
+        try:
+            await prev.close(code=4001)
+        except Exception:
+            pass
+    voice_bridge_ws_by_device[did] = websocket
+
+    try:
+        await _ensure_live_coordinator_for_device(did)
+        if did not in browser_voice_wake_processor:
+            browser_voice_wake_processor[did] = _build_browser_voice_wake_processor(did)
+        wp = browser_voice_wake_processor[did]
+
+        await manager.broadcast(
+            {"type": "voice_bridge_connected", "device_id": did, "connected": True}
+        )
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect()
+            chunk = msg.get("bytes")
+            if chunk:
+                await wp.feed_pcm(chunk)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[voice-bridge] error device={did!r}: {e}")
+    finally:
+        if voice_bridge_ws_by_device.get(did) is websocket:
+            voice_bridge_ws_by_device.pop(did, None)
+        wp_clear = browser_voice_wake_processor.pop(did, None)
+        if wp_clear:
+            wp_clear.set_paused(True)
+        try:
+            await manager.broadcast(
+                {"type": "voice_bridge_connected", "device_id": did, "connected": False}
+            )
+        except Exception:
+            pass
+        if not device_stream_is_live(did):
+            coord = gemini_live_session.live_coordinator_for(did)
+            if coord is not None:
+                try:
+                    await coord.stop()
+                except Exception as ex:
+                    print(f"[live] voice bridge coordinator stop: {ex}")
+
 
 @app.post("/api/text-command")
 async def text_command(req: TextCommandRequest):
@@ -2944,22 +3193,62 @@ async def set_timezone_setting(device_id: str, payload: TimezoneRuleRequest):
 
 @app.get("/api/hub/app-settings")
 async def get_hub_app_settings_endpoint():
-    """Hub-wide timezone and Maps grounding location (not per-Pixel)."""
+    """Hub-wide app settings (timezone, browser live voice, etc.)."""
     return load_hub_app_settings()
 
 
 @app.post("/api/hub/app-settings")
 async def post_hub_app_settings_endpoint(new_settings: HubAppSettingsSchema):
-    """Save hub clock settings; clears all in-memory Gemini histories."""
-    tz = str(new_settings.timezone_rule or DEFAULT_TIMEZONE_RULE)
-    row = {"timezone_rule": tz}
+    """Merge into hub_app_settings.json. Clears histories only when timezone_rule changes."""
+    updates = new_settings.model_dump(exclude_unset=True)
+    if not updates:
+        return {"status": "success", "settings": load_hub_app_settings()}
 
-    save_hub_app_settings(row)
-    history_by_device.clear()
-    for did in list(get_all_settings().keys()):
-        timezone_rule_by_device[did] = row["timezone_rule"]
-    await _push_timezone_to_all_streams(row["timezone_rule"])
-    return {"status": "success", "settings": row}
+    hub = load_hub_app_settings()
+    prev_tz = str(hub.get("timezone_rule") or DEFAULT_TIMEZONE_RULE)
+    prev_live = str(hub.get("live_voice_source") or "esp32").lower()
+
+    if "timezone_rule" in updates:
+        hub["timezone_rule"] = str(updates["timezone_rule"] or DEFAULT_TIMEZONE_RULE)
+    if "live_voice_source" in updates and updates["live_voice_source"] is not None:
+        hub["live_voice_source"] = updates["live_voice_source"]
+    if "browser_audio_input_device_id" in updates:
+        hub["browser_audio_input_device_id"] = str(
+            updates["browser_audio_input_device_id"] or ""
+        )
+    if "browser_audio_output_device_id" in updates:
+        hub["browser_audio_output_device_id"] = str(
+            updates["browser_audio_output_device_id"] or ""
+        )
+
+    if str(hub.get("live_voice_source") or "esp32").lower() not in ("esp32", "browser"):
+        hub["live_voice_source"] = "esp32"
+
+    save_hub_app_settings(hub)
+
+    new_tz = str(hub.get("timezone_rule") or DEFAULT_TIMEZONE_RULE)
+    if new_tz != prev_tz:
+        history_by_device.clear()
+        for did in list(get_all_settings().keys()):
+            timezone_rule_by_device[did] = new_tz
+        await _push_timezone_to_all_streams(new_tz)
+
+    new_live = str(hub.get("live_voice_source") or "esp32").lower()
+    if new_live != prev_live:
+        await _apply_live_voice_source_runtime()
+
+    await manager.broadcast(
+        {
+            "type": "hub_app_settings_changed",
+            "settings": {
+                "live_voice_source": hub.get("live_voice_source"),
+                "browser_audio_input_device_id": hub.get("browser_audio_input_device_id"),
+                "browser_audio_output_device_id": hub.get("browser_audio_output_device_id"),
+            },
+        }
+    )
+
+    return {"status": "success", "settings": hub}
 
 
 @app.get("/api/hub/status")

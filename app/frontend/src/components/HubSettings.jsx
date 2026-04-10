@@ -31,6 +31,16 @@ const HubSettings = () => {
     timezone_rule: TIMEZONE_OPTIONS[0].value,
   });
 
+  const [voiceSaving, setVoiceSaving] = useState(false);
+  const [voiceSaveStatus, setVoiceSaveStatus] = useState(null);
+  const [audioInputs, setAudioInputs] = useState([]);
+  const [audioOutputs, setAudioOutputs] = useState([]);
+  const [voiceForm, setVoiceForm] = useState({
+    live_voice_source: 'esp32',
+    browser_audio_input_device_id: '',
+    browser_audio_output_device_id: '',
+  });
+
   const hasTimezoneOption = TIMEZONE_OPTIONS.some((tz) => tz.value === locForm.timezone_rule);
 
   const load = async () => {
@@ -43,6 +53,12 @@ const HubSettings = () => {
       }));
       setLocForm({
         timezone_rule: app.timezone_rule || TIMEZONE_OPTIONS[0].value,
+      });
+      setVoiceForm({
+        live_voice_source:
+          app.live_voice_source === 'browser' ? 'browser' : 'esp32',
+        browser_audio_input_device_id: app.browser_audio_input_device_id || '',
+        browser_audio_output_device_id: app.browser_audio_output_device_id || '',
       });
     } catch (e) {
       console.error(e);
@@ -103,6 +119,48 @@ const HubSettings = () => {
       setSaveStatus('error');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const refreshAudioDevices = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((t) => t.stop());
+    } catch (err) {
+      console.warn('[HubSettings] getUserMedia for enumerateDevices', err);
+    }
+    try {
+      const list = await navigator.mediaDevices.enumerateDevices();
+      setAudioInputs(list.filter((d) => d.kind === 'audioinput'));
+      setAudioOutputs(list.filter((d) => d.kind === 'audiooutput'));
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleSubmitVoice = async (e) => {
+    e.preventDefault();
+    setVoiceSaving(true);
+    setVoiceSaveStatus(null);
+    try {
+      const res = await postHubAppSettings({
+        live_voice_source: voiceForm.live_voice_source,
+        browser_audio_input_device_id: voiceForm.browser_audio_input_device_id || '',
+        browser_audio_output_device_id: voiceForm.browser_audio_output_device_id || '',
+      });
+      const saved = res.settings || {};
+      setVoiceForm({
+        live_voice_source:
+          saved.live_voice_source === 'browser' ? 'browser' : 'esp32',
+        browser_audio_input_device_id: saved.browser_audio_input_device_id || '',
+        browser_audio_output_device_id: saved.browser_audio_output_device_id || '',
+      });
+      setVoiceSaveStatus('success');
+    } catch (err) {
+      console.error(err);
+      setVoiceSaveStatus('error');
+    } finally {
+      setVoiceSaving(false);
     }
   };
 
@@ -211,6 +269,110 @@ const HubSettings = () => {
         {saveStatus === 'success' && <div className="status-message success slide-enter">API keys saved.</div>}
         {saveStatus === 'error' && (
           <div className="status-message error slide-enter">Failed to save API keys.</div>
+        )}
+      </form>
+
+      <h3 className="hub-section-title">Browser live voice</h3>
+      <p className="help-text">
+        Use your <strong>PC microphone and speakers</strong> in the dashboard so the browser can apply echo
+        cancellation (same machine for capture and playback). Requires a secure context (HTTPS or localhost).
+        Saved device IDs are browser- and machine-specific; use <strong>Refresh devices</strong> if hardware
+        changes.
+      </p>
+
+      <form className="settings-form" onSubmit={handleSubmitVoice}>
+        <div className="form-group">
+          <label htmlFor="hubLiveVoiceSource">Voice input source</label>
+          <div className="select-wrapper">
+            <select
+              id="hubLiveVoiceSource"
+              value={voiceForm.live_voice_source}
+              onChange={(e) =>
+                setVoiceForm((f) => ({ ...f, live_voice_source: e.target.value }))
+              }
+              className="holo-select"
+            >
+              <option value="esp32">Pixel (ESP32) microphone</option>
+              <option value="browser">This computer (browser mic + speakers)</option>
+            </select>
+          </div>
+        </div>
+
+        {voiceForm.live_voice_source === 'browser' && (
+          <>
+            <div className="form-group">
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => void refreshAudioDevices()}
+              >
+                Refresh audio devices
+              </button>
+            </div>
+            <div className="form-group">
+              <label htmlFor="hubBrowserMic">Microphone</label>
+              <div className="select-wrapper">
+                <select
+                  id="hubBrowserMic"
+                  value={voiceForm.browser_audio_input_device_id}
+                  onChange={(e) =>
+                    setVoiceForm((f) => ({
+                      ...f,
+                      browser_audio_input_device_id: e.target.value,
+                    }))
+                  }
+                  className="holo-select"
+                >
+                  <option value="">System default</option>
+                  {audioInputs.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || `Microphone (${d.deviceId.slice(0, 8)}…)`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="form-group">
+              <label htmlFor="hubBrowserSpeaker">Speakers (playback)</label>
+              <div className="select-wrapper">
+                <select
+                  id="hubBrowserSpeaker"
+                  value={voiceForm.browser_audio_output_device_id}
+                  onChange={(e) =>
+                    setVoiceForm((f) => ({
+                      ...f,
+                      browser_audio_output_device_id: e.target.value,
+                    }))
+                  }
+                  className="holo-select"
+                >
+                  <option value="">System default</option>
+                  {audioOutputs.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || `Output (${d.deviceId.slice(0, 8)}…)`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <p className="help-text">
+                Output routing uses <code>AudioContext.setSinkId</code> where supported (e.g. Chromium).
+              </p>
+            </div>
+          </>
+        )}
+
+        <div className="form-actions">
+          <div className="form-actions-trailing">
+            <button type="submit" className="btn btn-primary" disabled={voiceSaving}>
+              {voiceSaving ? 'Saving...' : 'Save voice settings'}
+            </button>
+          </div>
+        </div>
+        {voiceSaveStatus === 'success' && (
+          <div className="status-message success slide-enter">Voice settings saved.</div>
+        )}
+        {voiceSaveStatus === 'error' && (
+          <div className="status-message error slide-enter">Failed to save voice settings.</div>
         )}
       </form>
 

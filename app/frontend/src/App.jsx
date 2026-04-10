@@ -13,10 +13,12 @@ import {
   sendProvision,
   fetchSetupHubEndpoint,
   getHubStatus,
+  getHubAppSettings,
   listBots,
   startBootstrapSoul,
 } from './components/setupService';
 import { hubUrl, getHubWebSocketUrl } from './hubOrigin';
+import { floatTo16kPcmS16le, int16ToCopyBuffer } from './browserVoicePcm';
 
 /** Decode base64 to Int16Array (little-endian PCM s16le). */
 function base64ToInt16PCM(b64) {
@@ -30,6 +32,9 @@ function App() {
   /** null = checking, false = show first-run key screen, true = hub has Gemini configured */
   const [geminiConfigured, setGeminiConfigured] = useState(null);
   const [hubLoadError, setHubLoadError] = useState(null);
+  const [hubAppSettings, setHubAppSettings] = useState(null);
+  const hubAppSettingsRef = useRef(null);
+  hubAppSettingsRef.current = hubAppSettings;
 
   const loadHubStatus = useCallback(() => {
     setHubLoadError(null);
@@ -47,6 +52,15 @@ function App() {
     loadHubStatus();
   }, [loadHubStatus]);
 
+  useEffect(() => {
+    if (geminiConfigured !== true) {
+      return;
+    }
+    getHubAppSettings()
+      .then((s) => setHubAppSettings(s && typeof s === 'object' ? s : {}))
+      .catch(() => setHubAppSettings({ live_voice_source: 'esp32' }));
+  }, [geminiConfigured]);
+
   const [sidebarBots, setSidebarBots] = useState([]);
   const [botUiStatus, setBotUiStatus] = useState({});
   const [lastPingById, setLastPingById] = useState({});
@@ -63,6 +77,16 @@ function App() {
   const liveAudioNextTimeRef = useRef(0);
   const liveAudioSrRef = useRef(24000);
   const liveAudioStreamIdRef = useRef(null);
+
+  const applyPlaybackSinkId = useCallback(async (ctx) => {
+    const id = (hubAppSettingsRef.current?.browser_audio_output_device_id || '').trim();
+    if (!id || typeof ctx?.setSinkId !== 'function') return;
+    try {
+      await ctx.setSinkId(id);
+    } catch (e) {
+      console.warn('AudioContext.setSinkId failed', e);
+    }
+  }, []);
 
   const stopLiveAudio = useCallback(() => {
     const ctx = liveAudioCtxRef.current;
@@ -417,6 +441,13 @@ function App() {
                 arguments: args,
               },
             ]);
+          } else if (message.type === 'hub_app_settings_changed') {
+            setHubAppSettings((prev) => ({
+              ...(prev && typeof prev === 'object' ? prev : {}),
+              ...(message.settings && typeof message.settings === 'object'
+                ? message.settings
+                : {}),
+            }));
           } else if (message.type === 'persona_file_updated') {
             const did = message.device_id || '';
             const f = message.file || 'persona file';
@@ -448,6 +479,7 @@ function App() {
             hubTtsCtxRef.current = ctx;
             hubTtsNextTimeRef.current = ctx.currentTime + 0.08;
             void ctx.resume().catch(() => {});
+            void applyPlaybackSinkId(ctx);
           } else if (message.type === 'hub_tts_chunk') {
             if (message.stream_id !== hubTtsStreamIdRef.current) return;
             const ctx = hubTtsCtxRef.current;
@@ -493,6 +525,7 @@ function App() {
               liveAudioCtxRef.current = ctx;
               liveAudioNextTimeRef.current = ctx.currentTime + 0.08;
               void ctx.resume().catch(() => {});
+              void applyPlaybackSinkId(ctx);
             }
             const ctx = liveAudioCtxRef.current;
             if (!ctx || !message.b64) return;
@@ -543,7 +576,110 @@ function App() {
       stopHubTtsAudio();
       if (ws) ws.close();
     };
-  }, [geminiConfigured, mergeBotList, refreshBotList, stopHubTtsAudio, appendLiveTranscription, stopLiveAudio]);
+  }, [
+    geminiConfigured,
+    mergeBotList,
+    refreshBotList,
+    stopHubTtsAudio,
+    appendLiveTranscription,
+    stopLiveAudio,
+    applyPlaybackSinkId,
+  ]);
+
+  useEffect(() => {
+    if (geminiConfigured !== true) {
+      return undefined;
+    }
+    if (!hubAppSettings || hubAppSettings.live_voice_source !== 'browser') {
+      return undefined;
+    }
+
+    let vbWs = null;
+    let mediaStream = null;
+    let audioCtx = null;
+    let proc = null;
+    let carry = new Int16Array(0);
+    const did = selectedBotId;
+
+    const run = async () => {
+      const url = getHubWebSocketUrl(
+        `/ws/voice-bridge?device_id=${encodeURIComponent(did)}`
+      );
+      vbWs = new WebSocket(url);
+      await new Promise((resolve, reject) => {
+        const t = window.setTimeout(() => reject(new Error('voice bridge connect timeout')), 15000);
+        vbWs.onopen = () => {
+          window.clearTimeout(t);
+          resolve();
+        };
+        vbWs.onerror = () => {
+          window.clearTimeout(t);
+          reject(new Error('voice bridge WebSocket error'));
+        };
+      });
+
+      const constraints = {
+        audio: {
+          channelCount: { ideal: 1 },
+          echoCancellation: { ideal: true },
+          noiseSuppression: { ideal: true },
+          autoGainControl: { ideal: true },
+        },
+      };
+      const inId = (hubAppSettings.browser_audio_input_device_id || '').trim();
+      if (inId) {
+        constraints.audio.deviceId = { exact: inId };
+      }
+      mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      audioCtx = new AudioContext();
+      await audioCtx.resume();
+      const source = audioCtx.createMediaStreamSource(mediaStream);
+      const bufferSize = 4096;
+      proc = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+      proc.onaudioprocess = (ev) => {
+        if (!vbWs || vbWs.readyState !== WebSocket.OPEN) return;
+        const input = ev.inputBuffer.getChannelData(0);
+        const chunk = floatTo16kPcmS16le(input, audioCtx.sampleRate);
+        if (!chunk.length) return;
+        const merged = new Int16Array(carry.length + chunk.length);
+        merged.set(carry);
+        merged.set(chunk, carry.length);
+        const frameSamples = 320;
+        let off = 0;
+        while (off + frameSamples <= merged.length) {
+          vbWs.send(int16ToCopyBuffer(merged.subarray(off, off + frameSamples)));
+          off += frameSamples;
+        }
+        carry = merged.subarray(off);
+      };
+      source.connect(proc);
+      proc.connect(audioCtx.destination);
+    };
+
+    run().catch((e) => console.error('[voice-bridge]', e));
+
+    return () => {
+      carry = new Int16Array(0);
+      try {
+        proc?.disconnect();
+      } catch {
+        /* ignore */
+      }
+      try {
+        mediaStream?.getTracks().forEach((t) => t.stop());
+      } catch {
+        /* ignore */
+      }
+      try {
+        void audioCtx?.close();
+      } catch {
+        /* ignore */
+      }
+      if (vbWs && vbWs.readyState === WebSocket.OPEN) {
+        vbWs.close();
+      }
+    };
+  }, [geminiConfigured, hubAppSettings, selectedBotId]);
 
   useEffect(
     () => () => {
