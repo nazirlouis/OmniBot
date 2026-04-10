@@ -413,6 +413,8 @@ def create_wav_header(data_size: int, sample_rate: int = 16000, num_channels: in
 
 @asynccontextmanager
 async def _omnibot_lifespan(_: FastAPI):
+    global _main_async_loop
+    _main_async_loop = asyncio.get_running_loop()
     hb_task = asyncio.create_task(
         heartbeat_service.heartbeat_supervisor_loop(
             default_model=DEFAULT_MODEL,
@@ -1967,6 +1969,19 @@ def _on_wake_live_turn_done(device_id: str) -> None:
         break
 
 
+def _on_live_user_transcription_activity(device_id: str) -> None:
+    for _ws, sess in active_streams.items():
+        if sess.get("device_id") != device_id:
+            continue
+        wp = sess.get("wake_processor")
+        if wp and getattr(wp, "use_gemini_live", False):
+            coord = sess.get("live_coordinator")
+            if coord and wp.begin_follow_up_turn_if_needed():
+                coord.begin_user_turn()
+            wp.note_model_user_activity()
+        break
+
+
 async def _notify_esp32_live_first_token(device_id: str) -> None:
     esp32_ws = get_active_esp32_socket(device_id)
     if esp32_ws:
@@ -2006,6 +2021,7 @@ def _build_live_coordinator(device_id: str) -> gemini_live_session.GeminiLiveCoo
         notify_esp32_first_token=_notify_esp32_live_first_token,
         notify_esp32_reply=_notify_esp32_live_reply,
         on_wake_processor_live_turn_done=_on_wake_live_turn_done,
+        on_user_transcription_activity=_on_live_user_transcription_activity,
         on_video_frame=_broadcast_live_video_preview,
     )
 

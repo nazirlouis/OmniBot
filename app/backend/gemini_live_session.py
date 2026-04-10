@@ -80,6 +80,7 @@ class GeminiLiveCoordinator:
         notify_esp32_first_token: Callable[[str], Awaitable[None]],
         notify_esp32_reply: Callable[[str, str], Awaitable[None]],
         on_wake_processor_live_turn_done: Callable[[str], None],
+        on_user_transcription_activity: Callable[[str], None],
         on_video_frame: Optional[Callable[[str, bytes], Awaitable[None]]] = None,
     ) -> None:
         self.device_id = device_id
@@ -92,6 +93,7 @@ class GeminiLiveCoordinator:
         self._notify_esp32_first_token = notify_esp32_first_token
         self._notify_esp32_reply = notify_esp32_reply
         self._on_wake_live_turn_done = on_wake_processor_live_turn_done
+        self._on_user_transcription_activity = on_user_transcription_activity
         self._on_video_frame = on_video_frame
 
         self._lock = asyncio.Lock()
@@ -105,6 +107,7 @@ class GeminiLiveCoordinator:
 
         self.resumption_handle: Optional[str] = None
         self._reconnecting = False
+        self._reconnect_task: Optional[asyncio.Task] = None
         self._go_away_reconnect_scheduled = False
 
         self._current_stream_id: Optional[str] = None
@@ -298,6 +301,8 @@ class GeminiLiveCoordinator:
                     break
                 logger.warning("[live] receive error device=%s: %s", self.device_id, e)
                 await self._schedule_reconnect()
+                # Avoid hammering logs while reconnect task is taking over.
+                await asyncio.sleep(0.25)
 
     async def _dispatch_message(self, msg: types.LiveServerMessage) -> None:
         if msg.go_away is not None and not self._go_away_reconnect_scheduled:
@@ -327,6 +332,13 @@ class GeminiLiveCoordinator:
         if sc.input_transcription and sc.input_transcription.text:
             t = sc.input_transcription.text
             fin = bool(sc.input_transcription.finished)
+            try:
+                self._on_user_transcription_activity(self.device_id)
+            except Exception:
+                logger.debug(
+                    "[live] on_user_transcription_activity callback failed device=%s",
+                    self.device_id,
+                )
             self._last_input_text = self._last_input_text + t
             await self._broadcast(
                 {
@@ -437,19 +449,20 @@ class GeminiLiveCoordinator:
     async def _schedule_reconnect(self) -> None:
         if self._reconnecting or self._stop.is_set():
             return
-        asyncio.create_task(self._reconnect_with_backoff())
+        self._reconnecting = True
+        logger.info("[live] reconnect scheduled device=%s", self.device_id)
+        self._reconnect_task = asyncio.create_task(self._reconnect_with_backoff())
 
     async def _reconnect_after_go_away(self) -> None:
         try:
             await asyncio.sleep(0.5)
-            await self._reconnect_with_backoff()
+            await self._schedule_reconnect()
         finally:
             self._go_away_reconnect_scheduled = False
 
     async def _reconnect_with_backoff(self) -> None:
-        if self._reconnecting or self._stop.is_set():
+        if self._stop.is_set():
             return
-        self._reconnecting = True
         delay = 0.5
         try:
             async with self._lock:
@@ -457,16 +470,29 @@ class GeminiLiveCoordinator:
             for attempt in range(8):
                 if self._stop.is_set():
                     return
+                logger.info(
+                    "[live] reconnect attempt %s/%s device=%s",
+                    attempt + 1,
+                    8,
+                    self.device_id,
+                )
                 try:
                     async with self._lock:
                         await self._connect_locked(initial=False)
+                    logger.info(
+                        "[live] reconnect success attempt=%s device=%s",
+                        attempt + 1,
+                        self.device_id,
+                    )
                     return
                 except Exception as e:
                     logger.warning("[live] reconnect attempt %s failed: %s", attempt + 1, e)
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, 8.0)
+            logger.error("[live] reconnect exhausted device=%s", self.device_id)
         finally:
             self._reconnecting = False
+            self._reconnect_task = None
 
 
 def live_api_configured() -> bool:

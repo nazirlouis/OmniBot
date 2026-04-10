@@ -138,6 +138,8 @@ class WakeListenProcessor:
     _followup_scan_carry: bytearray = field(init=False, default_factory=bytearray)
     _capture_from_followup: bool = field(init=False, default=False)
     _live_forward: bool = field(init=False, default=False)
+    _follow_up_window_s: float = field(init=False, default=5.0)
+    _follow_up_turn_started: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         self.model, self.model_label = build_openwakeword_model()
@@ -166,8 +168,10 @@ class WakeListenProcessor:
             await self.on_wake_listen_state(mode)
 
     def begin_follow_up_window(self, seconds: Optional[float] = None) -> None:
-        """After a bot reply, listen for more speech without the wake phrase (VAD-only)."""
+        """After a bot reply, allow no-wake follow-up for a bounded window."""
         raw = _env_float("OMNIBOT_FOLLOW_UP_S", 5.0) if seconds is None else float(seconds)
+        self._follow_up_window_s = raw
+        self._follow_up_turn_started = False
         if raw <= 0:
             self._follow_up_until = None
             self._followup_scan_carry.clear()
@@ -175,6 +179,25 @@ class WakeListenProcessor:
             return
         self._follow_up_until = time.monotonic() + raw
         self._cooldown_until = 0.0
+        self._schedule_wake_listen_state(WAKE_LISTEN_FOLLOW_UP)
+
+    def begin_follow_up_turn_if_needed(self) -> bool:
+        """Mark the next follow-up user activity as a fresh turn once."""
+        if self._follow_up_until is None:
+            return False
+        if self._follow_up_turn_started:
+            return False
+        self._follow_up_turn_started = True
+        self._schedule_wake_listen_state(WAKE_LISTEN_STREAMING)
+        return True
+
+    def note_model_user_activity(self) -> None:
+        """Refresh follow-up timeout based on Gemini input transcription activity."""
+        if self._follow_up_until is None:
+            return
+        if self._follow_up_window_s <= 0:
+            return
+        self._follow_up_until = time.monotonic() + self._follow_up_window_s
         self._schedule_wake_listen_state(WAKE_LISTEN_FOLLOW_UP)
 
     def set_paused(self, p: bool) -> None:
@@ -196,8 +219,9 @@ class WakeListenProcessor:
             self._schedule_wake_listen_state(WAKE_LISTEN_WAKE_REQUIRED)
 
     def end_live_forwarding(self, enable_followup: bool = True) -> None:
-        """Stop forwarding PCM to Gemini Live; optionally open VAD-only follow-up window."""
+        """Stop streaming state for this turn; optionally open follow-up window."""
         self._live_forward = False
+        self._follow_up_turn_started = False
         try:
             self.model.reset()
         except Exception:
@@ -210,6 +234,7 @@ class WakeListenProcessor:
         else:
             self._follow_up_until = None
             self._followup_scan_carry.clear()
+            self._follow_up_turn_started = False
             self._schedule_wake_listen_state(WAKE_LISTEN_WAKE_REQUIRED)
 
     def _trim_ring(self) -> None:
@@ -242,10 +267,21 @@ class WakeListenProcessor:
             await self.on_live_pcm(pcm)
             return
 
+        if (
+            self.use_gemini_live
+            and self._follow_up_until is not None
+            and now < self._follow_up_until
+            and self.on_live_pcm
+        ):
+            await self.on_live_pcm(pcm)
+            return
+
         if self._follow_up_until is not None and now >= self._follow_up_until:
             self._follow_up_until = None
             self._followup_scan_carry.clear()
-            await self._await_wake_listen_state(WAKE_LISTEN_WAKE_REQUIRED)
+            self._follow_up_turn_started = False
+            if self.use_gemini_live:
+                await self._await_wake_listen_state(WAKE_LISTEN_WAKE_REQUIRED)
 
         if self._capturing:
             self._utterance.extend(pcm)
@@ -264,9 +300,10 @@ class WakeListenProcessor:
                 await self._finalize_utterance()
             return
 
-        # Follow-up window: VAD speech onset only (no wake phrase)
+        # Follow-up window: VAD speech onset only (no wake phrase), REST mode only.
         if (
-            self._follow_up_until is not None
+            not self.use_gemini_live
+            and self._follow_up_until is not None
             and now < self._follow_up_until
             and now >= self._cooldown_until
         ):
@@ -278,24 +315,6 @@ class WakeListenProcessor:
                 del self._followup_scan_carry[:VAD_FRAME_BYTES]
                 if not self.vad.is_speech(frame, SAMPLE_RATE):
                     continue
-                if self.use_gemini_live and self.on_live_pcm:
-                    if self.on_capture_start:
-                        await self.on_capture_start()
-                    if self.on_live_wake:
-                        await self.on_live_wake()
-                    buf = bytearray(self._ring)
-                    self._ring.clear()
-                    buf.extend(frame)
-                    self._live_forward = True
-                    await self._await_wake_listen_state(WAKE_LISTEN_STREAMING)
-                    self._followup_scan_carry.clear()
-                    if buf:
-                        await self.on_live_pcm(bytes(buf))
-                    try:
-                        self.model.reset()
-                    except Exception:
-                        pass
-                    return
                 if self.on_capture_start:
                     await self.on_capture_start()
                 await self._await_wake_listen_state(WAKE_LISTEN_STREAMING)
@@ -323,6 +342,14 @@ class WakeListenProcessor:
                     if self._process_vad_tail():
                         await self._finalize_utterance()
                 return
+            return
+
+        # Follow-up window in live mode is model-driven (input transcription callback).
+        if (
+            self._follow_up_until is not None
+            and now < self._follow_up_until
+            and self.use_gemini_live
+        ):
             return
 
         # Listening for wake (cooldown after wake capture; skipped for follow-up utterances)
