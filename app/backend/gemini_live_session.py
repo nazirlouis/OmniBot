@@ -169,6 +169,8 @@ class GeminiLiveCoordinator:
         self._el_logged_no_key = False
         #: Set when ``send_text(..., track_turn_done=True)``; signaled after assistant turn + EL complete.
         self._turn_done_waiter: Optional[asyncio.Event] = None
+        #: Filled when a turn completes while ``_turn_done_waiter`` is set; consumed by ``pop_http_turn_reply_text``.
+        self._http_turn_reply_text: str = ""
 
     def _want_elevenlabs_playback(self) -> bool:
         bs = self._get_bot_settings(self.device_id)
@@ -433,10 +435,17 @@ class GeminiLiveCoordinator:
         await sess.send_realtime_input(text=text)
         return ev
 
+    def pop_http_turn_reply_text(self) -> str:
+        """Return assistant plain text for the last completed ``track_turn_done`` turn, then clear."""
+        t = self._http_turn_reply_text
+        self._http_turn_reply_text = ""
+        return t
+
     def begin_user_turn(self, stream_id: Optional[str] = None) -> str:
         old_waiter = self._turn_done_waiter
         self._turn_done_waiter = None
         if old_waiter is not None and not old_waiter.is_set():
+            self._http_turn_reply_text = ""
             old_waiter.set()
         sid = stream_id or str(uuid.uuid4())
         self._current_stream_id = sid
@@ -776,6 +785,7 @@ class GeminiLiveCoordinator:
                 tdw = self._turn_done_waiter
                 self._turn_done_waiter = None
                 if tdw is not None and not tdw.is_set():
+                    self._http_turn_reply_text = out_plain
                     tdw.set()
                 self._first_token_sent_for_stream = False
                 self._last_output_text = ""

@@ -191,6 +191,23 @@ class WakeListenProcessor:
         self._schedule_wake_listen_state(WAKE_LISTEN_STREAMING)
         return True
 
+    def ensure_follow_up_window_if_forwarding(self) -> None:
+        """Open the post-reply follow-up window if mic is streaming but the window was never set.
+
+        Normal wake flow calls ``end_live_forwarding`` → ``begin_follow_up_window``. Paths that only
+        call ``start_live_pcm_forwarding_only`` (e.g. after a face greeting) never set
+        ``_follow_up_until``, so ``begin_follow_up_turn_if_needed`` never runs and Gemini keeps one
+        ``stream_id`` for all turns — dashboard transcripts and audio routing break.
+        """
+        if not self._live_forward:
+            return
+        if self._follow_up_until is not None:
+            return
+        if self.get_follow_up_window_s is not None:
+            self.begin_follow_up_window(self.get_follow_up_window_s())
+        else:
+            self.begin_follow_up_window()
+
     async def activate_live_forwarding_from_external_wake(self) -> None:
         """Pixel (or other source) detected wake; stream conversation audio from elsewhere (e.g. browser).
 

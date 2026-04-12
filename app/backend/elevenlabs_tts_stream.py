@@ -2,7 +2,7 @@
 
 Uses ``output_format=pcm_24000`` on the WebSocket URL so frames are raw PCM (base64 in JSON),
 avoiding MP3 + ffmpeg decode. Follows the official real-time TTS flow (init with ``text`` space +
-``xi_api_key``, stream deltas, ``flush`` on end of turn, ``{"text": ""}`` to close). See:
+``xi_api_key``, stream deltas, one ``flush`` at end of turn, ``{"text": ""}`` to close). See:
 https://elevenlabs.io/docs/eleven-api/guides/how-to/websockets/realtime-tts
 
 Auth is via ``xi_api_key`` in the first JSON message only (no WebSocket headers), per their Python example.
@@ -20,6 +20,8 @@ from typing import Awaitable, Callable, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+from grounding_extract import strip_for_live_tts
 
 logger = logging.getLogger(__name__)
 
@@ -124,17 +126,30 @@ async def stream_elevenlabs_turn_pcm(
     text_queue: "asyncio.Queue[Optional[tuple[str, bool]]]",
     emit_pcm: Callable[[bytes], Awaitable[None]],
 ) -> None:
-    """Drain text_queue: each item is (delta_text, finished). None ends input.
+    """Drain text_queue: each item is (delta_text, gemini_segment_finished). None ends input.
 
-    Sends chunks to ElevenLabs stream-input, collects PCM from WebSocket frames, emits in small chunks.
+    Gemini's ``finished`` is for UI/logging only — it must not map to ElevenLabs ``flush`` (see realtime-tts
+    docs: flush once at end of turn). PCM is emitted to ``emit_pcm`` in order as it arrives from the API.
 
     While waiting for the next Gemini transcription chunk, sends periodic ``{"text": " "}``
     keepalives so ElevenLabs' 20s input timeout is not hit (see realtime-tts docs).
     """
     uri = elevenlabs_stream_url(voice_id)
-    pcm_acc = bytearray()
+    pcm_pending = bytearray()
+    n_emit = 0
+    total_pcm_bytes = 0
     chunks_sent = 0
     keepalives_sent = 0
+
+    async def emit_pending_fixed_slices() -> None:
+        nonlocal n_emit, total_pcm_bytes
+        while len(pcm_pending) >= PCM_CHUNK_BYTES:
+            sl = bytes(pcm_pending[:PCM_CHUNK_BYTES])
+            del pcm_pending[:PCM_CHUNK_BYTES]
+            n_emit += 1
+            total_pcm_bytes += len(sl)
+            _alog("emit_pcm slice #%s bytes=%s", n_emit, len(sl))
+            await emit_pcm(sl)
 
     try:
         schedule = chunk_length_schedule()
@@ -181,12 +196,13 @@ async def stream_elevenlabs_turn_pcm(
                         if aud:
                             try:
                                 dec = base64.b64decode(aud)
-                                pcm_acc.extend(dec)
+                                pcm_pending.extend(dec)
                                 _dlog(
-                                    "recv audio pcm_chunk=%s total_pcm=%s",
+                                    "recv audio pcm_chunk=%s pending_total=%s",
                                     len(dec),
-                                    len(pcm_acc),
+                                    len(pcm_pending),
                                 )
+                                await emit_pending_fixed_slices()
                             except Exception:
                                 pass
                         # Do not break on isFinal — ElevenLabs may emit multiple finals per stream; stopping
@@ -217,27 +233,31 @@ async def stream_elevenlabs_turn_pcm(
                     _alog("queue sentinel (turn end) chunks_sent_so_far=%s", chunks_sent)
                     break
                 text, finished = item
-                payload: dict = {"text": text}
-                if finished:
-                    payload["flush"] = True
-                await ws.send(json.dumps(payload))
+                to_send = strip_for_live_tts(text or "")
+                if not to_send:
+                    _dlog("skip empty text after TTS strip (raw len=%s)", len(text or ""))
+                    continue
+                await ws.send(json.dumps({"text": to_send}))
                 chunks_sent += 1
-                preview = (text or "")[:80].replace("\n", "\\n")
+                preview = to_send[:80].replace("\n", "\\n")
                 _dlog(
-                    "sent chunk #%s len=%s finished=%s preview=%r",
+                    "sent chunk #%s len=%s gemini_segment_finished=%s preview=%r",
                     chunks_sent,
-                    len(text or ""),
+                    len(to_send),
                     finished,
                     preview,
                 )
                 _alog(
-                    "ws sent chunk #%s text_len=%s finished=%s preview=%r",
+                    "ws sent chunk #%s text_len=%s gemini_segment_finished=%s preview=%r",
                     chunks_sent,
-                    len(text or ""),
+                    len(to_send),
                     finished,
                     preview,
                 )
 
+            # One flush at end of turn (not per Gemini output_transcription segment); then close.
+            await ws.send(json.dumps({"text": " ", "flush": True}))
+            _dlog("end-of-turn flush sent")
             await ws.send(json.dumps({"text": ""}))
 
             try:
@@ -248,42 +268,45 @@ async def stream_elevenlabs_turn_pcm(
                 with contextlib.suppress(asyncio.CancelledError):
                     await recv_task
 
+            await emit_pending_fixed_slices()
+            if pcm_pending:
+                n_emit += 1
+                rest = bytes(pcm_pending)
+                pcm_pending.clear()
+                total_pcm_bytes += len(rest)
+                _alog("emit_pcm final remainder bytes=%s", len(rest))
+                await emit_pcm(rest)
+
             logger.info(
-                "[elevenlabs] recv done; chunks_sent=%s keepalives=%s total_pcm=%s bytes",
+                "[elevenlabs] recv done; chunks_sent=%s keepalives=%s total_pcm=%s bytes emit_calls=%s",
                 chunks_sent,
                 keepalives_sent,
-                len(pcm_acc),
+                total_pcm_bytes,
+                n_emit,
             )
             _alog(
-                "recv_loop joined chunks_sent=%s total_pcm=%s",
+                "recv_loop joined chunks_sent=%s emit_calls=%s total_pcm_bytes=%s",
                 chunks_sent,
-                len(pcm_acc),
+                n_emit,
+                total_pcm_bytes,
             )
 
     except Exception as e:
         logger.warning("[elevenlabs] stream failed: %s", e)
         raise
 
-    pcm = bytes(pcm_acc)
-    logger.info(
-        "[elevenlabs] accumulated PCM len=%s bytes; emitting to hub clients",
-        len(pcm),
-    )
-    if not pcm and chunks_sent > 0:
+    if total_pcm_bytes == 0 and chunks_sent > 0:
         logger.warning(
-            "[elevenlabs-audio] ZERO PCM after recv but chunks_sent=%s pcm_acc=%s bytes — check API / output_format",
+            "[elevenlabs-audio] ZERO PCM emitted but chunks_sent=%s — check API / output_format",
             chunks_sent,
-            len(pcm_acc),
         )
-    if not pcm and chunks_sent == 0:
+    if total_pcm_bytes == 0 and chunks_sent == 0:
         logger.warning(
             "[elevenlabs-audio] ZERO PCM and chunks_sent=0 — no text reached ElevenLabs this turn"
         )
-    n_emit = 0
-    for i in range(0, len(pcm), PCM_CHUNK_BYTES):
-        sl = pcm[i : i + PCM_CHUNK_BYTES]
-        _alog("emit_pcm slice #%s bytes=%s", n_emit + 1, len(sl))
-        await emit_pcm(sl)
-        n_emit += 1
-    _dlog("emit_pcm calls=%s", n_emit)
-    logger.info("[elevenlabs-audio] emit_pcm completed n=%s total_pcm=%s", n_emit, len(pcm))
+    _dlog("emit_pcm total calls=%s total_pcm_bytes=%s", n_emit, total_pcm_bytes)
+    logger.info(
+        "[elevenlabs-audio] emit_pcm completed n=%s total_pcm=%s bytes",
+        n_emit,
+        total_pcm_bytes,
+    )

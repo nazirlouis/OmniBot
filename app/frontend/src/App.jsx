@@ -164,10 +164,11 @@ function App() {
     );
   };
 
-  const appendLiveTranscription = useCallback((device_id, role, stream_id, text) => {
+  const appendLiveTranscription = useCallback((device_id, role, stream_id, text, finished) => {
     const did = device_id || selectedBotIdRef.current;
     if (did !== selectedBotIdRef.current) return;
     const sender = role === 'user' ? 'user' : 'ai';
+    const done = finished === true;
     setLogs((prevLogs) => {
       let idx = -1;
       for (let i = prevLogs.length - 1; i >= 0; i--) {
@@ -180,7 +181,11 @@ function App() {
       if (idx >= 0) {
         const next = [...prevLogs];
         const cur = next[idx];
-        next[idx] = { ...cur, text: (cur.text || '') + (text || '') };
+        next[idx] = {
+          ...cur,
+          text: (cur.text || '') + (text || ''),
+          liveTranscript: done ? false : cur.liveTranscript,
+        };
         return next;
       }
       return [
@@ -195,7 +200,7 @@ function App() {
           sender,
           text: text || '',
           streamId: stream_id,
-          liveTranscript: true,
+          liveTranscript: !done,
         },
       ];
     });
@@ -505,7 +510,8 @@ function App() {
               message.device_id,
               message.role,
               message.stream_id,
-              message.text
+              message.text,
+              message.finished
             );
           } else if (message.type === 'live_audio_chunk') {
             const did = message.device_id || selectedBotIdRef.current;
@@ -553,15 +559,10 @@ function App() {
                 liveAudioSourcesRef.current = liveAudioSourcesRef.current.filter((n) => n !== src);
               };
               liveAudioSourcesRef.current.push(src);
-              // If the playhead fell far behind (tab sleep, long GC), catch up so audio still plays.
-              if (liveAudioNextTimeRef.current < ctx.currentTime - 0.5) {
-                liveAudioNextTimeRef.current = ctx.currentTime + 0.05;
-              }
-              // Avoid scheduling hours ahead if the queue once ran away (should be rare).
-              if (liveAudioNextTimeRef.current > ctx.currentTime + 5) {
-                liveAudioNextTimeRef.current = ctx.currentTime + 0.08;
-              }
-              const startAt = Math.max(ctx.currentTime, liveAudioNextTimeRef.current);
+              // Keep a single strict timeline: each chunk starts when the previous ends.
+              // Do NOT clamp when the queue is many seconds ahead — long ElevenLabs streams schedule
+              // minutes of audio; resetting the timeline would overlap new chunks with already-scheduled buffers.
+              const startAt = Math.max(ctx.currentTime + 0.002, liveAudioNextTimeRef.current);
               src.start(startAt);
               liveAudioNextTimeRef.current = startAt + buffer.duration;
             } catch (e) {

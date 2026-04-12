@@ -1339,6 +1339,7 @@ async def _start_live_mic_after_face_recognition(device_id: str) -> None:
     if not wp or not getattr(wp, "use_gemini_live", False):
         return
     await wp.start_live_pcm_forwarding_only()
+    wp.ensure_follow_up_window_if_forwarding()
     esp32_ws = get_active_esp32_socket(did)
     if esp32_ws:
         try:
@@ -2220,6 +2221,7 @@ def _on_live_user_transcription_activity(device_id: str) -> None:
             continue
         wp = sess.get("wake_processor")
         if wp and getattr(wp, "use_gemini_live", False):
+            wp.ensure_follow_up_window_if_forwarding()
             coord = sess.get("live_coordinator")
             if coord and wp.begin_follow_up_turn_if_needed():
                 coord.begin_user_turn()
@@ -2227,6 +2229,7 @@ def _on_live_user_transcription_activity(device_id: str) -> None:
         break
     wp_b = browser_voice_wake_processor.get(device_id)
     if wp_b and getattr(wp_b, "use_gemini_live", False):
+        wp_b.ensure_follow_up_window_if_forwarding()
         coord = gemini_live_session.live_coordinator_for(device_id)
         if coord and wp_b.begin_follow_up_turn_if_needed():
             coord.begin_user_turn()
@@ -2568,6 +2571,7 @@ async def _process_presence_jpeg(device_id: str, jpeg_bytes: bytes) -> None:
                             print(
                                 "[face] presence greeting: timed out waiting for assistant turn to finish"
                             )
+                        coord.pop_http_turn_reply_text()
                     await _start_live_mic_after_face_recognition(device_id)
                 except Exception as ex:
                     print(f"[face] presence Gemini Live failed, using REST: {ex}")
@@ -3213,9 +3217,18 @@ async def text_command(req: TextCommandRequest):
         ):
             turn_tool_state_by_device[req.device_id] = {"face_animation": False}
             # Do not block on in-flight ElevenLabs from e.g. a presence greeting; user text preempts.
-            await live_coord.send_text(payload_message, interrupt_previous=True)
+            turn_ev = await live_coord.send_text(
+                payload_message, interrupt_previous=True, track_turn_done=True
+            )
             print("\n>>> GEMINI (TEXT) sent via Live session")
-            return {"status": "success", "reply": "", "live": True}
+            reply_live = ""
+            if turn_ev is not None:
+                try:
+                    await asyncio.wait_for(turn_ev.wait(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    print("[text-command] timed out waiting for Live assistant turn")
+                reply_live = live_coord.pop_http_turn_reply_text()
+            return {"status": "success", "reply": reply_live, "live": True}
 
         full_text, _stream_id = await stream_chat_turn_response(
             req.device_id,

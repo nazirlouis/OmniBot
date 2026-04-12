@@ -4,6 +4,17 @@ import re
 
 # Remove `[n](url)` citation tails added by add_inline_citations_from_grounding (device / TTS).
 _INLINE_CITATION_RE = re.compile(r",?\s*\[\d+\]\([^)]*\)")
+# Bare `[n]` markers (e.g. from model transcription) — remove for spoken TTS so words are not split.
+_BARE_BRACKET_CITATION_RE = re.compile(r"\[\d+\]")
+
+
+def strip_for_live_tts(text: str) -> str:
+    """Strip grounding/citation markers before sending text to ElevenLabs (keeps prosody natural)."""
+    if not text:
+        return ""
+    s = _INLINE_CITATION_RE.sub("", text)
+    s = _BARE_BRACKET_CITATION_RE.sub("", s)
+    return s
 
 
 def strip_inline_citation_markdown(text: str) -> str:
