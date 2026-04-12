@@ -11,6 +11,7 @@ import {
   deleteFaceProfile,
   uploadFaceReference,
   captureFaceFromPixel,
+  previewPixelFace,
   getPersonaFile,
   getPersonaStatus,
   putPersonaFile,
@@ -24,6 +25,19 @@ const PIXEL_TTS_OPTIONS = [
   { value: 'gemini', label: 'Default (Gemini Live)' },
   { value: 'elevenlabs_pixel_male', label: 'Pixel — male (ElevenLabs)' },
   { value: 'elevenlabs_pixel_female', label: 'Pixel — female (ElevenLabs)' },
+];
+
+const FACE_PREVIEW_ANIMATIONS = [
+  'speaking',
+  'happy',
+  'mad',
+  'sad',
+  'surprised',
+  'sleepy',
+  'thinking',
+  'confused',
+  'excited',
+  'love',
 ];
 
 const SLEEP_TIMEOUT_OPTIONS = [
@@ -68,6 +82,7 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
   const [isSaving, setIsSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState(null);
   const [faceMessage, setFaceMessage] = useState(null);
+  const [facePreviewBusy, setFacePreviewBusy] = useState(null);
   const [pixelTtsVoice, setPixelTtsVoice] = useState('gemini');
   const [hubElevenlabsConfigured, setHubElevenlabsConfigured] = useState(false);
 
@@ -309,6 +324,19 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
     }
   };
 
+  const handleFacePreview = async (anim) => {
+    setFacePreviewBusy(anim);
+    setFaceMessage(null);
+    try {
+      await previewPixelFace(deviceId, anim, 3000);
+      setFaceMessage(`Playing “${anim}” on Pixel…`);
+    } catch (err) {
+      setFaceMessage(err.message || 'Face preview failed — is Pixel connected?');
+    } finally {
+      setFacePreviewBusy(null);
+    }
+  };
+
   const handleSavePersonaFile = async () => {
     setPersonaSaving(true);
     setPersonaMessage(null);
@@ -409,6 +437,26 @@ const BotSettings = ({ setAppMode, embedded = false, deviceId = 'default_bot', o
           you do not speak within this window, say the wake phrase again. Use 0 to require the wake phrase every turn.
           Applies to Gemini Live and REST wake. Save to apply.
         </p>
+      </div>
+
+      <div className="form-group">
+        <label>Face animation preview</label>
+        <p className="help-text">
+          Pixel must be connected to the hub. Each button plays that expression for a few seconds on the round display.
+        </p>
+        <div className="face-preview-buttons">
+          {FACE_PREVIEW_ANIMATIONS.map((anim) => (
+            <button
+              key={anim}
+              type="button"
+              className="face-preview-btn"
+              disabled={facePreviewBusy !== null}
+              onClick={() => handleFacePreview(anim)}
+            >
+              {facePreviewBusy === anim ? '…' : anim}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="form-group">

@@ -121,6 +121,9 @@ class GeminiLiveCoordinator:
         on_wake_processor_live_turn_done: Callable[[str], None],
         on_user_transcription_activity: Callable[[str], None],
         on_video_frame: Optional[Callable[[str, bytes], Awaitable[None]]] = None,
+        notify_esp32_assistant_speech_face: Optional[
+            Callable[[str, dict[str, Any]], Awaitable[None]]
+        ] = None,
     ) -> None:
         self.device_id = device_id
         self._get_bot_settings = get_bot_settings
@@ -134,6 +137,7 @@ class GeminiLiveCoordinator:
         self._on_wake_live_turn_done = on_wake_processor_live_turn_done
         self._on_user_transcription_activity = on_user_transcription_activity
         self._on_video_frame = on_video_frame
+        self._notify_esp32_assistant_speech_face = notify_esp32_assistant_speech_face
 
         self._lock = asyncio.Lock()
         self._session_cm: Any = None
@@ -606,6 +610,18 @@ class GeminiLiveCoordinator:
                     "stream_id": self._current_stream_id,
                 }
             )
+            if self._notify_esp32_assistant_speech_face is not None and (t or fin):
+                try:
+                    await self._notify_esp32_assistant_speech_face(
+                        self.device_id,
+                        {"event": "extend", "extend_ms": 600},
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "notify_esp32_assistant_speech_face extend failed device=%s: %s",
+                        self.device_id,
+                        e,
+                    )
             self._last_output_text = self._last_output_text + t
             if self._want_elevenlabs_playback():
                 try:
@@ -751,6 +767,18 @@ class GeminiLiveCoordinator:
                     if out_plain and self._live_turn_gm is not None
                     else out_plain
                 )
+                if self._notify_esp32_assistant_speech_face is not None:
+                    try:
+                        await self._notify_esp32_assistant_speech_face(
+                            self.device_id,
+                            {"event": "end"},
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "notify_esp32_assistant_speech_face end failed device=%s: %s",
+                            self.device_id,
+                            e,
+                        )
                 if out_plain:
                     try:
                         self._append_history_content(

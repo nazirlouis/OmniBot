@@ -119,7 +119,8 @@ USE_GEMINI_LIVE = (os.environ.get("OMNIBOT_USE_GEMINI_LIVE", "1") or "1").strip(
 _PIXEL_ANIMATION_AND_SINGLE_REC_RULES = (
     "Animation tools:\n"
     "- Use the `show_face_animation` / `face_animation` tool for conversational or emotional states only. "
-    "Pass a single argument: `animation` = speaking, happy, or mad.\n"
+    "Pass a single argument: `animation` = one of: speaking, happy, mad, sad, surprised, sleepy, thinking, "
+    "confused, excited, love.\n"
     "At most one animation tool should be used per turn. Do not call more than one of: "
     "`face_animation` or `show_face_animation` in the same turn.\n\n"
     "When asked about food, activities, or places near me, provide exactly ONE recommendation and do not list multiple options."
@@ -186,7 +187,10 @@ def _route_debug(msg: str) -> None:
 _main_async_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # OpenAPI-style declarations: https://ai.google.dev/gemini-api/docs/function-calling
-from pixel_tool_declarations import FACE_ANIMATION_FUNCTION_DECLARATION
+from pixel_tool_declarations import (
+    FACE_ANIMATION_FUNCTION_DECLARATION,
+    FACE_ANIMATION_NAMES,
+)
 
 # Per-device, per-turn tool usage guardrails.
 turn_tool_state_by_device: dict[str, dict[str, bool]] = {}
@@ -682,6 +686,11 @@ class CreateFaceProfileBody(BaseModel):
     display_name: str = "Person"
 
 
+class PixelFacePreviewBody(BaseModel):
+    animation: str
+    duration_ms: int = 3000
+
+
 # Use a standard BLE UUID for our custom generic characteristic
 WIFI_CREDS_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef0"
 # Must match bots/Pixel/src/main.cpp SERVICE_UUID (provisioning service in advertisements).
@@ -905,6 +914,17 @@ async def api_delete_face_profile(device_id: str, profile_id: str):
     return {"status": "success"}
 
 
+@app.post("/api/bots/{device_id}/face-preview")
+async def api_pixel_face_preview(device_id: str, body: PixelFacePreviewBody):
+    """Trigger a face animation on the connected Pixel (same WebSocket payload as model tool)."""
+    a = (body.animation or "").strip().lower()
+    if a not in FACE_ANIMATION_NAMES:
+        raise HTTPException(status_code=400, detail="Unknown animation")
+    dur = max(800, min(10000, int(body.duration_ms)))
+    await _send_face_animation_json_to_esp32(device_id, a, duration_ms=dur)
+    return {"ok": True, "animation": a, "duration_ms": dur}
+
+
 @app.post("/api/bots/{device_id}/face-profiles/{profile_id}/reference")
 async def api_upload_face_reference(device_id: str, profile_id: str, file: UploadFile = File(...)):
     data = await file.read()
@@ -1007,9 +1027,7 @@ async def _push_timezone_to_all_streams(timezone_rule: str) -> None:
 def _make_face_animation_tool(device_id: str):
     """Builder so face_animation is bound to the correct bot device."""
 
-    allowed = frozenset(
-        FACE_ANIMATION_FUNCTION_DECLARATION["parameters"]["properties"]["animation"]["enum"]
-    )
+    allowed = frozenset(FACE_ANIMATION_NAMES)
 
     def face_animation(animation: str) -> dict:
         a = (animation or "").strip().lower()
@@ -1034,7 +1052,7 @@ def _make_face_animation_tool(device_id: str):
 
 
 def show_face_animation(device_id: str, animation: str) -> dict:
-    """Convenience wrapper to trigger an expressive face animation (speaking/happy/mad).
+    """Convenience wrapper to trigger an expressive face animation (see FACE_ANIMATION_NAMES).
 
     Uses the same semantics, guardrails, and broadcast behavior as the Gemini `face_animation` tool.
     """
@@ -1042,11 +1060,14 @@ def show_face_animation(device_id: str, animation: str) -> dict:
     return face_animation_fn(animation=animation)
 
 
-async def _send_face_animation_json_to_esp32(device_id: str, animation: str) -> None:
+async def _send_face_animation_json_to_esp32(
+    device_id: str, animation: str, duration_ms: Optional[int] = None
+) -> None:
     ws = get_active_esp32_socket(device_id)
     if not ws:
         return
-    dur = FACE_ANIMATION_DISPLAY_MS
+    dur = int(FACE_ANIMATION_DISPLAY_MS if duration_ms is None else duration_ms)
+    dur = max(800, min(10000, dur))
     await _send_activity_event_to_esp32(device_id, "face_animation")
     payload = {
         "type": "face_animation",
@@ -1059,13 +1080,15 @@ async def _send_face_animation_json_to_esp32(device_id: str, animation: str) -> 
         print(f"Failed to send face_animation to ESP32: {e}")
 
 
-def _schedule_face_animation_to_esp32(device_id: str, animation: str) -> None:
+def _schedule_face_animation_to_esp32(
+    device_id: str, animation: str, duration_ms: Optional[int] = None
+) -> None:
     loop = _main_async_loop
     if loop is None:
         print("face_animation: no async loop yet; skipping robot display")
         return
     asyncio.run_coroutine_threadsafe(
-        _send_face_animation_json_to_esp32(device_id, animation),
+        _send_face_animation_json_to_esp32(device_id, animation, duration_ms),
         loop,
     )
 
@@ -2236,11 +2259,26 @@ def _on_live_user_transcription_activity(device_id: str) -> None:
         wp_b.note_model_user_activity()
 
 
+async def _notify_esp32_assistant_speech_face(device_id: str, payload: dict) -> None:
+    """Hub → Pixel: drive speaking face extend/end during Gemini Live output transcription."""
+    esp32_ws = get_active_esp32_socket(device_id)
+    if not esp32_ws:
+        return
+    body = {"type": "assistant_speech_face", **payload}
+    try:
+        await esp32_ws.send_text(json.dumps(body))
+    except Exception as e:
+        print(f"Failed to send assistant_speech_face to ESP32: {e}")
+
+
 async def _notify_esp32_live_first_token(device_id: str) -> None:
     esp32_ws = get_active_esp32_socket(device_id)
     if esp32_ws:
         try:
             await esp32_ws.send_text(json.dumps({"type": "gemini_first_token"}))
+            await esp32_ws.send_text(
+                json.dumps({"type": "assistant_speech_face", "event": "start"})
+            )
         except Exception as e:
             print(f"Failed to notify ESP32 first token (live): {e}")
 
@@ -2277,6 +2315,7 @@ def _build_live_coordinator(device_id: str) -> gemini_live_session.GeminiLiveCoo
         on_wake_processor_live_turn_done=_on_wake_live_turn_done,
         on_user_transcription_activity=_on_live_user_transcription_activity,
         on_video_frame=_broadcast_live_video_preview,
+        notify_esp32_assistant_speech_face=_notify_esp32_assistant_speech_face,
     )
 
 

@@ -206,6 +206,23 @@ export const captureFaceFromPixel = async (device_id, profile_id) => {
   return res.json();
 };
 
+/** Trigger a face animation on the connected Pixel (hub forwards to device WebSocket). */
+export const previewPixelFace = async (device_id, animation, duration_ms = 3000) => {
+  const res = await fetch(
+    hubUrl(`/api/bots/${encodeURIComponent(device_id)}/face-preview`),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ animation, duration_ms }),
+    }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Face preview failed');
+  }
+  return res.json();
+};
+
 export const getHubStatus = async () => {
   const res = await fetch(hubUrl('/api/hub/status'));
   if (!res.ok) throw new Error('Hub status failed');

@@ -267,16 +267,35 @@ static int callingCardJpegDrawCallback(JPEGDRAW *pDraw) {
 bool faceAnimActive = false;
 uint32_t faceAnimStartMs = 0;
 uint32_t faceAnimUntilMs = 0;
-uint8_t faceAnimMode = 0; // 0=speaking, 1=happy, 2=mad
-// Snapshot idle gaze when happy/mad animation starts (no drift during animation).
-int16_t happyFrozenLookX = 0;
-int16_t happyFrozenLookY = 0;
-int16_t madFrozenLookX = 0;
-int16_t madFrozenLookY = 0;
+/** 0=speaking 1=happy 2=mad 3=sad 4=surprised 5=sleepy 6=thinking 7=confused 8=excited 9=love */
+uint8_t faceAnimMode = 0;
+// Snapshot idle gaze when a non-speaking emotion animation starts (no drift during animation).
+int16_t faceAnimFrozenLookX = 0;
+int16_t faceAnimFrozenLookY = 0;
 // Optional caption under eyes if hub sends "words" (hub normally omits).
 char faceAnimWords[64] = "";
 
 #define FACE_ANIM_DURATION_MS 2500
+/** Max duration while assistant_speech_face extends the speaking animation. */
+#define FACE_ANIM_ASSISTANT_CAP_MS 120000UL
+/** After last transcription chunk, speaking face stops after this tail. */
+#define FACE_ANIM_ASSISTANT_TAIL_MS 350U
+
+static uint8_t faceAnimModeFromAnimName(const char* anim) {
+    if (!anim) {
+        return 0;
+    }
+    if (strcmp(anim, "happy") == 0) return 1;
+    if (strcmp(anim, "mad") == 0) return 2;
+    if (strcmp(anim, "sad") == 0) return 3;
+    if (strcmp(anim, "surprised") == 0) return 4;
+    if (strcmp(anim, "sleepy") == 0) return 5;
+    if (strcmp(anim, "thinking") == 0) return 6;
+    if (strcmp(anim, "confused") == 0) return 7;
+    if (strcmp(anim, "excited") == 0) return 8;
+    if (strcmp(anim, "love") == 0) return 9;
+    return 0;
+}
 
 static void setFaceAnimWordsFromPayload(const char* src) {
     faceAnimWords[0] = '\0';
@@ -854,13 +873,91 @@ static void happyEyeSpansAtY(
     *nSeg = subtractSpan1D(ea1, ea2, ca1, ca2, s1a, s1b, s2a, s2b);
 }
 
-// First scanline (inclusive) where mad eye may draw after removing top 50% of bbox [yc-ry, yc+ry].
-static int16_t madFlatCutYShowMin(int16_t yc, int16_t ry) {
-    return yc; // (yc - ry) + ry: bottom half of vertical extent only
+// Mad eye: bottom of ellipse clipped by a slanted "brow" line (inner brow lower → angry downward angle).
+static void madAngledEyeSpansAtY(
+    int16_t cx,
+    int16_t yc,
+    int16_t rx,
+    int16_t ry,
+    int16_t y,
+    bool isLeftEye,
+    int16_t* s1a,
+    int16_t* s1b,
+    int16_t* s2a,
+    int16_t* s2b,
+    uint8_t* nSeg
+) {
+    (void)s2a;
+    (void)s2b;
+    int16_t ea1 = 0, ea2 = -1;
+    bool hasE = ovalSpanAtY(cx, yc, rx, ry, y, ea1, ea2);
+    if (!hasE) {
+        *nSeg = 0;
+        return;
+    }
+    if (y < yc) {
+        *nSeg = 0;
+        return;
+    }
+    const int32_t scale = (int32_t)(2 * rx);
+    if (isLeftEye) {
+        int32_t xMax = ((int32_t)y - (int32_t)yc + 4) * scale / 10 + (int32_t)(cx - rx);
+        if (xMax < (int32_t)ea1) {
+            *nSeg = 0;
+            return;
+        }
+        int16_t nb = (int16_t)min((int32_t)ea2, xMax);
+        *s1a = ea1;
+        *s1b = nb;
+    } else {
+        int32_t xMin = (int32_t)(cx + rx) - ((int32_t)y - (int32_t)yc + 4) * scale / 10;
+        if (xMin > (int32_t)ea2) {
+            *nSeg = 0;
+            return;
+        }
+        int16_t na = (int16_t)max((int32_t)ea1, xMin);
+        *s1a = na;
+        *s1b = ea2;
+    }
+    *nSeg = (*s1b >= *s1a) ? 1 : 0;
 }
 
-// Mad eye = eye ellipse with top 50% of vertical bbox removed (flat horizontal cut / band).
-static void madEyeSpansAtY(
+// Sad eye = full ellipse minus upper carve ellipse (down-turned / heavy upper lid).
+static void sadEyeSpansAtY(
+    int16_t cx,
+    int16_t yc,
+    int16_t rx,
+    int16_t ry,
+    int16_t y,
+    int16_t* s1a,
+    int16_t* s1b,
+    int16_t* s2a,
+    int16_t* s2b,
+    uint8_t* nSeg
+) {
+    int16_t ea1 = 0, ea2 = -1, ca1 = 0, ca2 = -1;
+    bool hasE = ovalSpanAtY(cx, yc, rx, ry, y, ea1, ea2);
+    if (!hasE) {
+        *nSeg = 0;
+        return;
+    }
+    int16_t cutOff = ry / 2;
+    bool hasC = ovalSpanAtY(cx, yc - cutOff, (int16_t)(rx + 1), ry, y, ca1, ca2);
+    if (!hasC) {
+        *s1a = ea1;
+        *s1b = ea2;
+        *nSeg = 1;
+        return;
+    }
+    *nSeg = subtractSpan1D(ea1, ea2, ca1, ca2, s1a, s1b, s2a, s2b);
+}
+
+static int16_t sleepyFlatCutYShowMin(int16_t yc, int16_t ry) {
+    return (int16_t)(yc + (ry * 3) / 10);
+}
+
+// Sleepy = only lower portion of eye (heavy lids).
+static void sleepyEyeSpansAtY(
     int16_t cx,
     int16_t yc,
     int16_t rx,
@@ -880,7 +977,7 @@ static void madEyeSpansAtY(
         *nSeg = 0;
         return;
     }
-    int16_t yShowMin = madFlatCutYShowMin(yc, ry);
+    int16_t yShowMin = sleepyFlatCutYShowMin(yc, ry);
     if (y < yShowMin) {
         *nSeg = 0;
         return;
@@ -984,6 +1081,27 @@ static void drawHappyEyesDelta(
     }
 }
 
+static void drawMadAngryBrowStrokes(int16_t lookX, int16_t lookY) {
+    const int16_t baseY = 112;
+    const int16_t yc = baseY + lookY;
+    const uint16_t browDark = 0xA800; // dark red
+    // Downward strokes toward the nose (angry / furrowed).
+    int16_t x0 = 24 + lookX;
+    int16_t y0 = yc - 50;
+    int16_t x1 = 66 + lookX;
+    int16_t y1 = yc - 30;
+    for (int16_t t = -2; t <= 2; t++) {
+        gfx->drawLine(x0 + t, y0, x1 + t, y1, browDark);
+    }
+    x0 = 216 + lookX;
+    y0 = yc - 50;
+    x1 = 174 + lookX;
+    y1 = yc - 30;
+    for (int16_t t = -2; t <= 2; t++) {
+        gfx->drawLine(x0 + t, y0, x1 + t, y1, browDark);
+    }
+}
+
 static void drawMadEyesFull(int16_t lookX, int16_t lookY, int16_t ryL, int16_t ryR) {
     const int16_t baseY = 112;
     const int16_t rx = 46;
@@ -991,9 +1109,7 @@ static void drawMadEyesFull(int16_t lookX, int16_t lookY, int16_t ryL, int16_t r
     const int16_t cxR = 172 + lookX;
     const int16_t yc = baseY + lookY;
     int16_t rmax = max(ryL, ryR);
-    int16_t yShowMinL = madFlatCutYShowMin(yc, ryL);
-    int16_t yShowMinR = madFlatCutYShowMin(yc, ryR);
-    int16_t yMin = min(yShowMinL, yShowMinR) - 1;
+    int16_t yMin = yc - 1;
     if (yMin < 0) {
         yMin = 0;
     }
@@ -1004,15 +1120,16 @@ static void drawMadEyesFull(int16_t lookX, int16_t lookY, int16_t ryL, int16_t r
     for (int16_t y = yMin; y <= yMax; y++) {
         int16_t s1a, s1b, s2a, s2b;
         uint8_t n;
-        madEyeSpansAtY(cxL, yc, rx, ryL, y, &s1a, &s1b, &s2a, &s2b, &n);
+        madAngledEyeSpansAtY(cxL, yc, rx, ryL, y, true, &s1a, &s1b, &s2a, &s2b, &n);
         if (n >= 1) {
             drawSpanIfValid(y, s1a, s1b, CYAN);
         }
-        madEyeSpansAtY(cxR, yc, rx, ryR, y, &s1a, &s1b, &s2a, &s2b, &n);
+        madAngledEyeSpansAtY(cxR, yc, rx, ryR, y, false, &s1a, &s1b, &s2a, &s2b, &n);
         if (n >= 1) {
             drawSpanIfValid(y, s1a, s1b, CYAN);
         }
     }
+    drawMadAngryBrowStrokes(lookX, lookY);
 }
 
 static void drawMadEyesDelta(
@@ -1029,9 +1146,230 @@ static void drawMadEyesDelta(
     const int16_t cxR = 172 + lookX;
     const int16_t yc = baseY + lookY;
     int16_t rmax = max(max(oldRyL, oldRyR), max(newRyL, newRyR));
+    int16_t yMin = yc - 1;
+    if (yMin < 0) {
+        yMin = 0;
+    }
+    int16_t yMax = yc + rmax + 2;
+    if (yMax > 239) {
+        yMax = 239;
+    }
+
+    for (int16_t y = yMin; y <= yMax; y++) {
+        int16_t s1a, s1b, s2a, s2b;
+        uint8_t n;
+
+        madAngledEyeSpansAtY(cxL, yc, rx, oldRyL, y, true, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, BLACK);
+        }
+        madAngledEyeSpansAtY(cxR, yc, rx, oldRyR, y, false, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, BLACK);
+        }
+
+        madAngledEyeSpansAtY(cxL, yc, rx, newRyL, y, true, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, CYAN);
+        }
+        madAngledEyeSpansAtY(cxR, yc, rx, newRyR, y, false, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, CYAN);
+        }
+    }
+    drawMadAngryBrowStrokes(lookX, lookY);
+}
+
+static void drawSadEyesFull(int16_t lookX, int16_t lookY, int16_t ryL, int16_t ryR) {
+    const int16_t baseY = 112;
+    const int16_t rx = 46;
+    const int16_t cxL = 68 + lookX;
+    const int16_t cxR = 172 + lookX;
+    const int16_t yc = baseY + lookY;
+    int16_t rmax = max(ryL, ryR);
+    int16_t yMin = yc - rmax - 2;
+    int16_t yMax = yc + rmax + (3 * rmax) / 2 + 3;
+    if (yMin < 0) {
+        yMin = 0;
+    }
+    if (yMax > 239) {
+        yMax = 239;
+    }
+    for (int16_t y = yMin; y <= yMax; y++) {
+        int16_t s1a, s1b, s2a, s2b;
+        uint8_t n;
+        sadEyeSpansAtY(cxL, yc, rx, ryL, y, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, CYAN);
+        }
+        if (n >= 2) {
+            drawSpanIfValid(y, s2a, s2b, CYAN);
+        }
+        sadEyeSpansAtY(cxR, yc, rx, ryR, y, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, CYAN);
+        }
+        if (n >= 2) {
+            drawSpanIfValid(y, s2a, s2b, CYAN);
+        }
+    }
+}
+
+static void drawSadEyesDelta(
+    int16_t lookX,
+    int16_t lookY,
+    int16_t oldRyL,
+    int16_t oldRyR,
+    int16_t newRyL,
+    int16_t newRyR
+) {
+    const int16_t baseY = 112;
+    const int16_t rx = 46;
+    const int16_t cxL = 68 + lookX;
+    const int16_t cxR = 172 + lookX;
+    const int16_t yc = baseY + lookY;
+    int16_t rmax = max(max(oldRyL, oldRyR), max(newRyL, newRyR));
+    int16_t yMin = yc - rmax - 2;
+    int16_t yMax = yc + rmax + (3 * rmax) / 2 + 3;
+    if (yMin < 0) {
+        yMin = 0;
+    }
+    if (yMax > 239) {
+        yMax = 239;
+    }
+
+    for (int16_t y = yMin; y <= yMax; y++) {
+        int16_t s1a, s1b, s2a, s2b;
+        uint8_t n;
+
+        sadEyeSpansAtY(cxL, yc, rx, oldRyL, y, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, BLACK);
+        }
+        if (n >= 2) {
+            drawSpanIfValid(y, s2a, s2b, BLACK);
+        }
+        sadEyeSpansAtY(cxR, yc, rx, oldRyR, y, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, BLACK);
+        }
+        if (n >= 2) {
+            drawSpanIfValid(y, s2a, s2b, BLACK);
+        }
+
+        sadEyeSpansAtY(cxL, yc, rx, newRyL, y, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, CYAN);
+        }
+        if (n >= 2) {
+            drawSpanIfValid(y, s2a, s2b, CYAN);
+        }
+        sadEyeSpansAtY(cxR, yc, rx, newRyR, y, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, CYAN);
+        }
+        if (n >= 2) {
+            drawSpanIfValid(y, s2a, s2b, CYAN);
+        }
+    }
+}
+
+// Two-lobe + tapered tip heart (pink), used as the "love" face (reads as eye-shaped on the round panel).
+static const uint16_t LOVE_PINK = 0xF8B2;
+
+static void drawLoveHeartShape(int16_t lookX, int16_t lookY, int16_t beat) {
+    const int16_t cx = 120 + lookX;
+    const int16_t cy = 106 + lookY;
+    int16_t r = 18 + beat / 10;
+    if (r < 12) {
+        r = 12;
+    }
+    if (r > 30) {
+        r = 30;
+    }
+    gfx->fillCircle(cx - 22, cy - 4, r, LOVE_PINK);
+    gfx->fillCircle(cx + 22, cy - 4, r, LOVE_PINK);
+    const int16_t tipH = 26;
+    for (int16_t dy = 0; dy < tipH; dy++) {
+        int16_t halfW = (int16_t)(((tipH - dy) * 28) / tipH);
+        if (halfW < 1) {
+            halfW = 1;
+        }
+        int16_t yy = cy + 10 + dy;
+        if (yy >= 0 && yy <= 239) {
+            gfx->fillRect((int16_t)(cx - halfW), yy, (uint16_t)(2 * halfW + 1), 1, LOVE_PINK);
+        }
+    }
+}
+
+static void drawLoveEyesFull(int16_t lookX, int16_t lookY, int16_t ryL, int16_t ryR) {
+    (void)ryL;
+    (void)ryR;
+    drawLoveHeartShape(lookX, lookY, (int16_t)(ryL + ryR));
+}
+
+static void drawLoveEyesDelta(
+    int16_t lookX,
+    int16_t lookY,
+    int16_t oldRyL,
+    int16_t oldRyR,
+    int16_t newRyL,
+    int16_t newRyR
+) {
+    (void)oldRyL;
+    (void)oldRyR;
+    gfx->fillRect(38, 48, 164, 154, BLACK);
+    drawLoveHeartShape(lookX, lookY, (int16_t)(newRyL + newRyR));
+}
+
+static void drawSleepyEyesFull(int16_t lookX, int16_t lookY, int16_t ryL, int16_t ryR) {
+    const int16_t baseY = 112;
+    const int16_t rx = 46;
+    const int16_t cxL = 68 + lookX;
+    const int16_t cxR = 172 + lookX;
+    const int16_t yc = baseY + lookY;
+    int16_t rmax = max(ryL, ryR);
+    int16_t yShowMinL = sleepyFlatCutYShowMin(yc, ryL);
+    int16_t yShowMinR = sleepyFlatCutYShowMin(yc, ryR);
+    int16_t yMin = min(yShowMinL, yShowMinR) - 1;
+    if (yMin < 0) {
+        yMin = 0;
+    }
+    int16_t yMax = yc + rmax + 2;
+    if (yMax > 239) {
+        yMax = 239;
+    }
+    for (int16_t y = yMin; y <= yMax; y++) {
+        int16_t s1a, s1b, s2a, s2b;
+        uint8_t n;
+        sleepyEyeSpansAtY(cxL, yc, rx, ryL, y, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, CYAN);
+        }
+        sleepyEyeSpansAtY(cxR, yc, rx, ryR, y, &s1a, &s1b, &s2a, &s2b, &n);
+        if (n >= 1) {
+            drawSpanIfValid(y, s1a, s1b, CYAN);
+        }
+    }
+}
+
+static void drawSleepyEyesDelta(
+    int16_t lookX,
+    int16_t lookY,
+    int16_t oldRyL,
+    int16_t oldRyR,
+    int16_t newRyL,
+    int16_t newRyR
+) {
+    const int16_t baseY = 112;
+    const int16_t rx = 46;
+    const int16_t cxL = 68 + lookX;
+    const int16_t cxR = 172 + lookX;
+    const int16_t yc = baseY + lookY;
+    int16_t rmax = max(max(oldRyL, oldRyR), max(newRyL, newRyR));
     int16_t yMin = min(
-        min(madFlatCutYShowMin(yc, oldRyL), madFlatCutYShowMin(yc, oldRyR)),
-        min(madFlatCutYShowMin(yc, newRyL), madFlatCutYShowMin(yc, newRyR))
+        min(sleepyFlatCutYShowMin(yc, oldRyL), sleepyFlatCutYShowMin(yc, oldRyR)),
+        min(sleepyFlatCutYShowMin(yc, newRyL), sleepyFlatCutYShowMin(yc, newRyR))
     ) - 1;
     if (yMin < 0) {
         yMin = 0;
@@ -1045,24 +1383,34 @@ static void drawMadEyesDelta(
         int16_t s1a, s1b, s2a, s2b;
         uint8_t n;
 
-        madEyeSpansAtY(cxL, yc, rx, oldRyL, y, &s1a, &s1b, &s2a, &s2b, &n);
+        sleepyEyeSpansAtY(cxL, yc, rx, oldRyL, y, &s1a, &s1b, &s2a, &s2b, &n);
         if (n >= 1) {
             drawSpanIfValid(y, s1a, s1b, BLACK);
         }
-        madEyeSpansAtY(cxR, yc, rx, oldRyR, y, &s1a, &s1b, &s2a, &s2b, &n);
+        sleepyEyeSpansAtY(cxR, yc, rx, oldRyR, y, &s1a, &s1b, &s2a, &s2b, &n);
         if (n >= 1) {
             drawSpanIfValid(y, s1a, s1b, BLACK);
         }
 
-        madEyeSpansAtY(cxL, yc, rx, newRyL, y, &s1a, &s1b, &s2a, &s2b, &n);
+        sleepyEyeSpansAtY(cxL, yc, rx, newRyL, y, &s1a, &s1b, &s2a, &s2b, &n);
         if (n >= 1) {
             drawSpanIfValid(y, s1a, s1b, CYAN);
         }
-        madEyeSpansAtY(cxR, yc, rx, newRyR, y, &s1a, &s1b, &s2a, &s2b, &n);
+        sleepyEyeSpansAtY(cxR, yc, rx, newRyR, y, &s1a, &s1b, &s2a, &s2b, &n);
         if (n >= 1) {
             drawSpanIfValid(y, s1a, s1b, CYAN);
         }
     }
+}
+
+static void drawSurprisedEyesFull(int16_t lookX, int16_t lookY, int16_t ryL, int16_t ryR) {
+    const int16_t baseY = 112;
+    const int16_t rx = 52;
+    const int16_t cxL = 68 + lookX;
+    const int16_t cxR = 172 + lookX;
+    const int16_t yc = baseY + lookY;
+    fillOval(cxL, yc, rx, ryL, CYAN);
+    fillOval(cxR, yc, rx, ryR, CYAN);
 }
 
 static void drawEyeDelta(
@@ -1088,7 +1436,40 @@ static void drawEyeDelta(
     }
 }
 
-void drawEyesDelta(
+static void drawConfusedEyesFull(int16_t lookX, int16_t lookY, int16_t ryL, int16_t ryR) {
+    const int16_t baseY = 112;
+    const int16_t rx = 46;
+    const int16_t cxL = (68 + lookX) - 12;
+    const int16_t cxR = (172 + lookX) + 12;
+    const int16_t yc = baseY + lookY;
+    fillOval(cxL, yc, rx, ryL, CYAN);
+    fillOval(cxR, yc, rx, ryR, CYAN);
+}
+
+static void drawConfusedEyesDelta(
+    int16_t oldLookX,
+    int16_t oldLookY,
+    int16_t oldRyL,
+    int16_t oldRyR,
+    int16_t newLookX,
+    int16_t newLookY,
+    int16_t newRyL,
+    int16_t newRyR
+) {
+    const int16_t baseY = 112;
+    const int16_t rx = 46;
+    const int16_t oldCxL = (68 + oldLookX) - 12;
+    const int16_t oldCxR = (172 + oldLookX) + 12;
+    const int16_t newCxL = (68 + newLookX) - 12;
+    const int16_t newCxR = (172 + newLookX) + 12;
+    const int16_t oldYc = baseY + oldLookY;
+    const int16_t newYc = baseY + newLookY;
+    drawEyeDelta(oldCxL, newCxL, oldYc, newYc, rx, oldRyL, newRyL, CYAN, BLACK);
+    drawEyeDelta(oldCxR, newCxR, oldYc, newYc, rx, oldRyR, newRyR, CYAN, BLACK);
+}
+
+static void drawEyesDeltaRx(
+    int16_t rx,
     int16_t oldXOffset,
     int16_t oldYOffset,
     int16_t oldRyL,
@@ -1100,7 +1481,6 @@ void drawEyesDelta(
     uint16_t onColor
 ) {
     const int16_t baseY = 112;
-    const int16_t rx = 46;
     const int16_t oldCxL = 68 + oldXOffset;
     const int16_t oldCxR = 172 + oldXOffset;
     const int16_t newCxL = 68 + newXOffset;
@@ -1110,6 +1490,31 @@ void drawEyesDelta(
 
     drawEyeDelta(oldCxL, newCxL, oldYc, newYc, rx, oldRyL, newRyL, onColor, BLACK);
     drawEyeDelta(oldCxR, newCxR, oldYc, newYc, rx, oldRyR, newRyR, onColor, BLACK);
+}
+
+void drawEyesDelta(
+    int16_t oldXOffset,
+    int16_t oldYOffset,
+    int16_t oldRyL,
+    int16_t oldRyR,
+    int16_t newXOffset,
+    int16_t newYOffset,
+    int16_t newRyL,
+    int16_t newRyR,
+    uint16_t onColor
+) {
+    drawEyesDeltaRx(
+        46,
+        oldXOffset,
+        oldYOffset,
+        oldRyL,
+        oldRyR,
+        newXOffset,
+        newYOffset,
+        newRyL,
+        newRyR,
+        onColor
+    );
 }
 
 static int16_t triPulse(uint32_t elapsed, uint16_t durationMs, int16_t amplitude) {
@@ -1687,27 +2092,43 @@ void updateFaceEmotionAnimation() {
     uint32_t elapsed = now - faceAnimStartMs;
     int16_t eyeXOffset = idleAnim.lookX;
     int16_t eyeYOffset = idleAnim.lookY;
-    if (faceAnimMode == 1) {
-        eyeXOffset = happyFrozenLookX;
-        eyeYOffset = happyFrozenLookY;
-    } else if (faceAnimMode == 2) {
-        eyeXOffset = madFrozenLookX;
-        eyeYOffset = madFrozenLookY;
+    if (faceAnimMode != 0) {
+        eyeXOffset = faceAnimFrozenLookX;
+        eyeYOffset = faceAnimFrozenLookY;
     }
     int16_t eyeRyL = 66;
     int16_t eyeRyR = 66;
-    // Same pulse cadence for speaking, happy, and mad modes.
-    int16_t cadence = (int16_t)triPulse(elapsed % 340, 340, 24);
+    int16_t cadence = 0;
+
+    if (faceAnimMode == 0) {
+        cadence = (int16_t)triPulse(elapsed % 340, 340, 22);
+        cadence += (int16_t)triPulse(elapsed % 210, 210, 12);
+        eyeXOffset += (int16_t)(sinf((float)elapsed * 0.012f) * 4.0f);
+    } else if (faceAnimMode == 8) {
+        cadence = (int16_t)triPulse(elapsed % 180, 180, 30);
+    } else if (faceAnimMode == 6) {
+        cadence = (int16_t)triPulse(elapsed % 520, 520, 16);
+    } else if (faceAnimMode == 4) {
+        eyeRyL = 74;
+        eyeRyR = 74;
+        cadence = (int16_t)triPulse(elapsed % 280, 280, 20);
+    } else if (faceAnimMode == 7) {
+        eyeRyL = 40;
+        eyeRyR = 80;
+        cadence = (int16_t)triPulse(elapsed % 340, 340, 18);
+    } else {
+        cadence = (int16_t)triPulse(elapsed % 340, 340, 24);
+    }
+
     eyeRyL -= cadence;
     eyeRyR -= cadence;
 
     if (eyeRyL < 10) eyeRyL = 10;
     if (eyeRyR < 10) eyeRyR = 10;
-    if (eyeRyL > 78) eyeRyL = 78;
-    if (eyeRyR > 78) eyeRyR = 78;
+    if (eyeRyL > 88) eyeRyL = 88;
+    if (eyeRyR > 88) eyeRyR = 88;
 
     if (faceAnimMode == 1) {
-        // Happy: geometry-only cyan (ellipse minus carve); no black overlay over text.
         if (!idleAnim.hasPrevFrame) {
             gfx->fillScreen(BLACK);
             drawHappyEyesFull(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR);
@@ -1731,7 +2152,6 @@ void updateFaceEmotionAnimation() {
     }
 
     if (faceAnimMode == 2) {
-        // Mad: flat top-half cut on eyes; same flow as happy.
         if (!idleAnim.hasPrevFrame) {
             gfx->fillScreen(BLACK);
             drawMadEyesFull(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR);
@@ -1741,6 +2161,127 @@ void updateFaceEmotionAnimation() {
                 eyeYOffset,
                 idleAnim.prevEyeRyL,
                 idleAnim.prevEyeRyR,
+                eyeRyL,
+                eyeRyR
+            );
+        }
+        drawFaceAnimWordsLine();
+        idleAnim.prevEyeXOffset = eyeXOffset;
+        idleAnim.prevEyeYOffset = eyeYOffset;
+        idleAnim.prevEyeRyL = eyeRyL;
+        idleAnim.prevEyeRyR = eyeRyR;
+        idleAnim.hasPrevFrame = true;
+        return;
+    }
+
+    if (faceAnimMode == 3) {
+        if (!idleAnim.hasPrevFrame) {
+            gfx->fillScreen(BLACK);
+            drawSadEyesFull(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR);
+        } else {
+            drawSadEyesDelta(
+                eyeXOffset,
+                eyeYOffset,
+                idleAnim.prevEyeRyL,
+                idleAnim.prevEyeRyR,
+                eyeRyL,
+                eyeRyR
+            );
+        }
+        drawFaceAnimWordsLine();
+        idleAnim.prevEyeXOffset = eyeXOffset;
+        idleAnim.prevEyeYOffset = eyeYOffset;
+        idleAnim.prevEyeRyL = eyeRyL;
+        idleAnim.prevEyeRyR = eyeRyR;
+        idleAnim.hasPrevFrame = true;
+        return;
+    }
+
+    if (faceAnimMode == 4) {
+        if (!idleAnim.hasPrevFrame) {
+            gfx->fillScreen(BLACK);
+            drawSurprisedEyesFull(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR);
+        } else {
+            drawEyesDeltaRx(
+                52,
+                idleAnim.prevEyeXOffset,
+                idleAnim.prevEyeYOffset,
+                idleAnim.prevEyeRyL,
+                idleAnim.prevEyeRyR,
+                eyeXOffset,
+                eyeYOffset,
+                eyeRyL,
+                eyeRyR,
+                CYAN
+            );
+        }
+        drawFaceAnimWordsLine();
+        idleAnim.prevEyeXOffset = eyeXOffset;
+        idleAnim.prevEyeYOffset = eyeYOffset;
+        idleAnim.prevEyeRyL = eyeRyL;
+        idleAnim.prevEyeRyR = eyeRyR;
+        idleAnim.hasPrevFrame = true;
+        return;
+    }
+
+    if (faceAnimMode == 5) {
+        if (!idleAnim.hasPrevFrame) {
+            gfx->fillScreen(BLACK);
+            drawSleepyEyesFull(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR);
+        } else {
+            drawSleepyEyesDelta(
+                eyeXOffset,
+                eyeYOffset,
+                idleAnim.prevEyeRyL,
+                idleAnim.prevEyeRyR,
+                eyeRyL,
+                eyeRyR
+            );
+        }
+        drawFaceAnimWordsLine();
+        idleAnim.prevEyeXOffset = eyeXOffset;
+        idleAnim.prevEyeYOffset = eyeYOffset;
+        idleAnim.prevEyeRyL = eyeRyL;
+        idleAnim.prevEyeRyR = eyeRyR;
+        idleAnim.hasPrevFrame = true;
+        return;
+    }
+
+    if (faceAnimMode == 9) {
+        if (!idleAnim.hasPrevFrame) {
+            gfx->fillScreen(BLACK);
+            drawLoveEyesFull(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR);
+        } else {
+            drawLoveEyesDelta(
+                eyeXOffset,
+                eyeYOffset,
+                idleAnim.prevEyeRyL,
+                idleAnim.prevEyeRyR,
+                eyeRyL,
+                eyeRyR
+            );
+        }
+        drawFaceAnimWordsLine();
+        idleAnim.prevEyeXOffset = eyeXOffset;
+        idleAnim.prevEyeYOffset = eyeYOffset;
+        idleAnim.prevEyeRyL = eyeRyL;
+        idleAnim.prevEyeRyR = eyeRyR;
+        idleAnim.hasPrevFrame = true;
+        return;
+    }
+
+    if (faceAnimMode == 7) {
+        if (!idleAnim.hasPrevFrame) {
+            gfx->fillScreen(BLACK);
+            drawConfusedEyesFull(eyeXOffset, eyeYOffset, eyeRyL, eyeRyR);
+        } else {
+            drawConfusedEyesDelta(
+                idleAnim.prevEyeXOffset,
+                idleAnim.prevEyeYOffset,
+                idleAnim.prevEyeRyL,
+                idleAnim.prevEyeRyR,
+                eyeXOffset,
+                eyeYOffset,
                 eyeRyL,
                 eyeRyR
             );
@@ -2555,32 +3096,60 @@ void setupWiFi() {
                             if (dur < 800) dur = 800;
                             if (dur > 10000) dur = 10000;
 
-                            {
-                                setFaceAnimWordsFromPayload(w);
-                                gfx->fillScreen(BLACK);
-                                // Force caption redraw; screen was cleared even if words match last animation.
-                                s_faceCaptionLastText[0] = '\0';
-                                s_faceCaptionVisible = false;
-                                if (strcmp(anim, "happy") == 0) {
-                                    faceAnimMode = 1;
-                                } else if (strcmp(anim, "mad") == 0) {
-                                    faceAnimMode = 2;
-                                } else {
+                            setFaceAnimWordsFromPayload(w);
+                            gfx->fillScreen(BLACK);
+                            s_faceCaptionLastText[0] = '\0';
+                            s_faceCaptionVisible = false;
+                            faceAnimMode = faceAnimModeFromAnimName(anim);
+                            if (faceAnimMode != 0) {
+                                faceAnimFrozenLookX = idleAnim.lookX;
+                                faceAnimFrozenLookY = idleAnim.lookY;
+                                if (faceAnimMode == 6) {
+                                    faceAnimFrozenLookY = (int16_t)(idleAnim.lookY - 8);
+                                    if (faceAnimFrozenLookY > -2) {
+                                        faceAnimFrozenLookY = -2;
+                                    }
+                                    if (faceAnimFrozenLookY < -14) {
+                                        faceAnimFrozenLookY = -14;
+                                    }
+                                }
+                            }
+                            faceAnimActive = true;
+                            faceAnimStartMs = millis();
+                            faceAnimUntilMs = millis() + (uint32_t)dur;
+                            idleAnim.hasPrevFrame = false;
+                        } else if (strcmp(msgType, "assistant_speech_face") == 0) {
+                            const char* ev = doc["event"] | "";
+                            int ext = doc["extend_ms"] | 600;
+                            if (ext < 200) ext = 200;
+                            if (ext > 5000) ext = 5000;
+                            if (strcmp(ev, "start") == 0) {
+                                if (!(faceAnimActive && faceAnimMode != 0)) {
+                                    faceAnimWords[0] = '\0';
+                                    clearFaceAnimCaptionBox();
+                                    gfx->fillScreen(BLACK);
+                                    s_faceCaptionLastText[0] = '\0';
+                                    s_faceCaptionVisible = false;
                                     faceAnimMode = 0;
-                                }
-                                if (faceAnimMode == 1) {
-                                    happyFrozenLookX = idleAnim.lookX;
-                                    happyFrozenLookY = idleAnim.lookY;
-                                } else if (faceAnimMode == 2) {
-                                    madFrozenLookX = idleAnim.lookX;
-                                    madFrozenLookY = idleAnim.lookY;
-                                }
-                                faceAnimActive = true;
-                                faceAnimStartMs = millis();
-                                faceAnimUntilMs = millis() + (uint32_t)FACE_ANIM_DURATION_MS;
-                                idleAnim.hasPrevFrame = false;
-                                if (!timeScreenActive && !idleAnim.hasPrevFrame) {
+                                    faceAnimActive = true;
+                                    faceAnimStartMs = millis();
+                                    faceAnimUntilMs = millis() + FACE_ANIM_ASSISTANT_CAP_MS;
                                     idleAnim.hasPrevFrame = false;
+                                }
+                            } else if (strcmp(ev, "extend") == 0) {
+                                if (faceAnimActive && faceAnimMode == 0) {
+                                    uint32_t bump = millis() + (uint32_t)ext;
+                                    if (bump > faceAnimUntilMs) {
+                                        faceAnimUntilMs = bump;
+                                    }
+                                    uint32_t cap = millis() + FACE_ANIM_ASSISTANT_CAP_MS;
+                                    if (faceAnimUntilMs > cap) {
+                                        faceAnimUntilMs = cap;
+                                    }
+                                }
+                            } else if (strcmp(ev, "end") == 0) {
+                                if (faceAnimActive && faceAnimMode == 0) {
+                                    faceAnimUntilMs = millis() + FACE_ANIM_ASSISTANT_TAIL_MS;
                                 }
                             }
                         } else if (strcmp(status, "error") == 0) {

@@ -299,3 +299,31 @@
   color: var(--error);
   border: 1px solid rgba(255, 59, 48, 0.3);
 }
+
+.face-preview-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.face-preview-btn {
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: lowercase;
+  padding: 0.35rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 102, 204, 0.28);
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--text-main);
+  cursor: pointer;
+}
+
+.face-preview-btn:hover:not(:disabled) {
+  border-color: rgba(0, 136, 255, 0.5);
+  background: rgba(0, 136, 255, 0.08);
+}
+
+.face-preview-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
