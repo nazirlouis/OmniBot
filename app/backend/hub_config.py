@@ -155,15 +155,36 @@ def invalidate_genai_client() -> None:
 
 
 def get_genai_client():
-    """Return a google.genai.Client or None if no API key is configured."""
+    """Return a google.genai.Client (or Ollama adapter) or None if no API key is configured.
+
+    When OMNIBOT_OLLAMA_URL is set the local Ollama adapter is returned
+    unconditionally and the Gemini API key is ignored. See ollama_adapter.py
+    for the limitations of that path (no function calling, no multimodal).
+    """
+    global _genai_client, _genai_key_used
+    from ollama_adapter import OllamaClient, get_ollama_url
+
+    # Local Ollama override — bypass Google entirely when configured.
+    ollama_url = get_ollama_url()
+    if ollama_url:
+        with _genai_lock:
+            if isinstance(_genai_client, OllamaClient) and _genai_key_used == ollama_url:
+                return _genai_client
+            _genai_client = OllamaClient(ollama_url)
+            _genai_key_used = ollama_url
+            return _genai_client
+
     from google import genai
 
     key = get_gemini_api_key()
     if not key:
         return None
-    global _genai_client, _genai_key_used
     with _genai_lock:
-        if _genai_client is not None and _genai_key_used == key:
+        if (
+            _genai_client is not None
+            and _genai_key_used == key
+            and not isinstance(_genai_client, OllamaClient)
+        ):
             return _genai_client
         _genai_client = genai.Client(api_key=key)
         _genai_key_used = key

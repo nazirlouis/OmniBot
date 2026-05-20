@@ -715,9 +715,14 @@ def _ble_device_advertises_omnibot_service(device) -> bool:
 
 
 def _ble_device_is_pixel_setup(device) -> bool:
-    """Pixel in BLE provisioning: local name contains Pixel, or our service UUID appears in the advertisement."""
+    """Pixel in BLE provisioning: local name contains Pixel, or our service UUID appears in the advertisement.
+
+    Vyko-based Box-3 firmware advertises as VYKO_<xxxx> with the OmniBot service
+    UUID in the scan response. On macOS, Bleak's deprecated metadata API often
+    drops scan-response UUIDs, so the name prefix is the only reliable match.
+    """
     name = (device.name or "").strip()
-    if name and "Pixel" in name:
+    if name and ("Pixel" in name or name.startswith("VYKO_")):
         return True
     return _ble_device_advertises_omnibot_service(device)
 
@@ -2527,6 +2532,110 @@ def get_active_esp32_socket(device_id: str):
     return next(iter(active_streams), None)
 
 
+async def _speak_on_esp32(websocket, text: str) -> bool:
+    """Render `text` via macOS `say` and stream the PCM to the Box-3 speaker.
+
+    Uses the existing Vyko phone-as-brain audio protocol that command_parser
+    already implements (`audio_start` / `audio_chunk` / `audio_end` JSON
+    messages, base64-encoded PCM16 mono @ 16 kHz). omnibot.c routes WS text
+    frames into the same parser, so no firmware changes are needed.
+
+    Free, native, no API key. Chunks are paced to roughly match the device's
+    playback rate so the on-device 64 KB ring buffer stays bounded; the
+    parser drops overflow chunks silently if the producer runs too hot.
+
+    Returns True on success, False on any failure (caller stays silent).
+    """
+    if websocket is None or not text:
+        return False
+
+    import shutil, tempfile, struct as _struct
+    if not shutil.which("say"):
+        return False  # not on macOS — no-op
+
+    # Generate 16-bit little-endian PCM @ 16 kHz mono as a WAV file.
+    # `say --data-format=LEI16@16000` is the macOS-supported format string.
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_path = tmp.name
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-o", wav_path, "--data-format=LEI16@16000", text,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await proc.wait()
+        if rc != 0:
+            return False
+
+        with open(wav_path, "rb") as f:
+            data = f.read()
+        os.remove(wav_path)
+    except Exception as e:
+        print(f"[say] generation failed: {e}")
+        return False
+
+    # WAV files from `say` include a JUNK padding chunk before `data`. Find
+    # the `data` chunk header dynamically rather than assuming a fixed 44 B
+    # header layout.
+    di = data.find(b"data")
+    if di < 0 or di + 8 > len(data):
+        return False
+    pcm_size = _struct.unpack_from("<I", data, di + 4)[0]
+    pcm = data[di + 8 : di + 8 + pcm_size]
+    if not pcm:
+        return False
+
+    # audio_start primes the device-side audio task. length is a hint;
+    # the task drains until it sees audio_end.
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "audio_start",
+            "sampleRate": 16000,
+            "codec": "pcm16",
+            "length": len(pcm),
+        }))
+    except Exception:
+        return False
+
+    # Chunk size: command_parser caps writes at 256 B per JSON envelope.
+    # 128 B raw → ~172 B base64 → ~225 B envelope: comfortable fit.
+    CHUNK_BYTES = 128
+    # Pacing: real-time playback at 16 kHz/16-bit mono is 32000 B/s, so each
+    # 128 B chunk is 4 ms of audio. Send at slightly under that rate to keep
+    # the device's 64 KB ring buffer mostly empty (avoids overflow + drops).
+    PACING_SEC = 0.004
+
+    seq = 0
+    sent_bytes = 0
+    for i in range(0, len(pcm), CHUNK_BYTES):
+        chunk = pcm[i : i + CHUNK_BYTES]
+        b64 = base64.b64encode(chunk).decode("ascii")
+        is_last = (i + CHUNK_BYTES >= len(pcm))
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "audio_chunk",
+                "seq": seq,
+                "data": b64,
+                "last": is_last,
+            }))
+        except Exception as e:
+            print(f"[say] chunk {seq} send failed: {e}")
+            return False
+        seq += 1
+        sent_bytes += len(chunk)
+        # Yield + pace so the device task can drain.
+        await asyncio.sleep(PACING_SEC)
+
+    try:
+        await websocket.send_text(json.dumps({"type": "audio_end"}))
+    except Exception:
+        pass
+
+    # Estimate playback duration so the caller can hold the SPEAKING display
+    # state for roughly the right length of time.
+    return True
+
+
 def infer_stream_device_id_for_new_connection() -> str:
     """If only one Pixel is online, use the sole non-default_bot entry in settings (typical home setup)."""
     if len(active_streams) != 1:
@@ -2720,7 +2829,15 @@ async def esp32_stream_endpoint(websocket: WebSocket):
     if stream_device_id != "default_bot":
         print(f"[stream] Inferred device_id={stream_device_id!r} (single Pixel + one named bot in settings)")
     live_coord = None
-    if USE_GEMINI_LIVE and get_gemini_api_key():
+    # Skip the Gemini Live setup entirely when the Ollama adapter is the
+    # active LLM backend — Ollama doesn't implement google.genai's async
+    # client (gc.aio.live.connect), so building a live coordinator just
+    # raises AttributeError and leaves the connect path with no
+    # runtime_* sync to send the device. Local-stack only — upstream
+    # OmniBot will always have a Gemini-shaped client.
+    from ollama_adapter import get_ollama_url
+    _ollama_active = bool(get_ollama_url())
+    if USE_GEMINI_LIVE and get_gemini_api_key() and not _ollama_active:
         live_coord = gemini_live_session.live_coordinator_for(stream_device_id)
         if live_coord is None:
             live_coord = _build_live_coordinator(stream_device_id)
@@ -2730,6 +2847,8 @@ async def esp32_stream_endpoint(websocket: WebSocket):
             await live_coord.ensure_started()
         except Exception as ex:
             print(f"[live] ensure_started on connect failed: {ex}")
+    elif _ollama_active:
+        print("[stream] Ollama backend active — skipping Gemini Live coordinator")
     record_bot_seen(stream_device_id)
     await manager.broadcast(
         {
@@ -3207,6 +3326,171 @@ async def voice_bridge_websocket(websocket: WebSocket):
                     print(f"[live] voice bridge coordinator stop: {ex}")
 
 
+# ---------------------------------------------------------------------------
+# Piper neural TTS — local, free, no API key, near-human voice quality.
+# Activated by dropping a voice .onnx + .onnx.json pair into piper_voices/.
+# If the model isn't present the endpoint returns 503 and the dashboard
+# falls back to the browser's SpeechSynthesis API.
+# ---------------------------------------------------------------------------
+
+PIPER_DIR = Path(__file__).resolve().parent / "piper_voices"
+PIPER_BIN = Path(__file__).resolve().parent / ".venv" / "bin" / "piper"
+PIPER_DEFAULT_MODEL = "en_US-amy-medium"
+
+
+def _piper_voice_path(voice_name: Optional[str]) -> Optional[str]:
+    """Resolve a voice name (e.g. 'en_US-amy-medium') to its absolute
+    .onnx path inside PIPER_DIR. Returns None if the model isn't
+    installed. Empty/None voice_name resolves to the default voice."""
+    name = (voice_name or "").strip() or PIPER_DEFAULT_MODEL
+    # Guard against path traversal — only allow the basename.
+    name = os.path.basename(name)
+    if not name.endswith(".onnx"):
+        name = f"{name}.onnx"
+    p = PIPER_DIR / name
+    return str(p) if p.is_file() else None
+
+
+def _piper_list_installed() -> list[dict]:
+    """Scan PIPER_DIR for .onnx model files. Returns a list of
+    {name, path, size_mb} dicts sorted by name, suitable for the
+    dashboard voice picker."""
+    if not PIPER_DIR.is_dir():
+        return []
+    out = []
+    for p in sorted(PIPER_DIR.glob("*.onnx")):
+        # A valid voice has both .onnx and .onnx.json. Skip orphans so
+        # the dashboard never offers a voice that would crash piper.
+        cfg = p.with_suffix(".onnx.json")
+        if not cfg.is_file():
+            continue
+        out.append({
+            "name": p.stem,  # e.g. "en_US-amy-medium"
+            "size_mb": round(p.stat().st_size / (1024 * 1024), 1),
+        })
+    return out
+
+
+@app.get("/api/tts/voices")
+async def piper_list_voices():
+    """List Piper voices installed in piper_voices/. Empty list means
+    Piper isn't installed or no models are present — the dashboard then
+    hides its voice picker and falls back to browser TTS."""
+    if not PIPER_BIN.is_file():
+        return {"available": False, "default": PIPER_DEFAULT_MODEL, "voices": []}
+    return {
+        "available": True,
+        "default": PIPER_DEFAULT_MODEL,
+        "voices": _piper_list_installed(),
+    }
+
+
+class TtsRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None  # voice file basename, e.g. "en_US-ryan-medium"
+
+
+# --- Persistent Piper voice cache --------------------------------------------
+# The old code spawned a fresh `piper` subprocess per request, each one
+# loading the 60 MB .onnx model from scratch — that's ~1–3 s of overhead
+# on Mac CPU before any audio is synthesized. We instead load each voice
+# in-process via the piper-tts Python bindings and keep it pinned in a
+# dict for the life of the server. A per-voice asyncio.Lock serializes
+# concurrent requests onto the same voice (the underlying onnxruntime
+# session isn't thread-safe per call); different voices can synth in
+# parallel. Synth itself runs in a worker thread so it doesn't block
+# the event loop.
+
+_piper_voice_cache: dict[str, Any] = {}     # name -> PiperVoice
+_piper_voice_locks: dict[str, "asyncio.Lock"] = {}  # name -> Lock
+
+
+def _piper_get_voice(model_path: str):
+    """Return a loaded PiperVoice for the given .onnx path, loading on
+    first access and caching for subsequent calls. Each model is loaded
+    exactly once per server process — the 60 MB load cost is amortized
+    to zero over the chat session."""
+    cached = _piper_voice_cache.get(model_path)
+    if cached is not None:
+        return cached
+    from piper import PiperVoice  # local import keeps optional dep clean
+    print(f"[piper] loading voice (first request): {os.path.basename(model_path)}")
+    voice = PiperVoice.load(model_path)
+    _piper_voice_cache[model_path] = voice
+    return voice
+
+
+def _piper_synth_wav_bytes(model_path: str, text: str) -> bytes:
+    """Synthesize `text` to a WAV byte string using the cached voice.
+    Runs entirely in-process: no subprocess spawn, no model reload."""
+    import io
+    import wave
+    voice = _piper_get_voice(model_path)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        voice.synthesize_wav(text, wf)
+    return buf.getvalue()
+
+
+@app.post("/api/tts")
+async def piper_synthesize(req: TtsRequest):
+    """Generate WAV audio for `text` using local Piper neural TTS.
+
+    Returns the raw WAV bytes with `Content-Type: audio/wav`. The
+    frontend plays the response via a Blob URL on an HTMLAudioElement.
+    Capped at 4000 chars per request — anything longer takes too long
+    to feel responsive and is more likely an abuse signal than real
+    chat (typical replies are under 600 chars).
+
+    Performance: the voice .onnx is loaded once (lazily on first
+    request) and reused for every subsequent call. A short sentence
+    that previously took ~1.5 s (1 s model load + 0.5 s synth) now
+    takes only the synth time.
+    """
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    if len(text) > 4000:
+        raise HTTPException(status_code=400, detail="text too long (max 4000)")
+
+    model_path = _piper_voice_path(req.voice)
+    if not model_path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"voice '{req.voice or PIPER_DEFAULT_MODEL}' not installed",
+        )
+
+    # Serialize concurrent requests for the SAME voice — onnxruntime's
+    # InferenceSession isn't safe for concurrent .run() calls. Different
+    # voices have separate locks and can synth in parallel.
+    lock = _piper_voice_locks.get(model_path)
+    if lock is None:
+        lock = asyncio.Lock()
+        _piper_voice_locks[model_path] = lock
+
+    try:
+        async with lock:
+            # Synth is CPU-bound; push it to a worker thread so we don't
+            # stall the FastAPI event loop while it runs.
+            wav = await asyncio.to_thread(_piper_synth_wav_bytes, model_path, text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[piper] synth failed: {exc!r}")
+        raise HTTPException(status_code=500, detail="piper failed") from exc
+
+    if not wav:
+        raise HTTPException(status_code=500, detail="empty WAV")
+
+    from fastapi.responses import Response
+    return Response(
+        content=wav,
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Piper-Voice": os.path.basename(model_path).replace(".onnx", ""),
+        },
+    )
+
+
 @app.post("/api/text-command")
 async def text_command(req: TextCommandRequest):
     """Receives a typed command from dashboard, streams AI reply, and forwards to ESP32."""
@@ -3248,6 +3532,31 @@ async def text_command(req: TextCommandRequest):
 
     try:
         await _send_activity_event_to_esp32(req.device_id, "text_command")
+
+        # Drive the connected device's display during a text-chat turn so the
+        # Box-3 visibly reacts even though the user is typing in the browser.
+        # Sequence mirrors the Live-voice path: THINKING while the model
+        # generates → SPEAKING (with a face animation) while the reply lands
+        # → IDLE on completion. The handlers in firmware/main/command_parser
+        # translate these into FSM state transitions + display.set_mode().
+        text_chat_esp32_ws = get_active_esp32_socket(req.device_id)
+        if text_chat_esp32_ws is not None:
+            try:
+                # Echo the user's message onto the device's chat overlay
+                # immediately so the screen shows what was just asked
+                # even before the model starts replying. Then drive the
+                # display through THINKING.
+                user_visible = (message or "").strip()
+                if user_visible:
+                    await text_chat_esp32_ws.send_text(json.dumps({
+                        "type": "chat",
+                        "role": "user",
+                        "text": user_visible,
+                    }))
+                await text_chat_esp32_ws.send_text(json.dumps({"type": "wake_processing"}))
+            except Exception:
+                pass
+
         live_coord = gemini_live_session.live_coordinator_for(req.device_id)
         if (
             USE_GEMINI_LIVE
@@ -3276,6 +3585,68 @@ async def text_command(req: TextCommandRequest):
             extra_system_suffix=BOOTSTRAP_MODE_SYSTEM_SUFFIX if req.bootstrap else "",
         )
         print(f"\n>>> GEMINI (TEXT) SAYS: {full_text}")
+
+        # Drive the device through SPEAKING → IDLE around the on-device TTS
+        # playback. The audio streaming itself uses Vyko's existing
+        # audio_start/chunk/end protocol (command_parser already handles it);
+        # face_animation + assistant_speech_face just drive the display.
+        if text_chat_esp32_ws is not None:
+            try:
+                # Brief speech-face animation while audio plays. The
+                # chat[ai] send is deliberately deferred to AFTER
+                # assistant_speech_face:end below so the LCD lands in
+                # CHAT mode (showing the conversation) as the final
+                # state — wake_processing / face_animation /
+                # assistant_speech_face all switch the display mode
+                # and would otherwise overwrite the chat overlay.
+                await text_chat_esp32_ws.send_text(json.dumps({
+                    "type": "face_animation",
+                    "animation": "happy_talk",
+                    "words": full_text[:120],
+                    "duration_ms": 4000,
+                }))
+                await text_chat_esp32_ws.send_text(json.dumps({
+                    "type": "assistant_speech_face",
+                    "event": "start",
+                }))
+
+                # On-device speaker playback is blocked on the Box-3's
+                # ES8311 codec — same I2C bus that the ES7210 mic can't
+                # reach (see Phase 1 notes). The _speak_on_esp32 helper
+                # is kept in app.py so we can flip this back on by
+                # removing the False guard the moment the codec bus is
+                # verified. Until then we just animate the display and
+                # let the Mac speakers handle TTS via browser SpeechSynthesis.
+                _ENABLE_DEVICE_TTS = False
+                if _ENABLE_DEVICE_TTS:
+                    _spoke = await _speak_on_esp32(text_chat_esp32_ws, full_text)
+                    if _spoke:
+                        est_play_sec = max(2.0, min(15.0, len(full_text) * 0.08))
+                        await asyncio.sleep(est_play_sec)
+                    else:
+                        await asyncio.sleep(2.0)
+                else:
+                    # Hold SPEAKING long enough for the browser TTS to be
+                    # audibly synced with the display animation. Browser
+                    # speech rate ≈ 12 chars/s; cap at 12s for long replies.
+                    est = max(2.0, min(12.0, len(full_text) * 0.08))
+                    await asyncio.sleep(est)
+
+                await text_chat_esp32_ws.send_text(json.dumps({
+                    "type": "assistant_speech_face",
+                    "event": "end",
+                }))
+                # Finally, drop the full reply onto the chat overlay so
+                # the LCD lands in CHAT mode displaying You: ... + AI: ...
+                # as the resting state. Sent LAST so it isn't overwritten
+                # by the SPEAKING / IDLE mode switches above.
+                await text_chat_esp32_ws.send_text(json.dumps({
+                    "type": "chat",
+                    "role": "ai",
+                    "text": full_text,
+                }))
+            except Exception as e:
+                print(f"[text-command] device animation send failed: {e}")
 
         esp32_ws = get_active_esp32_socket(req.device_id)
         if esp32_ws:

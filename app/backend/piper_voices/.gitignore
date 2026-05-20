@@ -1,0 +1,5 @@
+# Piper voice model files — downloaded at runtime, too big for git.
+# Keep this .gitignore in the tree so the directory is created on clone
+# and users have a known place to drop .onnx + .onnx.json pairs into.
+*.onnx
+*.onnx.json
