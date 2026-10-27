@@ -30,3 +30,5 @@ openwakeword>=0.6.0
 # webrtcvad imports pkg_resources; setuptools>=81 no longer exposes it as top-level — pin for compatibility
 setuptools>=69,<81
 webrtcvad>=2.0.10
+# Stateful 24 kHz to 16 kHz audio for the Waveshare transport
+soxr>=0.3.7,<2

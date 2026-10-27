@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from google.genai import types
+from voice_control import VOICE_CONTROL_DECLARATION, normalize_live_voice
 
 from face_matching import jpeg_bytes_looks_complete
 from hub_config import get_elevenlabs_api_key, get_genai_client, get_gemini_api_key
@@ -95,6 +96,7 @@ def build_pixel_live_tools() -> list[types.Tool]:
     google_search_tool = ctor() if ctor is not None else types.GoogleSearch()
 
     custom_declarations = [
+        types.FunctionDeclaration(**VOICE_CONTROL_DECLARATION),
         types.FunctionDeclaration(**FACE_ANIMATION_FUNCTION_DECLARATION),
         types.FunctionDeclaration(**persona.SOUL_REPLACE_DECLARATION),
         types.FunctionDeclaration(**heartbeat_service.MEMORY_REPLACE_DECLARATION),
@@ -265,6 +267,8 @@ class GeminiLiveCoordinator:
         self._session_cm = gc.aio.live.connect(model=LIVE_MODEL, config=cfg)
         try:
             self._session = await self._session_cm.__aenter__()
+            selected_voice = cfg.speech_config.voice_config.prebuilt_voice_config.voice_name
+            print(f"[gemini-live] configured voice device={self.device_id} voice={selected_voice}", flush=True)
         except Exception as e:
             _print_live_error("Live session connect failed device=%s: %s", self.device_id, e)
             logger.exception("[live] connect __aenter__ failed device=%s", self.device_id)
@@ -296,7 +300,7 @@ class GeminiLiveCoordinator:
             "speech_config": types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=LIVE_PREBUILT_VOICE_NAME
+                        voice_name=normalize_live_voice(bs.get("live_voice_name"), LIVE_PREBUILT_VOICE_NAME)
                     )
                 )
             ),
@@ -305,10 +309,9 @@ class GeminiLiveCoordinator:
             "input_audio_transcription": types.AudioTranscriptionConfig(),
             "output_audio_transcription": types.AudioTranscriptionConfig(),
             "realtime_input_config": types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    prefix_padding_ms=200,
-                    silence_duration_ms=400,
-                )
+                automatic_activity_detection=(types.AutomaticActivityDetection(disabled=True)
+                    if getattr(self,"manual_activity",False) else types.AutomaticActivityDetection(
+                    prefix_padding_ms=200,silence_duration_ms=400))
             ),
             "context_window_compression": types.ContextWindowCompressionConfig(
                 sliding_window=types.SlidingWindow(),

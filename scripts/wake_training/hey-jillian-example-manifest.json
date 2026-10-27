@@ -1,0 +1,38 @@
+{
+  "phrase": "hey Jillian",
+  "training_text": "hey Jillian",
+  "pronunciation_phonemes": [
+    [
+      "h",
+      "\u02c8",
+      "e",
+      "\u026a",
+      " ",
+      "d",
+      "\u0292",
+      "\u02c8",
+      "\u026a",
+      "l",
+      "i",
+      "\u0259",
+      "n"
+    ]
+  ],
+  "model_name": "hey_jillian",
+  "sha256": "f36238b9a39270f5425c7372183c86173327cb52ed372a3cc4e53413ce36c2e9",
+  "positive_training_examples": 1000,
+  "positive_validation_examples": 500,
+  "initial_training_steps": 10000,
+  "follow_up_steps": [
+    1000,
+    1000
+  ],
+  "validation": {
+    "accuracy": 0.7450000047683716,
+    "recall": 0.5,
+    "false_positives_per_hour": 0.44247788190841675
+  },
+  "openwakeword_revision": "368c03716d1e92591906a84949bc477f3a834455",
+  "piper_revision": "213d4d561ab8a84f71de7dddac827cb07e92c031",
+  "piper_source_sha256": "c16312476b7abc60597d03508568253ed2f225e4b915e0e8569569dd2d956cc2"
+}

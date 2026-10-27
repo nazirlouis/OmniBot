@@ -241,3 +241,9 @@ Open [http://127.0.0.1:5173](http://127.0.0.1:5173).
 ## License
 
 [MIT](LICENSE). Contributions welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Waveshare round AMOLED robot
+
+The [Waveshare ESP32-S3-Touch-AMOLED-1.43C port](bots/Waveshare143C/README.md) adds ESP-IDF firmware with microphone/speaker audio, animated eyes-only display, an authenticated `/ws/board` transport, Pi-side ONNX wake detection, BOOT fallback/cancellation, and three-second spoken follow-ups. Its optional environment variables use the `OMNIBOT_BOARD_` prefix; existing Pixel/dashboard LAN behavior is preserved unless `OMNIBOT_BOARD_LOCAL_ADMIN=1` explicitly restricts it.
+
+Gemini conversations can use the `voice_control` tool to list, inspect, change, or reset the requesting robot's prebuilt speaking voice. Changes persist as `live_voice_name` and take effect on the next reply, preserving the intelligence model and conversation history.

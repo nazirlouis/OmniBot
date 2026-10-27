@@ -1,0 +1,1 @@
+idf_component_register(SRCS "main.c" "wake_stream.c" "network.c" "audio_process.c" "display.c" "pixel_eyes.c" "face_ui.c" "vendor/esp_lcd_sh8601.c" INCLUDE_DIRS "." "vendor" REQUIRES codec_board esp_codec_dev driver esp_psram esp_lcd esp_wifi esp_netif nvs_flash esp_websocket_client json)

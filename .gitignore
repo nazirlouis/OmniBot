@@ -35,3 +35,5 @@ node_modules/
 .DS_Store
 Thumbs.db
 app/backend/face_profiles/
+# ESP-IDF Waveshare build outputs
+bots/Waveshare143C/build/

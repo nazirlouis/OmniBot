@@ -19,6 +19,20 @@ jobs:
         run: pip install -r app/backend/requirements.txt
       - name: Compile Python
         run: python -m compileall -q app/backend
+      - name: Board and voice regression checks
+        run: |
+          pip install httpx
+          for test in app/backend/tests/test_*.py; do python "$test" || exit; done
+          python scripts/wake_training/test_bounded_validation.py
+      - name: Audio and eyes host checks
+        run: |
+          fw=bots/Waveshare143C
+          cc -O2 -fsanitize=address,undefined -I"$fw/main" "$fw/tests/test_face.c" "$fw/main/face_ui.c" "$fw/main/pixel_eyes.c" -lm -o /tmp/face-test
+          /tmp/face-test
+          cc -O2 -fsanitize=address,undefined -I"$fw/main" "$fw/tests/test_stream.c" "$fw/main/wake_stream.c" -lm -o /tmp/stream-test
+          /tmp/stream-test
+          cc -O2 -fsanitize=address,undefined -I"$fw/main" "$fw/tests/test_audio_process.c" "$fw/main/audio_process.c" -lm -o /tmp/audio-test
+          /tmp/audio-test
 
   frontend:
     runs-on: ubuntu-latest

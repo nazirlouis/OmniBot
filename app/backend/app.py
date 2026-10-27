@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import sys
 import socket
 import uvicorn
 from contextlib import asynccontextmanager
@@ -66,6 +67,8 @@ from wake_listen import (
 import heartbeat_service
 import persona
 import gemini_live_session
+import board_transport
+from voice_control import VOICE_CONTROL_DECLARATION, control_voice, normalize_live_voice
 from grounding_extract import (
     add_inline_citations_from_grounding,
     extract_search_sources_from_grounding_metadata,
@@ -123,6 +126,9 @@ _PIXEL_ANIMATION_AND_SINGLE_REC_RULES = (
     "confused, excited, love.\n"
     "At most one animation tool should be used per turn. Do not call more than one of: "
     "`face_animation` or `show_face_animation` in the same turn.\n\n"
+    "Voice preferences: use voice_control when the user asks to list, inspect, change, or reset your spoken voice. "
+    "Save the setting through the tool rather than just imitating a voice. Confirm changes only after success; "
+    "the new voice starts on the next reply. Ask for a preferred name or style if unspecified.\n\n"
     "When asked about food, activities, or places near me, provide exactly ONE recommendation and do not list multiple options."
 )
 
@@ -335,6 +341,7 @@ def get_bot_settings(device_id: str):
         "heartbeat_enabled": bool(bot_conf.get("heartbeat_enabled", DEFAULT_HEARTBEAT_ENABLED)),
         "thinking_level": normalize_gemini_thinking_level(bot_conf.get("thinking_level")),
         "pixel_tts_voice": normalize_pixel_tts_voice(bot_conf.get("pixel_tts_voice")),
+        "live_voice_name": normalize_live_voice(bot_conf.get("live_voice_name"), gemini_live_session.LIVE_PREBUILT_VOICE_NAME),
     }
 
 
@@ -511,6 +518,7 @@ def _pixel_chat_generate_config(
     Maps functionality is removed; use Search + local function tools.
     """
     custom_declarations = [
+        types.FunctionDeclaration(**VOICE_CONTROL_DECLARATION),
         types.FunctionDeclaration(**FACE_ANIMATION_FUNCTION_DECLARATION),
         types.FunctionDeclaration(**persona.SOUL_REPLACE_DECLARATION),
         types.FunctionDeclaration(**heartbeat_service.MEMORY_REPLACE_DECLARATION),
@@ -849,6 +857,8 @@ async def update_settings(device_id: str, new_settings: BotSettingsSchema):
         "thinking_level": normalize_gemini_thinking_level(new_settings.thinking_level),
         "pixel_tts_voice": normalize_pixel_tts_voice(new_settings.pixel_tts_voice),
     }
+    if "live_voice_name" in settings.get(device_id, {}):
+        row["live_voice_name"] = settings[device_id]["live_voice_name"]
     settings[device_id] = row
     save_all_settings(settings)
     history_by_device.pop(device_id, None)
@@ -2161,7 +2171,9 @@ async def run_pixel_gemini_tool(
 
     result: dict[str, Any] = {"error": "Unknown function"}
 
-    if fname == "face_animation":
+    if fname == "voice_control":
+        result = control_voice(SETTINGS_FILE, device_id, args, gemini_live_session.LIVE_PREBUILT_VOICE_NAME)
+    elif fname == "face_animation":
         result = _make_face_animation_tool(device_id)(
             animation=str(args.get("animation") or "speaking")
         )
@@ -3462,6 +3474,8 @@ async def ping():
     """Health check for load balancers / Docker. Does not signal ESP32 connection (avoid false positives from periodic health probes)."""
     return {"status": "ready"}
 
+
+board_transport.install(app, sys.modules[__name__])
 
 # Optional: serve production Vite build (Docker). Register after all API/WebSocket routes.
 _omnibot_static_root = (os.getenv("OMNIBOT_STATIC_ROOT") or "").strip()

@@ -1,0 +1,5 @@
+Board: S3_AMOLED_1_43C
+i2c: {sda: 47, scl: 48}
+i2s: {mclk: 38, bclk: 39, ws: 40, din: 42, dout: 41}
+out: {codec: ES8311, pa: 46, pa_gain: 6, use_mclk: 1}
+in: {codec: ES7210}
